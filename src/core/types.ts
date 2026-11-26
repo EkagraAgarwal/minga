@@ -104,9 +104,11 @@ export interface ProjectConfig {
   checkKeep: string[];
   /**
    * What happens when the branch moved while a check ran (project.toml `recheck`).
-   * "always" (default): run the check again on the new head before committing.
-   * "on-overlap": recheck only when a commit since the check's base touched one of the
-   * submitted paths; otherwise commit on top of the new head without rechecking.
+   * "on-overlap" (default): recheck only when a commit since the check's base touched one of the
+   * submitted paths; otherwise commit on top of the new head without rechecking. Fast: passing
+   * work on different files lands in parallel.
+   * "always": run the check again on the new head before every commit. Strict, but accepts
+   * become serial when many agents pass at once.
    */
   recheck: "always" | "on-overlap";
   rules: Rules;

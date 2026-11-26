@@ -7,6 +7,8 @@ head = "ed25519:AJgMIqPSQxxNWI5lOpDWCwXWKvx-xETgGyFU4nVZBtI"
 
 check_timeout_seconds = 1200
 branch = "main"
+# Keep the Lean build cache between checks so `lake build` stays warm.
+check_keep = [".lake"]
 
 [rules]
 width = 3

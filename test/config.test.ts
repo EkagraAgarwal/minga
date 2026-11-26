@@ -37,6 +37,9 @@ describe("parseProject", () => {
     expect(cfg.checkTimeoutSeconds).toBe(600);
     expect(cfg.branch).toBe("main");
     expect(cfg.head).toBe(HEAD);
+    expect(cfg.checkConcurrency).toBe(0);
+    expect(cfg.checkKeep).toEqual([]);
+    expect(cfg.recheck).toBe("on-overlap");
     expect(cfg.rules).toEqual({
       width: 3,
       leaseMinutes: 45,
@@ -66,6 +69,71 @@ describe("parseProject", () => {
     );
     expect(cfg.checkTimeoutSeconds).toBe(30);
     expect(cfg.branch).toBe("work");
+  });
+
+  test("parses check_concurrency, check_keep and recheck", () => {
+    const cfg = parseProject(
+      baseToml() +
+        'check_concurrency = 4\ncheck_keep = [".lake", "build/cache", "node_modules"]\nrecheck = "on-overlap"\n',
+    );
+    expect(cfg.checkConcurrency).toBe(4);
+    expect(cfg.checkKeep).toEqual([".lake", "build/cache", "node_modules"]);
+    expect(cfg.recheck).toBe("on-overlap");
+  });
+
+  test("check_concurrency is an integer >= 0", () => {
+    for (const value of ["-1", "1.5", '"2"', "true"]) {
+      expect(() => parseProject(baseToml() + `check_concurrency = ${value}\n`))
+        .toThrow(/check_concurrency must be an integer >= 0/);
+    }
+    expect(parseProject(baseToml() + "check_concurrency = 0\n").checkConcurrency).toBe(0);
+  });
+
+  test("check_keep must be an array", () => {
+    expect(() => parseProject(baseToml() + 'check_keep = ".lake"\n'))
+      .toThrow(/check_keep must be an array/);
+    expect(() => parseProject(baseToml() + "check_keep = 1\n"))
+      .toThrow(/check_keep must be an array/);
+  });
+
+  test("check_keep entries must be non-empty strings", () => {
+    expect(() => parseProject(baseToml() + 'check_keep = [""]\n'))
+      .toThrow(/check_keep\[0\] must be a non-empty string/);
+    expect(() => parseProject(baseToml() + 'check_keep = ["   "]\n'))
+      .toThrow(/check_keep\[0\] must be a non-empty string/);
+    expect(() => parseProject(baseToml() + "check_keep = [3]\n"))
+      .toThrow(/check_keep\[0\] must be a non-empty string/);
+    expect(() => parseProject(baseToml() + 'check_keep = [".lake", ""]\n'))
+      .toThrow(/check_keep\[1\] must be a non-empty string/);
+  });
+
+  test("check_keep rejects glob characters", () => {
+    for (const entry of ["*", "cache/*", "cache?", "cache/[ab]", "cache]x"]) {
+      expect(() => parseProject(baseToml() + `check_keep = ["${entry}"]\n`))
+        .toThrow(/check_keep\[0\] must not contain glob characters/);
+    }
+  });
+
+  test("check_keep rejects absolute, backslash and traversal paths", () => {
+    for (const entry of ["/cache", "cache\\x", "../cache", "cache/../x", "cache//x"]) {
+      expect(() => parseProject(baseToml() + `check_keep = ["${entry.replaceAll("\\", "\\\\")}"]\n`))
+        .toThrow(/check_keep\[0\]/);
+    }
+  });
+
+  test("check_keep rejects .git and .minga", () => {
+    for (const entry of [".git", ".git/config", ".minga", ".minga/agent.json"]) {
+      expect(() => parseProject(baseToml() + `check_keep = ["${entry}"]\n`))
+        .toThrow(/check_keep\[0\] must not be inside \.git or \.minga/);
+    }
+  });
+
+  test("recheck accepts only always and on-overlap", () => {
+    expect(parseProject(baseToml() + 'recheck = "always"\n').recheck).toBe("always");
+    expect(() => parseProject(baseToml() + 'recheck = "sometimes"\n'))
+      .toThrow(/recheck must be "always" or "on-overlap"/);
+    expect(() => parseProject(baseToml() + "recheck = 1\n"))
+      .toThrow(/recheck must be "always" or "on-overlap"/);
   });
 
   test("applies a partial [rules] table over defaults", () => {
@@ -280,6 +348,7 @@ describe("loadProject", () => {
     expect(cfg.name).toContain("P vs NP");
     expect(cfg.check).toBe("lake build");
     expect(cfg.paths).toEqual(["proofs/**/*.lean"]);
+    expect(cfg.checkKeep).toEqual([".lake"]);
     expect(cfg.rules.accept).toEqual({ mode: "head-or-votes", votes: 3 });
     expect(cfg.seedTasks.length).toBeGreaterThanOrEqual(4);
 

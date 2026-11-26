@@ -37,9 +37,14 @@ const TOP_LEVEL_KEYS = new Set([
   "head",
   "check_timeout_seconds",
   "branch",
+  "check_concurrency",
+  "check_keep",
+  "recheck",
   "rules",
   "task",
 ]);
+
+const RECHECK_VALUES = new Set(["always", "on-overlap"]);
 
 const RULE_KEYS = new Set([
   "width",
@@ -180,6 +185,40 @@ function parsePaths(value: unknown): string[] {
   return paths;
 }
 
+/** Repo-relative, non-glob paths preserved between checks (build caches). */
+function parseCheckKeep(value: unknown): string[] {
+  if (value === undefined) return [];
+  if (!Array.isArray(value)) fail("check_keep must be an array of repo-relative paths");
+
+  const kept: string[] = [];
+  value.forEach((entry, index) => {
+    const label = `check_keep[${index}]`;
+    if (typeof entry !== "string" || entry.trim() === "") fail(`${label} must be a non-empty string`);
+    if (/[*?\[\]]/.test(entry)) fail(`${label} must not contain glob characters`);
+    if (entry.startsWith("/")) fail(`${label} must not start with "/"`);
+    if (entry.includes("\\")) fail(`${label} must not contain a backslash`);
+
+    const segments = entry.split("/");
+    if (segments.some((segment) => segment === "" || segment === "." || segment === "..")) {
+      fail(`${label} must be a normalized repo-relative POSIX path`);
+    }
+    if (segments[0] === ".git" || segments[0] === ".minga") {
+      fail(`${label} must not be inside .git or .minga`);
+    }
+    kept.push(entry);
+  });
+  return kept;
+}
+
+/** "on-overlap" (default) or "always". */
+function parseRecheck(value: unknown): "always" | "on-overlap" {
+  if (value === undefined) return "on-overlap";
+  if (typeof value !== "string" || !RECHECK_VALUES.has(value)) {
+    fail(`recheck must be "always" or "on-overlap"`);
+  }
+  return value as "always" | "on-overlap";
+}
+
 function parseHead(value: unknown): string {
   const head = requiredString({ head: value }, "head");
   try {
@@ -277,6 +316,9 @@ export const parseProject: ParseProject = (tomlText) => {
     paths: parsePaths(parsed.paths),
     head: parseHead(parsed.head),
     branch: optionalString(parsed, "branch", "branch", DEFAULT_BRANCH),
+    checkConcurrency: integerField(parsed, "check_concurrency", "check_concurrency", 0, 0),
+    checkKeep: parseCheckKeep(parsed.check_keep),
+    recheck: parseRecheck(parsed.recheck),
     rules: parseRules(parsed.rules),
     seedTasks: parseTasks(parsed.task),
   };

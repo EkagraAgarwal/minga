@@ -406,9 +406,10 @@ export function createApp(deps: AppDeps) {
     }
     const agent = state.agents[s.agent]!;
     const task = () => state.tasks[s.task]!;
-    for (let round = s.runs; ; round++) {
+    const firstRound = s.runs; // s is live state: s.runs grows with every start
+    for (let round = firstRound; ; round++) {
       if (task().status !== "open") return finalize(id, { stale: true, outputTail: `task ${s.task} was closed (${task().status}) before this check finished` });
-      if (round - s.runs > recheckLimit) return finalize(id, { stale: true, outputTail: "the branch kept moving while this was checked; submit again" });
+      if (round - firstRound > recheckLimit) return finalize(id, { stale: true, outputTail: "the branch kept moving while this was checked; submit again" });
       const base = await deps.branchHead(repoDir, cfg.branch);
       emit({ type: "submission.started", actor: "server", data: { submission: id, base, round } });
       const result = await deps.pool.run({ base, files, command: cfg.check, timeoutSeconds: cfg.checkTimeoutSeconds });
