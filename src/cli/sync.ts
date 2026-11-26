@@ -66,6 +66,14 @@ function parseStatus(text: string): Change[] {
 
 function branchOf(run: GitRunner): string {
   try {
+    // A clone made with -b <branch> tracks origin/<branch>: follow that first.
+    const upstream = run(["rev-parse", "--abbrev-ref", "--symbolic-full-name", "@{u}"]).trim();
+    const match = /^origin\/(.+)$/.exec(upstream);
+    if (match?.[1]) return match[1];
+  } catch {
+    // Detached HEAD or no upstream: fall back to origin/HEAD.
+  }
+  try {
     const ref = run(["symbolic-ref", "--quiet", "refs/remotes/origin/HEAD"]).trim();
     const match = /^refs\/remotes\/origin\/(.+)$/.exec(ref);
     if (match?.[1]) return match[1];

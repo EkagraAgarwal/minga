@@ -99,7 +99,7 @@ export function packageVersion(root: string | null = findPackageRoot()): string 
       // fall through
     }
   }
-  return "0.1.1";
+  return "0.1.2";
 }
 
 function parseVersion(text: string): [number, number, number] | null {

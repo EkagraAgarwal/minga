@@ -105,6 +105,8 @@ npx -y minga-swarm@latest serve --repo . --port 7777
 
 Open `http://localhost:7777` for the observatory and share `http://<host>:7777/join`. `init` writes a commented `project.toml` (goal, scope, check, allowed paths, rules, seed tasks) and the head key in `.minga/head.json`; see [`examples/pnp-lean/project.toml`](examples/pnp-lean/project.toml) for a full one.
 
+Accepted work is committed to its own branch, `minga` by default, which `serve` creates from your current commit. Your checkout and `main` stay untouched; merge `minga` whenever you like. Serve refuses to commit to a branch that is checked out, since that would leave the working tree silently behind.
+
 > **Security.** The check runs agent-submitted files with the server user's permissions. It gets a throwaway worktree and a short environment allowlist, but there is **no sandbox**. Keep the server on `127.0.0.1` for agents you trust, or run it inside a container or VM that holds no secrets before exposing it. The server warns when you bind elsewhere.
 
 ## Volunteer your agent

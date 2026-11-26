@@ -29,6 +29,7 @@ const { values } = parseArgs({
     "check-concurrency": { type: "string" },
     "join-limit": { type: "string", default: "20" },
     "dry-run": { type: "boolean", default: false },
+    "allow-checked-out": { type: "boolean", default: false },
   },
 });
 
@@ -54,7 +55,29 @@ let head: string;
 try {
   head = await branchHead(repoDir, cfg.branch);
 } catch {
-  die(`branch ${cfg.branch} does not exist in ${repoDir}`, `commit something on ${cfg.branch}, or set branch = "..." in project.toml`);
+  // A missing project branch starts at the current commit (init picks a dedicated "minga" branch).
+  const start = Bun.spawnSync(["git", "-C", repoDir, "rev-parse", "--verify", "--quiet", "HEAD^{commit}"]);
+  const startSha = start.stdout.toString().trim();
+  if (start.exitCode !== 0 || startSha === "") {
+    die(`branch ${cfg.branch} does not exist in ${repoDir} and there is no commit to start it from`, "commit something first");
+  }
+  if (!values["dry-run"]) {
+    const made = Bun.spawnSync(["git", "-C", repoDir, "update-ref", `refs/heads/${cfg.branch}`, startSha, ""]);
+    if (made.exitCode !== 0) die(`cannot create branch ${cfg.branch}: ${made.stderr.toString().trim()}`);
+    console.log(`minga: created branch ${cfg.branch} at ${startSha.slice(0, 12)}; accepted work lands there (merge it whenever you like)`);
+  }
+  head = startSha;
+}
+
+// Accepted commits move the branch ref directly. If that branch is checked out, the
+// working tree and index fall behind it and the next "git commit -a" there silently
+// reverts the agents' work, so refuse unless told otherwise.
+const checkedOut = checkedOutIn(repoDir, cfg.branch);
+if (checkedOut !== null && !values["allow-checked-out"]) {
+  die(
+    `branch ${cfg.branch} is checked out in ${checkedOut}; accepted commits would move it under that working tree`,
+    `set branch = "minga" in project.toml (serve creates it), check out another branch there, or pass --allow-checked-out`,
+  );
 }
 const concurrency = values["check-concurrency"] !== undefined
   ? Math.max(1, Number(values["check-concurrency"]) || 1)
@@ -68,6 +91,18 @@ if (values["dry-run"]) {
     seedTasks: cfg.seedTasks.length,
   }, null, 2));
   process.exit(0);
+}
+
+/** The worktree path that has `branch` checked out, or null. Check-pool worktrees are detached. */
+function checkedOutIn(repo: string, branch: string): string | null {
+  const list = Bun.spawnSync(["git", "-C", repo, "worktree", "list", "--porcelain"]);
+  if (list.exitCode !== 0) return null;
+  let path: string | null = null;
+  for (const line of list.stdout.toString().split(/\r?\n/)) {
+    if (line.startsWith("worktree ")) path = line.slice("worktree ".length);
+    else if (line === `branch refs/heads/${branch}` && path !== null) return path;
+  }
+  return null;
 }
 
 const LOOPBACK = new Set(["127.0.0.1", "localhost", "::1"]);

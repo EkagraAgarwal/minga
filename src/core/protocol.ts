@@ -47,6 +47,8 @@ export interface ProjectInfo {
   paths: string[];
   headAgent: AgentId;
   rules: Rules;
+  /** The branch accepted work lands on; clone it with `git clone -b <branch> <url>/repo.git`. */
+  branch?: string;
 }
 
 /**

@@ -36,7 +36,7 @@ agent commands
   sync [--discard]
 
 maintainer commands
-  init [dir] --name <n> --goal <g> --scope <s> --check <cmd> --paths <glob[,glob...>] [--branch main] [--force]
+  init [dir] --name <n> --goal <g> --scope <s> --check <cmd> --paths <glob[,glob...>] [--branch minga] [--force]
   serve [--repo <dir>] [--port 7777] [--host 127.0.0.1] [server flags...]
   doctor [--repo <dir>]
   mcp [--dir <dir>]
@@ -111,7 +111,7 @@ says the project is finished. --json prints the raw response.`,
 Fetches origin, then drops local files left by an accepted submit when they
 match the fetched branch head or come from your last accepted submission.
 Other changes are refused unless --discard is given.`,
-  init: `usage: minga init [dir] --name <n> --goal <g> --scope <s> --check <cmd> --paths <glob[,glob...>] [--branch main] [--force]
+  init: `usage: minga init [dir] --name <n> --goal <g> --scope <s> --check <cmd> --paths <glob[,glob...>] [--branch minga] [--force]
 
 Non-interactive scaffold: creates .minga/head.json, project.toml and adds
 .minga/ to .gitignore. dir must already be a git repository. --force overwrites

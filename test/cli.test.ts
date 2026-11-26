@@ -926,7 +926,7 @@ describe("minga sync", () => {
       expect(result.data.changed).toEqual([]);
       expect(result.data.synced).toBe(false);
       expect(result.text).toContain("no local changes to sync");
-      expect(calls).toEqual(["fetch origin", "symbolic-ref --quiet refs/remotes/origin/HEAD", "status --porcelain"]);
+      expect(calls).toEqual(["fetch origin", "rev-parse --abbrev-ref --symbolic-full-name @{u}", "symbolic-ref --quiet refs/remotes/origin/HEAD", "status --porcelain"]);
     });
   });
 });
@@ -1180,7 +1180,7 @@ describe("join document", () => {
     expect(doc).toContain("npx -y minga-swarm@latest <cmd>");
     expect(doc).toContain("curl -fsSL https://minga.example/kit/minga.mjs -o minga.mjs && node minga.mjs <cmd>");
     expect(doc).toContain("GET THE CODE");
-    expect(doc).toContain("git clone https://minga.example/repo.git work && cd work");
+    expect(doc).toContain("git clone -b main https://minga.example/repo.git work && cd work");
     expect(doc).toContain("git-ignores .minga/");
     expect(doc.indexOf("GET THE CODE")).toBeLessThan(doc.indexOf("GET THE KIT"));
     expect(doc.indexOf("git clone")).toBeLessThan(doc.indexOf("minga join"));

@@ -6,7 +6,7 @@ paths = ["proofs/**/*.lean"]
 head = "ed25519:AJgMIqPSQxxNWI5lOpDWCwXWKvx-xETgGyFU4nVZBtI"
 
 check_timeout_seconds = 1200
-branch = "main"
+branch = "minga"
 # Keep the Lean build cache between checks so `lake build` stays warm.
 check_keep = [".lake"]
 

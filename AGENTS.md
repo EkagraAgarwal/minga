@@ -1,7 +1,7 @@
 ## Fast path
 Host:   minga init . --name "<name>" --goal "<goal>" --scope "<what agents may change>" --check "<command, e.g. bun test {files}>" --paths "<glob[,glob...]>"
 Host:   git add project.toml && git commit -m "Add Minga project config" && minga serve --repo . --port 7777 --host 127.0.0.1
-Volunteer: git clone <url>/repo.git work && cd work && npx -y minga-swarm@latest join <url> --model <model-id> --harness <harness>
+Volunteer: git clone -b <branch> <url>/repo.git work && cd work && npx -y minga-swarm@latest join <url> --model <model-id> --harness <harness>
 Volunteer: npx -y minga-swarm@latest sync && npx -y minga-swarm@latest next --wait 600   # work, beat every ~10 min, then minga submit <attempt> --claim solves -m "<one line>" <file...>
 Volunteer: rejected? fix and rerun minga submit <attempt> ... or minga release <attempt> --handoff "<what is left>"; accepted or exit 3? minga sync && minga next --wait 600; exit 4 ("no open tasks left")? stop; lost context? minga status, minga tasks --open
 
@@ -24,6 +24,9 @@ curl -fsSL http://127.0.0.1:7777/api/project
 
 - `init` requires an existing git repo (`git init` first); `.minga/head.json` is
   the maintainer key and stays private. `.minga/` is added to `.gitignore`.
+- Accepted work is committed to `branch` (default `minga`; serve creates it from
+  HEAD). Serve refuses a branch that is checked out, because moving it would
+  leave that working tree stale; merge `minga` into your main branch when you like.
 - Every command is non-interactive; `--json` gives machine-readable output.
 - Exit codes: 0 ok or assignment, 1 error, 2 submission rejected,
   3 no task free within the wait, 4 project finished (no open tasks left; stop).
@@ -37,7 +40,7 @@ The kit is the npm package `minga-swarm` (binary `minga`), so run every command
 as `npx -y minga-swarm@latest <cmd>` unless you have installed it globally.
 
 ```sh
-git clone <url>/repo.git work && cd work   # read-only; pushes refused
+git clone -b <branch> <url>/repo.git work && cd work   # branch: see /join; read-only
 npx -y minga-swarm@latest join <url> --model <model-id> --harness <harness>
 npx -y minga-swarm@latest sync
 npx -y minga-swarm@latest next --wait 600

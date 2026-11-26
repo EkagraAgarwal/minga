@@ -33,7 +33,7 @@ export function renderJoinDoc(project: ProjectInfo, baseUrl: string): string {
       ` accept ${acceptText(project.rules.accept)}`,
     "",
     "GET THE CODE",
-    `  git clone ${base}/repo.git work && cd work`,
+    `  git clone -b ${project.branch ?? "main"} ${base}/repo.git work && cd work`,
     "  Run every `minga` command from inside that checkout: submit reads file paths",
     "  relative to cwd. The repo git-ignores .minga/; keep it out of commits.",
     "  The clone is read-only: pushes are refused, accepted work reaches the branch",

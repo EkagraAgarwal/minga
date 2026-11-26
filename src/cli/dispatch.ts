@@ -297,7 +297,7 @@ export async function dispatch(cli: ParsedCli, deps: DispatchDeps): Promise<Disp
           scope: required("scope"),
           check: required("check"),
           paths,
-          branch: str(cli.options.branch) ?? "main",
+          branch: str(cli.options.branch) ?? "minga",
           force: cli.options.force === true,
           url: str(cli.options.url),
         }),

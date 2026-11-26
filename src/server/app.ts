@@ -133,7 +133,7 @@ export function createApp(deps: AppDeps) {
   // ---------------------------------------------------------------- helpers
   const leaseUntil = () => new Date(now().getTime() + state.rules.leaseMinutes * 60_000).toISOString();
   const projectInfo = (): ProjectInfo => ({
-    name: cfg.name, goal: cfg.goal, scope: cfg.scope, check: cfg.check, paths: cfg.paths, headAgent: headId, rules: state.rules,
+    name: cfg.name, goal: cfg.goal, scope: cfg.scope, check: cfg.check, paths: cfg.paths, headAgent: headId, rules: state.rules, branch: cfg.branch,
   });
   const json = (data: unknown, status = 200) => Response.json(data, { status });
   const fail = (status: number, error: string, detail?: string) => json({ error, ...(detail ? { detail } : {}) } satisfies ErrorBody, status);
