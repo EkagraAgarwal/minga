@@ -612,14 +612,25 @@ export function createApp(deps: AppDeps) {
   }
 
   // ---------------------------------------------------------------- reads
-  let viewCache: { seq: number; at: number; body: string } | null = null;
-  function viewBody(): string {
+  // Rebuilt at most once a second (and kept up to 5 s while nothing changes). Gzipped once per
+  // rebuild: at ~1,500 agents the JSON is ~1 MB and compresses about 10x.
+  let viewCache: { seq: number; at: number; body: string; gz?: Uint8Array<ArrayBuffer> } | null = null;
+  function viewEntry() {
     const t = Date.now();
-    if (viewCache && t - viewCache.at < 1000) return viewCache.body;
-    if (viewCache && viewCache.seq === state.seq && t - viewCache.at < 5000) return viewCache.body;
+    if (viewCache && t - viewCache.at < 1000) return viewCache;
+    if (viewCache && viewCache.seq === state.seq && t - viewCache.at < 5000) return viewCache;
     const body = JSON.stringify(buildView({ state, project: projectInfo(), now: now(), events: store.head() }));
     viewCache = { seq: state.seq, at: t, body };
-    return body;
+    return viewCache;
+  }
+  function viewResponse(req: Request): Response {
+    const v = viewEntry();
+    const headers: Record<string, string> = { "content-type": "application/json", "cache-control": "no-store", vary: "accept-encoding" };
+    if (/\bgzip\b/.test(req.headers.get("accept-encoding") ?? "") && v.body.length > 2048) {
+      v.gz ??= Bun.gzipSync(v.body) as Uint8Array<ArrayBuffer>;
+      return new Response(v.gz as Uint8Array<ArrayBuffer>, { headers: { ...headers, "content-encoding": "gzip" } });
+    }
+    return new Response(v.body, { headers });
   }
 
   function metrics(): MetricsResponse {
@@ -684,7 +695,7 @@ export function createApp(deps: AppDeps) {
     const path = url.pathname;
     if (req.method === "GET") {
       if (path === "/api/project") return json(projectInfo());
-      if (path === "/api/view") return new Response(viewBody(), { headers: { "content-type": "application/json", "cache-control": "no-store" } });
+      if (path === "/api/view") return viewResponse(req);
       if (path === "/api/leaderboard") return json(computeLeaderboard(state, 1000));
       if (path === "/api/metrics") return json(metrics());
       if (path === "/api/events") {
