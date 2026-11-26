@@ -12,6 +12,14 @@ import { dirname, join, resolve } from "node:path";
 import type { AgentId } from "../core/types.ts";
 import type { KeyPair } from "../identity/keys.ts";
 
+/** The last work `minga next` handed out, kept so `status` can recover context. */
+export interface LastAssignment {
+  attempt: string;
+  role: string;
+  leaseUntil: string;
+  task: string;
+}
+
 export interface SessionIdentity {
   /** Coordinator base URL used at join time. */
   url: string;
@@ -21,6 +29,10 @@ export interface SessionIdentity {
   model: string;
   harness: string;
   owner?: string;
+  /** Last assignment from `next`. */
+  lastAssignment?: LastAssignment;
+  /** Last submission id from `submit`. */
+  lastSubmission?: string;
 }
 
 export interface HeadIdentity {
@@ -110,6 +122,19 @@ export function readAgent(dir: string): SessionIdentity | null {
   };
   const owner = optionalString(obj, "owner");
   if (owner !== undefined) identity.owner = owner;
+  const raw = obj.lastAssignment;
+  if (raw && typeof raw === "object" && !Array.isArray(raw)) {
+    const a = raw as Record<string, unknown>;
+    const attempt = optionalString(a, "attempt");
+    const role = optionalString(a, "role");
+    const leaseUntil = optionalString(a, "leaseUntil");
+    const task = optionalString(a, "task");
+    if (attempt && role && leaseUntil && task) {
+      identity.lastAssignment = { attempt, role, leaseUntil, task };
+    }
+  }
+  const lastSubmission = optionalString(obj, "lastSubmission");
+  if (lastSubmission !== undefined) identity.lastSubmission = lastSubmission;
   return identity;
 }
 
@@ -123,6 +148,8 @@ export function writeAgent(dir: string, identity: SessionIdentity): string {
     harness: identity.harness,
   };
   if (identity.owner !== undefined) value.owner = identity.owner;
+  if (identity.lastAssignment !== undefined) value.lastAssignment = identity.lastAssignment;
+  if (identity.lastSubmission !== undefined) value.lastSubmission = identity.lastSubmission;
   return writeObject(agentPath(dir), value);
 }
 

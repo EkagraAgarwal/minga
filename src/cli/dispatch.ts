@@ -23,7 +23,7 @@ import type { SessionIdentity } from "./store.ts";
 export interface DispatchDeps {
   dir: string;
   urlOverride?: string;
-  /** Progress lines (queued / checking / verdict), never part of --json output. */
+  /** Progress lines (queued / checking), written to stderr, never part of --json output. */
   onProgress?: (line: string) => void;
   fetchImpl?: FetchLike;
   runtime?: RuntimeDeps;
@@ -118,6 +118,18 @@ export async function dispatch(cli: ParsedCli, deps: DispatchDeps): Promise<Disp
         wait: intOption(cli.options.wait, "wait") ?? 0,
         onProgress: deps.onProgress,
       });
+      const a = result.data.assignment;
+      if (a) {
+        writeAgent(dir, {
+          ...identity,
+          lastAssignment: {
+            attempt: a.attempt,
+            role: a.role,
+            leaseUntil: a.leaseUntil,
+            task: a.task.id,
+          },
+        });
+      }
       return { result, code: result.data.assignment ? 0 : 3 };
     }
 
@@ -160,6 +172,8 @@ export async function dispatch(cli: ParsedCli, deps: DispatchDeps): Promise<Disp
         wait: cli.options.wait !== false,
         onProgress: deps.onProgress,
       });
+      const submission = "submission" in result.data ? result.data.submission : result.data.id;
+      writeAgent(dir, { ...identity, lastSubmission: submission });
       return { result, code: submissionExitCode(result.data) };
     }
 
@@ -222,7 +236,7 @@ export async function dispatch(cli: ParsedCli, deps: DispatchDeps): Promise<Disp
 
     case "status": {
       const { identity, client: c } = requireAgent(deps);
-      return { result: await statusCommand(c, identity.agent), code: 0 };
+      return { result: await statusCommand(c, identity), code: 0 };
     }
 
     case "board": {

@@ -32,7 +32,7 @@ const boolProp = (description: string) => ({ type: "boolean", description });
 export const MCP_TOOLS: McpTool[] = [
   {
     name: "minga_join",
-    description: "Join a Minga project with your model and harness; saves your identity for later tools. Call this first.",
+    description: "Step 0: join a Minga project with your model and harness; saves your identity for later tools. Call this first. Loop after it: minga_next -> work -> minga_beat -> minga_submit -> read the verdict with minga_submit or minga_result, or give up with minga_release.",
     inputSchema: {
       type: "object",
       properties: {
@@ -46,17 +46,20 @@ export const MCP_TOOLS: McpTool[] = [
   },
   {
     name: "minga_next",
-    description: "Ask for the next task. Use wait to block until one is free, up to 600 seconds.",
+    description: "Step 1 of the loop: ask for a task. wait defaults to 30 seconds (one long-poll); call again if assignment is null. Then work, minga_beat every ~10 min, minga_submit, and read the verdict (or minga_release).",
     inputSchema: {
       type: "object",
       properties: {
-        wait: { type: "integer", minimum: 0, description: "Seconds to wait for an assignment (default 0)." },
+        wait: {
+          type: "integer", minimum: 0,
+          description: "Seconds to wait for an assignment (default 30, one long-poll); call again if assignment is null.",
+        },
       },
     },
   },
   {
     name: "minga_beat",
-    description: "Renew the lease on your current attempt. Do this roughly every 10 minutes while working.",
+    description: "Step 2 of the loop: renew the lease on your current attempt roughly every 10 minutes while working on it.",
     inputSchema: {
       type: "object",
       properties: {
@@ -81,7 +84,7 @@ export const MCP_TOOLS: McpTool[] = [
   },
   {
     name: "minga_submit",
-    description: "Submit changed files for checking and wait for the verdict. Files must be paths relative to root.",
+    description: "Step 3 of the loop: submit changed files (paths relative to root) for checking; waits for the verdict by default, up to ~10 minutes. Pass wait:false to return immediately and then call minga_result. On rejection, fix and submit again or call minga_release.",
     inputSchema: {
       type: "object",
       properties: {
@@ -97,7 +100,7 @@ export const MCP_TOOLS: McpTool[] = [
   },
   {
     name: "minga_result",
-    description: "Show a submission and its verdict; use wait to block until it is final.",
+    description: "Show a submission and its verdict. Use this after minga_submit with wait:false; set wait:true to block until the verdict is final.",
     inputSchema: {
       type: "object",
       properties: {
@@ -109,7 +112,7 @@ export const MCP_TOOLS: McpTool[] = [
   },
   {
     name: "minga_release",
-    description: "Give up an attempt. Always leave a handoff note so the next agent can continue.",
+    description: "Step 4 of the loop (instead of submitting): give up an attempt. Always leave a handoff note so the next agent can continue.",
     inputSchema: {
       type: "object",
       properties: {
@@ -158,7 +161,7 @@ export const MCP_TOOLS: McpTool[] = [
   },
   {
     name: "minga_status",
-    description: "Show the project goal, scope, check, paths, rules and your agent id.",
+    description: "Show the project goal, scope, check, paths, rules, your agent id, your last attempt with lease remaining and your last submission's queue position.",
     inputSchema: { type: "object", properties: {} },
   },
   {
@@ -234,8 +237,11 @@ export function toolToCli(name: string, args: Record<string, unknown>): ParsedCl
       break;
     case "minga_next": {
       command = "next";
-      const wait = optNumber(args, "wait");
-      if (wait !== undefined) options.wait = String(Math.max(0, Math.floor(wait)));
+      // One long-poll by default; the agent calls again when assignment is null.
+      // An explicit wait:false still means a single immediate request.
+      const given = args.wait;
+      const wait = typeof given === "boolean" ? (given ? 30 : 0) : optNumber(args, "wait") ?? 30;
+      options.wait = String(Math.max(0, Math.floor(wait)));
       break;
     }
     case "minga_beat":

@@ -11,9 +11,10 @@ import type {
   SubmissionView,
   SubmitResponse,
 } from "../../src/core/protocol.ts";
-import { generateKeyPair } from "../../src/identity/keys.ts";
+import { generateKeyPair, type KeyPair } from "../../src/identity/keys.ts";
 import type { Options } from "./args.ts";
 import { apiRequest, sleep } from "./client.ts";
+import { PipelineStats, submissionTimings, type PipelineSnapshot } from "./pipeline.ts";
 import { RouteStats, type RouteSnapshot } from "./stats.ts";
 
 interface ModelMix {
@@ -32,6 +33,9 @@ const MODEL_MIX: readonly ModelMix[] = [
 ];
 const WEIGHT_TOTAL = MODEL_MIX.reduce((sum, entry) => sum + entry.weight, 0);
 
+/** A rejected attempt stays live; bound how often we resubmit on the same attempt. */
+const MAX_RESUBMITS = 2;
+
 function pickModel(): ModelMix {
   let roll = Math.random() * WEIGHT_TOTAL;
   for (const entry of MODEL_MIX) {
@@ -39,6 +43,35 @@ function pickModel(): ModelMix {
     if (roll < 0) return entry;
   }
   return MODEL_MIX[MODEL_MIX.length - 1]!;
+}
+
+/**
+ * Give an attempt back before another next() call. A failed release must never
+ * be followed by next() on the same agent: the server keeps the attempt live
+ * and answers 409. Returns true only when the attempt is no longer held.
+ */
+async function releaseAttempt(
+  baseUrl: string,
+  keys: KeyPair,
+  attempt: string,
+  handoff: string,
+  stats: RouteStats,
+  routeName: string,
+  leaseUntil?: string,
+): Promise<boolean> {
+  // An expired lease is no longer a held attempt; the server's sweep will end it.
+  if (leaseUntil && Date.parse(leaseUntil) <= Date.now()) return true;
+  for (let tryNo = 0; tryNo < 3; tryNo++) {
+    const release = await apiRequest(baseUrl, keys, "POST", "/api/release", { attempt, handoff }, 8_000);
+    stats.record(routeName, release.status, release.latencyMs, release.errorBody);
+    if (release.ok) return true;
+    // 410 means the attempt already ended (expired or closed), so it is not held.
+    if (release.status === 410) return true;
+    // 409 means a submission is still queued: calling next would also be a 409.
+    if (release.status === 409) return false;
+    await sleep(300);
+  }
+  return false;
 }
 
 export interface MetricsSample {
@@ -79,11 +112,15 @@ export interface SwarmTotals {
 }
 
 export interface Targets {
-  /** Worst p99 across next(probe), beat, note and submit. */
+  /** Worst p99 across next(probe), beat, note, submit and release. */
   p99Ms: number;
   p99Pass: boolean;
   errors5xx: number;
   errors5xxPass: boolean;
+  /** A 409/410 after the harness fixes means protocol misuse; both must be zero. */
+  errors409: number;
+  errors410: number;
+  conflictPass: boolean;
   peakCpuPct: number;
   cpuPass: boolean;
   peakRssBytes: number;
@@ -97,6 +134,8 @@ export interface HarnessResult {
   endedAt: string;
   durationSeconds: number;
   routes: Record<string, RouteSnapshot>;
+  /** Check-pipeline numbers from SubmissionView fields, separate from HTTP latency. */
+  pipeline: PipelineSnapshot;
   samples: MetricsSample[];
   peakCpuPct: number;
   peakRssBytes: number;
@@ -117,6 +156,7 @@ export async function runSwarm(opts: Options, baseUrl: string): Promise<HarnessR
   const startedAt = Date.now();
   const deadline = startedAt + opts.duration * 1000;
   const stats = new RouteStats();
+  const pipeline = new PipelineStats();
   const totals = emptyTotals();
   const samples: MetricsSample[] = [];
   const sse: SseStats = { connections: 0, events: 0, errors: 0, maxLagMs: 0 };
@@ -125,10 +165,12 @@ export async function runSwarm(opts: Options, baseUrl: string): Promise<HarnessR
   const statusTimer = setInterval(() => {
     const elapsed = Math.round((Date.now() - startedAt) / 1000);
     const probe = stats.snapshot()["POST /api/next probe"];
+    const conflicts = stats.totalConflicts();
     console.log(
       `[${String(elapsed).padStart(3)}s] joins=${totals.joins} assigned=${totals.assignments} ` +
       `submitted=${totals.submissions} accepted=${totals.accepted} rejected=${totals.rejected} ` +
-      `nextProbe p99=${probe?.p99.toFixed(1) ?? "0.0"}ms 5xx=${stats.total5xx()}`,
+      `nextProbe p99=${probe?.p99.toFixed(1) ?? "0.0"}ms 5xx=${stats.total5xx()} ` +
+      `409=${conflicts.errors409} 410=${conflicts.errors410}`,
     );
   }, 10_000);
 
@@ -188,7 +230,7 @@ export async function runSwarm(opts: Options, baseUrl: string): Promise<HarnessR
     let first = true;
     while (!stop) {
       const metrics = await apiRequest<MetricsResponse>(baseUrl, undefined, "GET", "/api/metrics", undefined, 5000);
-      stats.record("GET /api/metrics", metrics.status, metrics.latencyMs);
+      stats.record("GET /api/metrics", metrics.status, metrics.latencyMs, metrics.errorBody);
       if (metrics.body) {
         const at = performance.now();
         const deltaSeconds = (at - previousAt) / 1000;
@@ -214,7 +256,7 @@ export async function runSwarm(opts: Options, baseUrl: string): Promise<HarnessR
         });
       }
       const view = await apiRequest<unknown>(baseUrl, undefined, "GET", "/api/view", undefined, 10_000);
-      stats.record("GET /api/view", view.status, view.latencyMs);
+      stats.record("GET /api/view", view.status, view.latencyMs, view.errorBody);
       await sleep(5000);
     }
   })();
@@ -228,12 +270,22 @@ export async function runSwarm(opts: Options, baseUrl: string): Promise<HarnessR
       const join = await apiRequest<JoinResponse>(baseUrl, keys, "POST", "/api/join", {
         publicKey: keys.publicKey, model, harness: "swarm-probe",
       }, 10_000);
-      stats.record("POST /api/join", join.status, join.latencyMs);
+      stats.record("POST /api/join", join.status, join.latencyMs, join.errorBody);
       if (!join.ok) return;
       while (!stop && Date.now() < deadline) {
         const tickStart = Date.now();
         const result = await apiRequest<NextResponse>(baseUrl, keys, "POST", "/api/next", { wait: 0, model }, 15_000);
-        stats.record("POST /api/next probe", result.status, result.latencyMs);
+        // Only the next() latency is measured for the target; the release is a separate route.
+        stats.record("POST /api/next probe", result.status, result.latencyMs, result.errorBody);
+        const assignment = result.ok ? result.body?.assignment : undefined;
+        if (assignment) {
+          // Probe agents keep no state: give the slot straight back before calling next again.
+          const released = await releaseAttempt(
+            baseUrl, keys, assignment.attempt, "latency probe", stats, "POST /api/release probe",
+            assignment.leaseUntil,
+          );
+          if (!released) return; // never call next while an assignment may still be held
+        }
         await sleep(Math.max(0, 1000 - (Date.now() - tickStart)));
       }
     })());
@@ -253,7 +305,7 @@ export async function runSwarm(opts: Options, baseUrl: string): Promise<HarnessR
       const joined = await apiRequest<JoinResponse>(baseUrl, keys, "POST", "/api/join", {
         publicKey: keys.publicKey, model, harness,
       }, 15_000);
-      stats.record("POST /api/join", joined.status, joined.latencyMs);
+      stats.record("POST /api/join", joined.status, joined.latencyMs, joined.errorBody);
       if (!joined.ok) {
         totals.joinErrors++;
         return;
@@ -262,7 +314,7 @@ export async function runSwarm(opts: Options, baseUrl: string): Promise<HarnessR
 
       while (!stop && Date.now() < deadline) {
         const next = await apiRequest<NextResponse>(baseUrl, keys, "POST", "/api/next", { wait: 30, model }, 40_000);
-        stats.record("POST /api/next", next.status, next.latencyMs);
+        stats.record("POST /api/next", next.status, next.latencyMs, next.errorBody);
         const assignment = next.ok ? next.body?.assignment : undefined;
         if (!assignment) {
           totals.noWork++;
@@ -279,7 +331,7 @@ export async function runSwarm(opts: Options, baseUrl: string): Promise<HarnessR
         // A long think needs a lease heartbeat.
         if (thinkMs > 8000) {
           const beat = await apiRequest(baseUrl, keys, "POST", "/api/beat", { attempt: assignment.attempt, model }, 15_000);
-          stats.record("POST /api/beat", beat.status, beat.latencyMs);
+          stats.record("POST /api/beat", beat.status, beat.latencyMs, beat.errorBody);
           if (beat.ok) totals.beats++;
         }
 
@@ -289,61 +341,80 @@ export async function runSwarm(opts: Options, baseUrl: string): Promise<HarnessR
             kind: "idea",
             text: `swarm agent exploring ${assignment.task.id} as ${assignment.role}`,
           }, 15_000);
-          stats.record("POST /api/note", note.status, note.latencyMs);
+          stats.record("POST /api/note", note.status, note.latencyMs, note.errorBody);
           if (note.ok) totals.notes++;
         }
 
-        const passes = Math.random() < opts.pass;
-        const content = passes
-          ? "load test artefact\nok\nsubmitted by simulated agent\n"
-          : "load test artefact\nstill working\nsubmitted by simulated agent\n";
-        const submitted = await apiRequest<SubmitResponse>(baseUrl, keys, "POST", "/api/submit", {
-          attempt: assignment.attempt,
-          claim: "progress",
-          message: `swarm: ${assignment.task.id}`,
-          files: { [`work/${assignment.task.id}.txt`]: content },
-          model,
-        }, 15_000);
-        stats.record("POST /api/submit", submitted.status, submitted.latencyMs);
-        if (!submitted.ok || !submitted.body?.submission) {
-          const release = await apiRequest(baseUrl, keys, "POST", "/api/release", {
-            attempt: assignment.attempt, handoff: "submission failed to queue",
+        // Work this attempt until accepted, or hand it back. Every path that
+        // calls next() again first makes sure the attempt is no longer held.
+        let resubmits = 0;
+        while (!stop && Date.now() < deadline) {
+          const passes = Math.random() < opts.pass;
+          const content = passes
+            ? "load test artefact\nok\nsubmitted by simulated agent\n"
+            : "load test artefact\nstill working\nsubmitted by simulated agent\n";
+          const submitted = await apiRequest<SubmitResponse>(baseUrl, keys, "POST", "/api/submit", {
+            attempt: assignment.attempt,
+            claim: "progress",
+            message: `swarm: ${assignment.task.id}`,
+            files: { [`work/${assignment.task.id}.txt`]: content },
+            model,
           }, 15_000);
-          stats.record("POST /api/release", release.status, release.latencyMs);
-          totals.releases++;
-          continue;
-        }
-        totals.submissions++;
-
-        let final: SubmissionView | undefined;
-        for (let poll = 0; poll < 3 && !stop && Date.now() < deadline; poll++) {
-          const result = await apiRequest<SubmissionView>(
-            baseUrl, undefined, "GET", `/api/submission/${encodeURIComponent(submitted.body.submission)}?wait=30`, undefined, 40_000,
-          );
-          stats.record("GET /api/submission", result.status, result.latencyMs);
-          totals.polls++;
-          if (!result.ok || !result.body) break;
-          if (result.body.status === "accepted" || result.body.status === "rejected") {
-            final = result.body;
+          stats.record("POST /api/submit", submitted.status, submitted.latencyMs, submitted.errorBody);
+          if (!submitted.ok || !submitted.body?.submission) {
+            // Nothing was queued, so the attempt is safe to release.
+            const released = await releaseAttempt(
+              baseUrl, keys, assignment.attempt, "submission failed to queue", stats, "POST /api/release",
+              assignment.leaseUntil,
+            );
+            totals.releases++;
+            if (!released) return; // do not call next with a live attempt
             break;
           }
-        }
+          totals.submissions++;
 
-        if (final?.status === "accepted") {
-          totals.accepted++;
-          continue;
+          // A timed-out poll just polls again. Never release while the
+          // submission is queued or checking: the server rejects that with 409.
+          let final: SubmissionView | undefined;
+          while (!final && !stop && Date.now() < deadline) {
+            const result = await apiRequest<SubmissionView>(
+              baseUrl, undefined, "GET", `/api/submission/${encodeURIComponent(submitted.body.submission)}?wait=30`, undefined, 40_000,
+            );
+            stats.record("GET /api/submission", result.status, result.latencyMs, result.errorBody);
+            totals.polls++;
+            if (!result.ok || !result.body) {
+              await sleep(1000);
+              continue;
+            }
+            if (result.body.status === "accepted" || result.body.status === "rejected") {
+              final = result.body;
+            }
+          }
+          if (!final) break; // deadline or stop; leave the attempt to expire rather than release a queued submission
+
+          pipeline.record(submissionTimings(final));
+          if (final.status === "accepted") {
+            totals.accepted++;
+            break; // the server ended the attempt on acceptance
+          }
+          totals.rejected++;
+
+          if (resubmits < MAX_RESUBMITS && Math.random() < 0.5) {
+            // Resubmit on the SAME attempt: it stays live after a rejection.
+            resubmits++;
+            totals.resubmits++;
+            continue;
+          }
+          // Give up on this attempt, with a handoff, before the next next() call.
+          const released = await releaseAttempt(
+            baseUrl, keys, assignment.attempt,
+            `check ${final.status}: trying a different approach`, stats, "POST /api/release",
+            assignment.leaseUntil,
+          );
+          totals.releases++;
+          if (!released) return; // do not call next with a live attempt
+          break;
         }
-        if (final?.status === "rejected") totals.rejected++;
-        if (final?.status === "rejected" && Math.random() < 0.5) {
-          totals.resubmits++;
-          continue; // try a fresh assignment and resubmit
-        }
-        const release = await apiRequest(baseUrl, keys, "POST", "/api/release", {
-          attempt: assignment.attempt,
-          handoff: final ? `check ${final.status}: trying a different approach` : "verdict timed out, handing off",
-        }, 15_000);
-        stats.record("POST /api/release", release.status, release.latencyMs);
-        totals.releases++;
       }
     })());
   }
@@ -355,21 +426,27 @@ export async function runSwarm(opts: Options, baseUrl: string): Promise<HarnessR
   await Promise.allSettled([sampleTask, ...probeTasks, ...viewerTasks]);
 
   const routes = stats.snapshot();
-  const targetNames = ["POST /api/next probe", "POST /api/beat", "POST /api/note", "POST /api/submit"];
+  const targetNames = ["POST /api/next probe", "POST /api/beat", "POST /api/note", "POST /api/submit", "POST /api/release"];
   const p99Ms = Math.max(...targetNames.map((name) => routes[name]?.p99 ?? 0));
   const errors5xx = stats.total5xx();
+  const { errors409, errors410 } = stats.totalConflicts();
   const peakCpuPct = samples.reduce((peak, sample) => Math.max(peak, sample.cpuPct), 0);
   const peakRssBytes = samples.reduce((peak, sample) => Math.max(peak, sample.rssBytes), 0);
   const notes: string[] = [];
   if ((routes["POST /api/next probe"]?.count ?? 0) === 0) notes.push("no wait=0 probe samples: p99 target is unproven");
   if (samples.length === 0) notes.push("no /api/metrics samples: CPU and RSS targets are unproven");
   if (sse.connections === 0) notes.push("no SSE connections established");
+  if (pipeline.count === 0) notes.push("no final submissions: check-pipeline numbers are unproven");
+  notes.push("submit-to-verdict latency is informational; it depends on the project's check");
 
   const targets: Targets = {
     p99Ms,
     p99Pass: (routes["POST /api/next probe"]?.count ?? 0) > 0 && p99Ms < 250,
     errors5xx,
     errors5xxPass: errors5xx === 0,
+    errors409,
+    errors410,
+    conflictPass: errors409 === 0 && errors410 === 0,
     peakCpuPct,
     cpuPass: samples.length > 0 && peakCpuPct < 85,
     peakRssBytes,
@@ -377,13 +454,14 @@ export async function runSwarm(opts: Options, baseUrl: string): Promise<HarnessR
     overall: true,
     notes,
   };
-  targets.overall = targets.p99Pass && targets.errors5xxPass && targets.cpuPass && targets.rssPass;
+  targets.overall = targets.p99Pass && targets.errors5xxPass && targets.conflictPass && targets.cpuPass && targets.rssPass;
 
   return {
     startedAt: new Date(startedAt).toISOString(),
     endedAt: new Date().toISOString(),
     durationSeconds: (Date.now() - startedAt) / 1000,
     routes,
+    pipeline: pipeline.snapshot(),
     samples,
     peakCpuPct,
     peakRssBytes,

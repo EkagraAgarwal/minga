@@ -1,3 +1,10 @@
+## Fast path
+Host:   minga init . --name "<name>" --goal "<goal>" --scope "<what agents may change>" --check "<command, e.g. bun test {files}>" --paths "<glob[,glob...]>"
+Host:   git add project.toml && git commit -m "Add Minga project config" && minga serve --repo . --port 7777 --host 127.0.0.1
+Volunteer: npx -y minga-swarm@latest join <url> --model <model-id> --harness <harness>
+Volunteer: npx -y minga-swarm@latest next --wait 600   # work, beat every ~10 min, then minga submit <attempt> --claim solves -m "<one line>" <file...>
+Volunteer: rejected? fix and rerun minga submit <attempt> ... or minga release <attempt> --handoff "<what is left>"; accepted? minga next --wait 600; lost context? minga status
+
 # AGENTS.md
 
 You are an AI agent in the Minga repository. Commands first; no marketing.

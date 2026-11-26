@@ -410,7 +410,10 @@ export async function nextCommand(client: Client, input: NextInput = {}): Promis
 
   const wait = last?.retryAfterSeconds ?? 60;
   return {
-    text: `nothing to do, retry in ${wait}s`,
+    // Without --wait an agent should be told the one command that will block.
+    text: total === 0
+      ? 'nothing to do right now; run "minga next --wait 600" to wait for a task'
+      : `nothing to do, retry in ${wait}s`,
     data: last ?? { assignment: null, retryAfterSeconds: wait },
   };
 }
@@ -461,19 +464,29 @@ export async function waitForSubmission(
   initialStatus = "queued",
 ): Promise<SubmissionView> {
   let lastStatus = initialStatus;
+  let lastRuns = 0;
   // Each poll holds the connection for up to 30 s; 1000 polls is > 8 hours.
   for (let i = 0; i < 1000; i++) {
     const view = await client.submission(id, 30);
-    if (view.status !== lastStatus) {
-      lastStatus = view.status;
-      if (view.status === "checking") onProgress?.(`checking ${id}`);
+    const changed = view.status !== lastStatus || view.runs !== lastRuns;
+    lastStatus = view.status;
+    lastRuns = view.runs;
+    if (view.status === "checking" && changed) {
+      onProgress?.(`checking ${id} (run ${view.runs})`);
     }
-    if (isFinal(view.status)) {
-      onProgress?.(`verdict ${view.status} ${id}`);
-      return view;
-    }
+    // The final block below is the only place that reports the verdict.
+    if (isFinal(view.status)) return view;
   }
   throw new Error(`submission ${id} has no verdict yet; check it with "minga result ${id}"`);
+}
+
+/** Why a check was discarded without a verdict, read from the server's outputTail. */
+function staleReason(view: SubmitView): string | undefined {
+  if (!("stale" in view) || view.stale !== true) return undefined;
+  const tail = view.outputTail ?? "";
+  if (/branch kept moving/i.test(tail)) return "the branch kept moving";
+  if (/\bclosed\b/i.test(tail)) return "the task closed first";
+  return "unknown reason";
 }
 
 /** The exact text printed for a submission, shared by submit and result. */
@@ -485,14 +498,31 @@ export function renderSubmission(view: SubmitView): string {
     return `submission ${id}: queued${position}`;
   }
   const lines: string[] = [];
-  if (view.status === "checking") lines.push(`submission ${id}: checking`);
-  else lines.push(`verdict: ${view.status}`, `submission ${id}`);
-  lines.push(`exit code: ${view.exitCode ?? 0}${view.timedOut ? " (timed out)" : ""}`);
+  if (view.status === "checking") {
+    lines.push(`submission ${id}: checking`);
+    return lines.join("\n");
+  }
+  const attempt = "attempt" in view ? view.attempt : id;
+  const exitCode = view.exitCode ?? 0;
+  lines.push(`verdict: ${view.status}`, `submission ${id}`);
+  lines.push(`exit code: ${exitCode}${view.timedOut ? " (timed out)" : ""}`);
+  if (view.status === "rejected") {
+    const reason = staleReason(view);
+    if (reason !== undefined) lines.push(`stale: ${reason}`);
+  }
   if (view.outputTail && view.outputTail.length > 0) {
     lines.push("output tail:", indent(view.outputTail));
+  } else if (view.status === "rejected") {
+    lines.push(`output: (the check printed nothing; exit code ${exitCode})`);
   }
   if (view.commit !== undefined) lines.push(`commit: ${view.commit}`);
   lines.push(`points: ${view.points}`);
+  if (view.status === "accepted") {
+    lines.push("next: minga next --wait 600");
+  } else if (view.status === "rejected") {
+    lines.push(`next: fix and run "minga submit ${attempt} ..." again, or ` +
+      `"minga release ${attempt} --handoff \\"...\\""`);
+  }
   return lines.join("\n");
 }
 
@@ -512,9 +542,9 @@ export async function submitCommand(client: Client, input: SubmitInput): Promise
     ...(input.model !== undefined ? { model: input.model } : {}),
   });
 
-  const progress = `queued ${queued.submission} #${queued.position}`;
+  const progress = `queued ${queued.submission} (#${queued.position} in line)`;
   input.onProgress?.(progress);
-  if (input.wait === false) return { text: progress, data: queued };
+  if (input.wait === false) return { text: renderSubmission(queued), data: queued };
 
   const final = await waitForSubmission(client, queued.submission, input.onProgress);
   return { text: renderSubmission(final), data: final };
@@ -637,20 +667,51 @@ export async function voteCommand(client: Client, input: VoteInput): Promise<Com
 export interface StatusData {
   agent: AgentId;
   project: ProjectInfo;
+  /** Last assignment from `next`, persisted in .minga/agent.json. */
+  assignment?: SessionIdentity["lastAssignment"];
+  /** Last submission from `submit`, checked live on `status`. */
+  submission?: SubmissionView;
 }
 
-export async function statusCommand(client: Client, agent: AgentId): Promise<CommandResult<StatusData>> {
+/** Minutes left on a lease, for an agent that lost context. */
+function leaseText(leaseUntil: string): string {
+  const ms = Date.parse(leaseUntil) - Date.now();
+  if (!Number.isFinite(ms)) return leaseUntil;
+  return ms > 0 ? `${Math.ceil(ms / 60_000)}m left` : "expired";
+}
+
+export async function statusCommand(client: Client, identity: SessionIdentity): Promise<CommandResult<StatusData>> {
   const project = await client.project();
-  const text = [
+  const data: StatusData = { agent: identity.agent, project };
+  const lines = [
     `project: ${project.name}`,
     `goal: ${project.goal}`,
     `scope: ${project.scope}`,
     `check: ${project.check}`,
     `paths: ${project.paths.join(", ")}`,
     `rules: ${formatRules(project.rules)}`,
-    `your agent: ${agent}`,
-  ].join("\n");
-  return { text, data: { agent, project } };
+    `your agent: ${identity.agent}`,
+  ];
+
+  const assignment = identity.lastAssignment;
+  if (assignment) {
+    lines.push(`attempt: ${assignment.attempt} (${assignment.role}) on ${assignment.task} — ` +
+      `lease ${leaseText(assignment.leaseUntil)}`);
+    data.assignment = assignment;
+  }
+
+  if (identity.lastSubmission) {
+    try {
+      const view = await client.submission(identity.lastSubmission, 0);
+      const position = view.status === "queued" && view.position !== undefined ? ` #${view.position}` : "";
+      lines.push(`submission: ${view.id} ${view.status}${position}`);
+      data.submission = view;
+    } catch {
+      lines.push(`submission: ${identity.lastSubmission} (unavailable)`);
+    }
+  }
+
+  return { text: lines.join("\n"), data };
 }
 
 export async function boardCommand(client: Client): Promise<CommandResult<LeaderboardResponse>> {

@@ -76,7 +76,7 @@ export function findPackageRoot(fromUrl: string = import.meta.url): string | nul
     if (existsSync(file)) {
       try {
         const value = JSON.parse(readFileSync(file, "utf8")) as { name?: unknown };
-        if ((value.name === "minga-swarm" || value.name === "minga")) return dir;
+        if ((value.name === "minga-swarm" || (value.name === "minga-swarm" || value.name === "minga"))) return dir;
       } catch {
         // Unreadable package.json: keep walking upwards.
       }

@@ -87,6 +87,21 @@ describe("MCP protocol", () => {
       expect(typeof tool.inputSchema.properties).toBe("object");
     }
     expect(MCP_TOOLS.length).toBe(12);
+
+    const joined = reply.result.tools.find((t: { name: string }) => t.name === "minga_join");
+    const next = reply.result.tools.find((t: { name: string }) => t.name === "minga_next");
+    const submitted = reply.result.tools.find((t: { name: string }) => t.name === "minga_submit");
+    const result = reply.result.tools.find((t: { name: string }) => t.name === "minga_result");
+    expect(joined.description).toContain("minga_next");
+    expect(joined.description).toContain("minga_submit");
+    expect(next.description).toContain("call again if assignment is null");
+    expect(next.description).toContain("30 seconds");
+    expect(next.inputSchema.properties.wait.description).toContain("default 30");
+    expect(submitted.description).toContain("waits for the verdict");
+    expect(submitted.description).toContain("~10 minutes");
+    expect(submitted.description).toContain("wait:false");
+    expect(submitted.description).toContain("minga_result");
+    expect(result.description).toContain("wait:false");
   });
 
   test("unknown methods use -32601; bad JSON uses -32700", async () => {
@@ -149,6 +164,9 @@ describe("tool calls", () => {
       command: "join", options: { model: "m", harness: "h", owner: "o" }, positionals: ["u"],
     });
     expect(toolToCli("minga_next", { wait: 600 }).options.wait).toBe("600");
+    // One long-poll by default; the agent calls again if assignment is null.
+    expect(toolToCli("minga_next", {}).options.wait).toBe("30");
+    expect(toolToCli("minga_next", { wait: false }).options.wait).toBe("0");
     expect(toolToCli("minga_submit", {
       attempt: "A-1", claim: "solves", message: "m", files: ["a.ts", "b.ts"], root: "r",
     })).toEqual({

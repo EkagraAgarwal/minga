@@ -18,6 +18,8 @@ export interface FetchResult<T> {
   ok: boolean;
   body?: T;
   error?: string;
+  /** Raw non-2xx response body, kept only long enough for the harness to print the first few errors. */
+  errorBody?: string;
   latencyMs: number;
   retries: number;
 }
@@ -96,7 +98,7 @@ export async function apiRequest<T>(
         status: res.status,
         ok,
         ...(parsed === undefined ? {} : { body: parsed }),
-        ...(ok ? {} : { error: errorMessage(text, res.status) }),
+        ...(ok ? {} : { error: errorMessage(text, res.status), errorBody: text.slice(0, 500) }),
         latencyMs,
         retries: attempt,
       };

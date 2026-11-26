@@ -17,12 +17,49 @@ export interface DoctorCheck {
 
 export interface DoctorOutput {
   checks: DoctorCheck[];
+  /** Full server dry-run response; printed only by --json, never in the text lines. */
+  configDryRun?: unknown;
 }
 
 export interface DoctorInput {
   dir: string;
   repo?: string;
   packageRoot?: string | null;
+}
+
+interface DryRunInfo {
+  project?: { name?: string; check?: string; branch?: string; head?: string; recheck?: string };
+  checkConcurrency?: number;
+}
+
+/** The server's dry-run error JSON is pretty-printed; reduce it to one line. */
+function dryRunError(raw: string): string | null {
+  try {
+    const parsed = JSON.parse(raw) as { error?: string; fix?: string };
+    if (parsed && typeof parsed.error === "string" && parsed.error.length > 0) {
+      return parsed.fix ? `${parsed.error} (fix: ${parsed.fix})` : parsed.error;
+    }
+  } catch {
+    // not JSON
+  }
+  return null;
+}
+
+/** One line from the server's dry-run JSON; null when it is not the expected shape. */
+function dryRunDetail(raw: string): string | null {
+  let parsed: DryRunInfo;
+  try {
+    parsed = JSON.parse(raw) as DryRunInfo;
+  } catch {
+    return null;
+  }
+  const info = parsed?.project;
+  if (!info || typeof info !== "object") return null;
+  const sha = typeof info.head === "string" && info.head.length > 0 ? info.head.slice(0, 7) : "unknown";
+  const slots = typeof parsed.checkConcurrency === "number" && parsed.checkConcurrency > 0
+    ? parsed.checkConcurrency : 1;
+  return `${info.name ?? "project"}: check "${info.check ?? ""}", branch ${info.branch ?? "?"} @ ${sha}, ` +
+    `${slots} check slot(s), recheck ${info.recheck ?? "?"}`;
 }
 
 export function doctorCommand(input: DoctorInput, deps: RuntimeDeps = {}): CommandResult<DoctorOutput> {
@@ -67,6 +104,7 @@ export function doctorCommand(input: DoctorInput, deps: RuntimeDeps = {}): Comma
     });
 
   // The server owns TOML parsing (Bun.TOML / Bun.Glob); ask it to validate.
+  let configDryRun: unknown;
   if (bun.ok) {
     const root = input.packageRoot === undefined
       ? (deps.packageRoot === undefined ? findPackageRoot() : deps.packageRoot)
@@ -79,7 +117,17 @@ export function doctorCommand(input: DoctorInput, deps: RuntimeDeps = {}): Comma
     } else {
       const worker = join(root, "src", "server", "main.ts");
       const dry = runner(deps.bunPath ?? "bun", [worker, "--repo", repoDir, "--dry-run"]);
-      const detail = dry.stdout.trim() || dry.stderr.trim() || `exit ${dry.status}`;
+      const raw = dry.stdout.trim() || dry.stderr.trim() || `exit ${dry.status}`;
+      const compact = dry.status === 0 ? dryRunDetail(raw) : null;
+      if (compact !== null) {
+        try {
+          configDryRun = JSON.parse(raw);
+        } catch {
+          // Keep the raw text as the detail below; malformed JSON is still a failure.
+        }
+      }
+      const firstLine = raw.split("\n")[0] ?? raw;
+      const detail = compact ?? (dry.status === 0 ? firstLine : dryRunError(raw) ?? firstLine);
       add(dry.status === 0
         ? { name: "config", ok: true, detail }
         : { name: "config", ok: false, detail, fix: "fix project.toml and re-run minga doctor" });
@@ -93,5 +141,8 @@ export function doctorCommand(input: DoctorInput, deps: RuntimeDeps = {}): Comma
     ...(check.fix !== undefined && !check.ok ? [`(fix: ${check.fix})`] : []),
   ].join("  ")).join("\n");
 
-  return { text, data: { checks } };
+  return {
+    text,
+    data: configDryRun === undefined ? { checks } : { checks, configDryRun },
+  };
 }

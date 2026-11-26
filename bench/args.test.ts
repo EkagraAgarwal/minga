@@ -31,6 +31,24 @@ describe("parseArgs", () => {
     expect(() => parseArgs(["--url", "not-a-url"])).toThrow(/--url/);
   });
 
+  test("check-concurrency defaults to cores - 1 (min 1) and can be overridden", () => {
+    expect(parseArgs([]).checkConcurrency).toBe(1);
+    expect(parseArgs(["--cores", "2"]).checkConcurrency).toBe(1);
+    expect(parseArgs(["--cores", "3"]).checkConcurrency).toBe(2);
+    expect(parseArgs(["--cores", "1"]).checkConcurrency).toBe(1);
+    expect(parseArgs(["--cores", "3", "--check-concurrency", "1"]).checkConcurrency).toBe(1);
+    expect(parseArgs(["--check-concurrency=4", "--cores", "2"]).checkConcurrency).toBe(4);
+    expect(() => parseArgs(["--check-concurrency", "0"])).toThrow(/check-concurrency/);
+  });
+
+  test("parses the boolean --keep flag without consuming the next argument", () => {
+    expect(parseArgs([]).keep).toBe(false);
+    expect(parseArgs(["--keep"]).keep).toBe(true);
+    expect(parseArgs(["--keep", "--agents", "300"])).toMatchObject({ keep: true, agents: 300 });
+    expect(parseArgs(["--keep=false"]).keep).toBe(false);
+    expect(() => parseArgs(["--keep=yes"])).toThrow(/keep/);
+  });
+
   test("rejects invalid numbers, ranges and unknown flags", () => {
     expect(() => parseArgs(["--agents", "0"])).toThrow(/agents/);
     expect(() => parseArgs(["--agents", "abc"])).toThrow(/agents/);

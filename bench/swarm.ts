@@ -30,6 +30,7 @@ async function main(): Promise<void> {
     return;
   }
 
+  const runId = new Date().toISOString().replace(/[:.]/g, "-");
   let server: RunningServer | undefined;
   let repoDir: string | undefined;
   try {
@@ -38,9 +39,10 @@ async function main(): Promise<void> {
       const repo = await createTempRepo(opts.tasks);
       repoDir = repo.dir;
       console.log(`bench: temp repo ${repo.dir} (${opts.tasks} tasks)`);
-      server = await startServer(repo.dir, opts.port, opts.cores);
+      server = await startServer(repo.dir, opts.port, opts.cores, opts.checkConcurrency, runId);
       baseUrl = server.url;
-      console.log(`bench: server ready at ${baseUrl}; affinity ${server.pinNote}`);
+      console.log(`bench: server ready at ${baseUrl}; affinity ${server.pinNote}; ` +
+        `check-concurrency ${opts.checkConcurrency}; log ${server.logPath}`);
     } else {
       console.log(`bench: using existing server at ${baseUrl} (no pinning, no teardown)`);
     }
@@ -51,14 +53,19 @@ async function main(): Promise<void> {
     );
     const result = await runSwarm(opts, baseUrl);
     console.log(renderReport(result, opts, baseUrl));
-    const file = await writeResult(result, opts, baseUrl);
+    const file = await writeResult(result, opts, baseUrl, runId);
     console.log(`bench: full result written to ${file}`);
+    if (server) console.log(`bench: server log written to ${server.logPath}`);
   } catch (error) {
     console.error(`bench: setup failed: ${error instanceof Error ? error.message : String(error)}`);
     process.exitCode = 1;
   } finally {
     if (server) await server.stop();
-    if (repoDir) await removeDir(repoDir);
+    if (repoDir && opts.keep) {
+      console.log(`bench: --keep, leaving temp repo at ${repoDir}`);
+    } else if (repoDir) {
+      await removeDir(repoDir);
+    }
   }
 }
 

@@ -4,7 +4,7 @@
  * Resolve all paths from this file's location, never from process.cwd().
  */
 
-import { existsSync } from "node:fs";
+import { closeSync, existsSync, mkdirSync, openSync, writeSync } from "node:fs";
 import { mkdtemp, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
@@ -161,34 +161,74 @@ export interface RunningServer {
   proc: ReturnType<typeof Bun.spawn>;
   url: string;
   pinNote: string;
-  logs(): Promise<{ stdout: string; stderr: string }>;
+  /** Path of the streamed server log (bench/results/<run>-server.log). */
+  logPath: string;
+  /** Read the tail of the log from disk; never buffered in memory. */
+  logs(): Promise<string>;
   stop(): Promise<void>;
 }
 
+/**
+ * Stream one server pipe into the log file, chunk by chunk. The log lives on
+ * disk instead of accumulating in a Promise<string> for the whole run.
+ */
+async function streamToLog(stream: ReadableStream<Uint8Array> | null, fd: number): Promise<void> {
+  if (!stream) return;
+  const reader = stream.getReader();
+  try {
+    for (;;) {
+      const { done, value } = await reader.read();
+      if (done) break;
+      if (value && value.byteLength > 0) writeSync(fd, value);
+    }
+  } catch {
+    // The server exited and closed the pipe.
+  }
+}
+
 /** Start src/server/main.ts, pin it to `cores`, wait until /api/project answers. */
-export async function startServer(repoDir: string, port: number, cores: number): Promise<RunningServer> {
+export async function startServer(
+  repoDir: string,
+  port: number,
+  cores: number,
+  checkConcurrency: number,
+  runId: string,
+): Promise<RunningServer> {
   const projectRoot = join(import.meta.dir, "..", "..");
   const entry = join(projectRoot, "src", "server", "main.ts");
+  const resultsDir = join(import.meta.dir, "..", "results");
+  mkdirSync(resultsDir, { recursive: true });
+  const logPath = join(resultsDir, `${runId}-server.log`);
   const proc = Bun.spawn(
-    [process.execPath, entry, "--repo", repoDir, "--port", String(port), "--join-limit", "0"],
+    [process.execPath, entry, "--repo", repoDir, "--port", String(port),
+      "--check-concurrency", String(Math.max(1, checkConcurrency)), "--join-limit", "0"],
     { cwd: projectRoot, stdin: "ignore", stdout: "pipe", stderr: "pipe" },
   );
+  const logFd = openSync(logPath, "w");
+  const logDone = Promise.all([
+    streamToLog(proc.stdout, logFd),
+    streamToLog(proc.stderr, logFd),
+  ]).then(() => { try { closeSync(logFd); } catch { /* already closed */ } });
 
-  const stdoutPromise = proc.stdout ? new Response(proc.stdout).text() : Promise.resolve("");
-  const stderrPromise = proc.stderr ? new Response(proc.stderr).text() : Promise.resolve("");
-  let cachedLogs: Promise<{ stdout: string; stderr: string }> | undefined;
+  const logs = async () => {
+    try {
+      return await Bun.file(logPath).text();
+    } catch {
+      return "";
+    }
+  };
 
   const pinNote = await pinProcess(proc.pid, cores);
   const url = `http://127.0.0.1:${port}`;
-  const getLogs = () => cachedLogs ??= Promise.all([stdoutPromise, stderrPromise]).then(([stdout, stderr]) => ({ stdout, stderr }));
   try {
-    await waitForProject(url, proc, getLogs);
+    await waitForProject(url, proc, logs);
   } catch (error) {
-    const detail = await getLogs();
+    const detail = await logs();
     try { proc.kill(); } catch { /* already gone */ }
+    await logDone;
     throw new Error(
       `${error instanceof Error ? error.message : String(error)}\n` +
-      `--- server stdout ---\n${detail.stdout.slice(-2000)}\n--- server stderr ---\n${detail.stderr.slice(-2000)}`,
+      `--- server log (${logPath}) ---\n${detail.slice(-4000)}`,
     );
   }
 
@@ -196,7 +236,8 @@ export async function startServer(repoDir: string, port: number, cores: number):
     proc,
     url,
     pinNote,
-    logs: () => cachedLogs ?? Promise.all([stdoutPromise, stderrPromise]).then(([stdout, stderr]) => ({ stdout, stderr })),
+    logPath,
+    logs,
     stop: async () => {
       try {
         proc.kill();
@@ -204,6 +245,7 @@ export async function startServer(repoDir: string, port: number, cores: number):
         // already gone
       }
       await Promise.race([proc.exited.catch(() => undefined), sleep(3000)]);
+      await logDone;
     },
   };
 }
@@ -212,15 +254,15 @@ export async function startServer(repoDir: string, port: number, cores: number):
 export async function waitForProject(
   url: string,
   proc?: ReturnType<typeof Bun.spawn>,
-  logs?: () => Promise<{ stdout: string; stderr: string }>,
+  logs?: () => Promise<string>,
   timeoutMs = 20_000,
 ): Promise<void> {
   const deadline = Date.now() + timeoutMs;
   let lastError = "no response";
   while (Date.now() < deadline) {
     if (proc && proc.exitCode !== null) {
-      const detail = logs ? await logs() : { stdout: "", stderr: "" };
-      throw new Error(`server exited with code ${proc.exitCode}: ${detail.stderr.slice(-2000)}`);
+      const detail = logs ? await logs() : "";
+      throw new Error(`server exited with code ${proc.exitCode}: ${detail.slice(-4000)}`);
     }
     try {
       const res = await fetch(`${url}/api/project`, { signal: AbortSignal.timeout(1500) });

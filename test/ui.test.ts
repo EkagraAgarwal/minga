@@ -34,8 +34,8 @@ describe("lab notebook index.html", () => {
   test("uses only the specified type scale and one ink, one accent", () => {
     const sizes = new Set([...html.matchAll(/font-size:\s*(\d+)px/g)].map(m => m[1] ?? ""));
     for (const size of sizes) expect(["12", "13", "15", "20", "32"]).toContain(size);
-    expect(html).toContain("--paper:#f3f0e8");
-    expect(html).toContain("--ink:#1c1a16");
+    expect(html).toContain("--paper:#f6f6f4");
+    expect(html).toContain("--ink:#161616");
     expect(html).toContain("--accent:#c8381c");
     expect(html).toContain("background:var(--paper)");
   });
@@ -55,6 +55,82 @@ describe("lab notebook index.html", () => {
   test("never builds markup from server strings", () => {
     expect(script).not.toMatch(/innerHTML|outerHTML|insertAdjacentHTML|document\.write|\beval\s*\(|new Function\s*\(/);
     expect(script).toMatch(/textContent\s*=/);
+  });
+
+  test("paints rows with only the spec fonts, after webfonts load", () => {
+    expect(script).toContain('"IBM Plex Sans"');
+    expect(script).toContain('"IBM Plex Mono"');
+    expect(script).toContain('"500 13px " + FONT_SANS');
+    expect(script).toContain('"400 13px " + FONT_SANS');
+    expect(script).toContain('"400 12px " + FONT_MONO');
+    expect(script).toContain("document.fonts.ready");
+    expect(script).toContain('"loadingdone"');
+    expect(html).not.toMatch(/font\s*=\s*["']bold/);
+  });
+
+  test("defaults to light with dark gated by preference or an explicit choice", () => {
+    expect(html).toMatch(/:root\{[^}]*--paper:#f6f6f4[^}]*color-scheme:light/);
+    expect(html).toContain("@media (prefers-color-scheme: dark)");
+    expect(html).toContain(":root:not([data-theme=light])");
+    expect(html).toContain(":root[data-theme=dark]");
+    expect(html).toContain("prefers-reduced-motion");
+  });
+
+  test("uses the exact neutral light and dark palettes", () => {
+    const light = [
+      "--paper:#f6f6f4", "--paper-2:#ececea", "--ink:#161616", "--ink-2:#4d4d4d",
+      "--ink-3:#8a8a8a", "--rule:#d9d9d6", "--accent:#c8381c",
+    ];
+    const dark = [
+      "--paper:#111111", "--paper-2:#1a1a1a", "--ink:#ececec", "--ink-2:#b0b0b0",
+      "--ink-3:#767676", "--rule:#2e2e2e", "--accent:#ff6b45",
+    ];
+    for (const token of [...light, ...dark]) expect(html).toContain(token);
+    // Each dark block is self-contained: both the media-query branch and the explicit override.
+    for (const block of html.match(/--paper:#111111;[^}]*}/g) ?? []) {
+      for (const token of dark) expect(block).toContain(token);
+    }
+  });
+
+  test("does not use Newsreader or any serif family", () => {
+    expect(html).not.toContain("Newsreader");
+    expect(html).not.toContain("--serif");
+    expect(html).not.toMatch(/Georgia|Times New Roman|var\(--serif\)/);
+    const link = html.match(/<link rel="stylesheet" href="([^"]+)"/)?.[1] ?? "";
+    expect(link).toContain("family=IBM+Plex+Sans");
+    expect(link).toContain("family=IBM+Plex+Mono");
+    expect(link).not.toContain("Newsreader");
+  });
+
+  test("uses Plex Sans for titles, goals, sections and captions", () => {
+    expect(html).toContain(".masthead h1{font:600 32px/1.1 var(--sans); letter-spacing:-0.01em");
+    expect(html).toContain(".goal{font:400 15px/1.45 var(--sans); color:var(--ink-2)");
+    expect(html).toContain(".section{font:500 15px/1.3 var(--sans)");
+    expect(html).toContain(".caption{font:500 15px/1.4 var(--sans); color:var(--ink)");
+    expect(html).toContain(".caption.note,.caption .note{font:400 13px/1.5 var(--sans); color:var(--ink-2)}");
+    expect(html).toContain("caption{text-align:left; font:400 13px/1.4 var(--sans); color:var(--ink-2)");
+    expect(html).not.toMatch(/font:[^;}]*italic/);
+  });
+
+  test("tables size to content with a visible pass-rate track and narrow rank", () => {
+    expect(html).toContain("table-layout:auto");
+    expect(html).toContain("white-space:nowrap");
+    expect(html).toContain("td.trunc{max-width:28ch");
+    expect(html).toContain('setAttribute("title", text)');
+    expect(html).toContain(".track{display:block; width:80px; height:1px; background:var(--rule)}");
+    expect(html).toContain(".bar{display:block; height:2px; max-width:80px; background:var(--ink)}");
+    expect(html).toContain("th.rank,tbody td.rank{width:3.5em; text-align:right}");
+    expect(script).toContain('Math.round(N(r.passRate) * 100) + "%"');
+  });
+
+  test("has a fixed scroll viewport, caption controls and a log transition", () => {
+    expect(html).toContain("height:min(70vh,900px)");
+    expect(html).toContain('id="rowCount"');
+    expect(html).toContain('id="collapseAll"');
+    expect(html).toContain('id="expandAll"');
+    expect(html).toContain(".logline.fresh{color:var(--accent); transition:color 1.2s linear}");
+    expect(html).toContain(".logline time{color:var(--ink-3)}");
+    expect(html).not.toContain("@keyframes settle");
   });
 });
 
@@ -316,6 +392,193 @@ describe("server strings", () => {
   });
 });
 
+// ------------------------------------------------------------------ visual review fixes (browser-free)
+
+function mountScript(): AnyRec {
+  const g = globalThis as AnyRec;
+  const saved: AnyRec = {};
+  const keys = ["document", "matchMedia", "getComputedStyle", "localStorage", "location", "navigator",
+    "requestAnimationFrame", "MutationObserver", "ResizeObserver", "window", "__MINGA_UI_TEST__"];
+  for (const k of keys) saved[k] = [Object.prototype.hasOwnProperty.call(g, k), g[k]];
+
+  allNodes = [];
+  drawn.length = 0;
+  const byId = new Map<string, FakeNode>();
+  const frames: Array<(t: number) => void> = [];
+  g.document = {
+    title: "",
+    hidden: false,
+    documentElement: new FakeNode("html"),
+    getElementById(id: string): FakeNode {
+      let n = byId.get(id);
+      if (!n) { n = new FakeNode("div"); byId.set(id, n); }
+      return n;
+    },
+    createElement(tag: string): FakeNode { return new FakeNode(tag); },
+    createDocumentFragment(): FakeNode { return new FakeNode("#fragment", 11); },
+    addEventListener(): void {},
+  };
+  g.matchMedia = (q: string): AnyRec => ({ matches: false, media: q, addEventListener() {}, removeEventListener() {} });
+  g.getComputedStyle = (): AnyRec => ({ getPropertyValue: () => "#1c1a16" });
+  g.localStorage = { getItem: () => null, setItem() {}, removeItem() {} };
+  g.location = { origin: "https://minga.test" };
+  g.navigator = { clipboard: { writeText() {} } };
+  g.requestAnimationFrame = (cb: (t: number) => void): number => { frames.push(cb); return frames.length; };
+  g.MutationObserver = class { observe() {} };
+  g.ResizeObserver = class { observe() {} };
+  g.window = { devicePixelRatio: 1 };
+  let api: AnyRec | null = null;
+  g.__MINGA_UI_TEST__ = (hooks: AnyRec): void => { api = hooks; };
+  new Function(script)();
+  return {
+    g, byId, frames, hooks: api!,
+    restore(): void {
+      for (const k of keys) {
+        const [present, value] = saved[k] as [boolean, unknown];
+        if (present) g[k] = value; else delete g[k];
+      }
+    },
+  };
+}
+
+function bigView(leafCount: number, submissionCount: number): AnyRec {
+  const at = new Date().toISOString();
+  const task = (id: string, title: string, parent: string | null, children: string[] = []): AnyRec => ({
+    id, title, body: "body", parent, children, status: "open", points: 10, postedAt: at,
+    attemptCount: 0, noteCount: 0, liveCount: 0,
+  });
+  const tasks: AnyRec[] = [];
+  const areas = ["Circuit lower bounds", "Proof complexity", "Barriers"].map((title, i) => task("T-" + (i + 1), title, null));
+  tasks.push(...areas);
+  const subAreas = ["Switching and shrinkage", "Width lower bounds", "Relativization desk"].map((title, i) => {
+    const t = task("T-" + (4 + i), title, areas[i]!.id);
+    areas[i]!.children.push(t.id);
+    tasks.push(t);
+    return t;
+  });
+  for (let i = 0; i < leafCount; i += 1) {
+    const parent = subAreas[i % subAreas.length]!;
+    const t = task("T-" + (7 + i), "Lemma " + (i + 1), parent.id);
+    parent.children.push(t.id);
+    tasks.push(t);
+  }
+  const submissions: AnyRec[] = [];
+  for (let i = 0; i < submissionCount; i += 1) {
+    const checking = i % 3 === 0;
+    submissions.push({
+      id: "S-" + (i + 1), attempt: "A-" + (i + 1), task: "T-7", agent: "abcdef" + String(i).padStart(10, "0"),
+      model: "hy4-flash", claim: "solves", message: "m", files: [], bytes: 0,
+      status: checking ? "checking" : "queued", queuedAt: at, runs: checking ? 1 : 0, points: 0,
+    });
+  }
+  return {
+    project: { name: "t", goal: "g", scope: "", check: "", paths: [], headAgent: "head", rules: { width: 6 } },
+    seq: 9, now: at,
+    totals: {
+      agents: 1, activeAgents: 1, tasks: tasks.length, openTasks: tasks.length, liveAttempts: 0,
+      queuedSubmissions: submissionCount, checkingSubmissions: 0, submissions: submissionCount,
+      accepted: 0, notes: 0, events: 9,
+    },
+    tasks, attempts: [], agents: [], notes: [], submissions, proposals: [],
+    leaderboard: { agents: [], models: [] },
+  };
+}
+
+describe("visual review fixes", () => {
+  test("areas are expanded by default: the debug layout has over 100 rows", () => {
+    const m = mountScript();
+    try {
+      m.hooks.applyView(bigView(180, 2));
+      m.hooks.flush();
+      expect(m.g.window.__minga.rowCount).toBeGreaterThan(100);
+      expect(m.g.window.__minga.rowCount).toBe(186);
+      expect(m.g.window.__minga.areaCount).toBe(6);
+      expect(m.g.window.__minga.leafCount).toBe(180);
+      expect(m.g.window.__minga.collapsedCount).toBe(0);
+      expect(m.byId.get("rowCount")!.textContent).toBe("186 rows");
+    } finally { m.restore(); }
+  });
+
+  test("the queue is populated from view.submissions and caps at 50 rows", () => {
+    const m = mountScript();
+    try {
+      m.hooks.applyView(bigView(120, 60));
+      m.hooks.flush();
+      expect(m.g.window.__minga.queueCount).toBe(60);
+      const children = m.byId.get("qlist")!.children;
+      expect(children.filter((n: FakeNode) => n.className.startsWith("qrow") && !n.className.includes("more"))).toHaveLength(50);
+      expect(children.find((n: FakeNode) => n.className.includes("more"))!.textContent).toBe("+10 more");
+      expect(children.some((n: FakeNode) => n.className.includes("checking"))).toBe(true);
+      const readout = m.byId.get("rQueue")!.textContent;
+      expect(readout).toContain("queued");
+      expect(readout).toContain("checking");
+      expect(readout).not.toContain("/");
+    } finally { m.restore(); }
+  });
+
+  test("the queue follows queued, started and checked events", () => {
+    const m = mountScript();
+    try {
+      m.hooks.applyView(bigView(20, 1));
+      m.hooks.flush();
+      const at = new Date().toISOString();
+      const q = (seq: number, id: string) => ({
+        seq, at, type: "submission.queued", actor: "abcdef",
+        data: {
+          submission: id, attempt: "A-x" + seq, task: "T-7", agent: "abcdef",
+          model: "hy4-flash", claim: "solves", message: "m", files: [], bytes: 0,
+        },
+      });
+      m.hooks.queueEvent(q(10, "S-x1"));
+      m.hooks.flush();
+      expect(m.g.window.__minga.queueCount).toBe(2);
+      m.hooks.queueEvent({
+        seq: 11, at, type: "submission.started", actor: "server",
+        data: { submission: "S-x1", base: "abc", round: 1 },
+      });
+      m.hooks.flush();
+      expect(m.g.window.__minga.queueCount).toBe(2);
+      expect(m.byId.get("qlist")!.children.some((n: FakeNode) => n.className.includes("checking"))).toBe(true);
+      m.hooks.queueEvent({
+        seq: 12, at, type: "submission.checked", actor: "server",
+        data: {
+          submission: "S-x1", attempt: "A-x10", task: "T-7", agent: "abcdef", model: "hy4-flash",
+          claim: "solves", files: [], ok: true, exitCode: 0, timedOut: false,
+          outputTail: "", durationMs: 1, points: 10,
+        },
+      });
+      m.hooks.flush();
+      expect(m.g.window.__minga.queueCount).toBe(1);
+      expect(m.byId.get("rQueue")!.textContent).toContain("queued");
+    } finally { m.restore(); }
+  });
+
+  test("only the newest log line starts in accent, then loses the class", () => {
+    const m = mountScript();
+    try {
+      m.hooks.applyView(bigView(20, 0));
+      m.hooks.flush();
+      const at = new Date().toISOString();
+      for (let i = 0; i < 3; i += 1) {
+        m.hooks.queueEvent({
+          seq: 10 + i, at, type: "submission.queued", actor: "abcdef",
+          data: {
+            submission: "S-x" + i, attempt: "A-x" + i, task: "T-7", agent: "abcdef",
+            model: "hy4-flash", claim: "solves", message: "m", files: [], bytes: 0,
+          },
+        });
+      }
+      m.hooks.flush();
+      const lines = m.byId.get("logList")!.children;
+      expect(lines).toHaveLength(3);
+      expect(lines[0]!.className).toBe("logline fresh");
+      expect(lines.filter((n: FakeNode) => n.className.includes("fresh"))).toHaveLength(1);
+      while (m.frames.length) { const cb = m.frames.shift() as (t: number) => void; cb(16); }
+      expect(m.byId.get("logList")!.children.filter((n: FakeNode) => n.className.includes("fresh"))).toHaveLength(0);
+    } finally { m.restore(); }
+  });
+});
+
 // ------------------------------------------------------------------ dev server tests
 
 describe("dev server", () => {
@@ -404,6 +667,35 @@ describe("dev server", () => {
     const leaderboard = body.leaderboard as AnyRec;
     expect(Array.isArray(leaderboard.agents)).toBe(true);
     expect(Array.isArray(leaderboard.models)).toBe(true);
+  });
+
+  test("seeds area-like names with two area levels and spread leaves", async () => {
+    const res = await fetch(origin + "/api/view");
+    const body = await res.json() as AnyRec;
+    const tasks = body.tasks as AnyRec[];
+    const byId = new Map(tasks.map(t => [t.id, t]));
+    const depth = (t: AnyRec): number => {
+      let d = 0, p = t.parent;
+      while (p && byId.has(p) && d < 6) { d += 1; p = byId.get(p)!.parent; }
+      return d;
+    };
+    const top = tasks.filter(t => depth(t) === 0);
+    const knownAreas = new Set([
+      "Circuit lower bounds", "Proof complexity", "Barriers",
+      "Combinatorial core", "Reductions library", "Oracle constructions",
+    ]);
+    expect(top.length).toBeGreaterThanOrEqual(3);
+    expect(top.length).toBeLessThanOrEqual(6);
+    for (const t of top) {
+      expect(knownAreas.has(t.title)).toBe(true);
+      expect(t.title).not.toMatch(/variant|Refinement of|Subarea/i);
+    }
+    const subs = tasks.filter(t => depth(t) === 1);
+    expect(subs.length).toBeGreaterThan(0);
+    for (const s of subs) expect(s.title).not.toMatch(/variant|Refinement of|Subarea/i);
+    const leaves = tasks.filter(t => depth(t) === 2);
+    expect(leaves.length).toBeGreaterThan(40);
+    expect(new Set(leaves.map(t => t.parent)).size).toBe(subs.length);
   });
 
   test("streams real event shapes with ascending seq, honoring ?after and Last-Event-ID", async () => {

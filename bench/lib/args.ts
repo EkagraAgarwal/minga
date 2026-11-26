@@ -13,6 +13,13 @@ export interface Options {
   thinkMax: number;
   /** Probability that a submitted file contains the line "ok". */
   pass: number;
+  /**
+   * Check slots passed to the server as `--check-concurrency N`. Defaults to
+   * cores - 1 (min 1) so the warm check pool fits the pinned cores.
+   */
+  checkConcurrency: number;
+  /** Keep the generated temp repo after the run instead of deleting it. */
+  keep: boolean;
   /** If set, test this already-running server instead of starting one. */
   url?: string;
 }
@@ -27,6 +34,8 @@ export const DEFAULTS: Options = {
   thinkMin: 2,
   thinkMax: 20,
   pass: 0.3,
+  checkConcurrency: 1,
+  keep: false,
 };
 
 export const USAGE = `Usage: bun bench/swarm.ts [options]
@@ -39,12 +48,17 @@ export const USAGE = `Usage: bun bench/swarm.ts [options]
   --ramp N        agents joined per second (default ${DEFAULTS.ramp})
   --think A-B     thinking time range in seconds (default ${DEFAULTS.thinkMin}-${DEFAULTS.thinkMax})
   --pass F        probability a submission passes, 0..1 (default ${DEFAULTS.pass})
+  --check-concurrency N
+                  server check slots, passed as --check-concurrency N
+                  (default: cores - 1, minimum 1)
+  --keep          keep the generated temp repo for inspection (default: delete it)
   --url URL       use an existing server; skips setup, pinning and teardown
   --help          print this message
 
 Examples:
   bun bench/swarm.ts --agents 300 --duration 60
   bun bench/swarm.ts --agents 1000 --duration 120 --cores 2 --tasks 500
+  bun bench/swarm.ts --agents 1000 --duration 90 --cores 2 --tasks 600 --check-concurrency 1
   bun bench/swarm.ts --agents 3000 --duration 180 --cores 3 --ramp 100
   bun bench/swarm.ts --agents 1000 --url http://127.0.0.1:7777
 `;
@@ -68,10 +82,13 @@ function thinkRange(raw: string): { thinkMin: number; thinkMax: number } {
   return { thinkMin: min, thinkMax: max };
 }
 
+const BOOLEAN_FLAGS = new Set(["keep"]);
+
 /** Parse CLI flags. Accepts both `--agents 300` and `--agents=300`. */
 export function parseArgs(argv: readonly string[]): Options {
   const options: Options = { ...DEFAULTS };
-  const known = new Set(["agents", "duration", "cores", "tasks", "port", "ramp", "think", "pass", "url"]);
+  const known = new Set(["agents", "duration", "cores", "tasks", "port", "ramp", "think", "pass", "check-concurrency", "keep", "url"]);
+  let checkConcurrencySet = false;
 
   for (let i = 0; i < argv.length; i++) {
     const arg = argv[i] ?? "";
@@ -80,6 +97,13 @@ export function parseArgs(argv: readonly string[]): Options {
     const name = (eq === -1 ? arg.slice(2) : arg.slice(2, eq)).trim();
     if (!known.has(name)) throw new Error(`unknown option "--${name}"`);
     let raw: string | undefined = eq === -1 ? undefined : arg.slice(eq + 1);
+    if (BOOLEAN_FLAGS.has(name)) {
+      if (raw !== undefined && raw !== "true" && raw !== "false") {
+        throw new Error(`--${name} must be true or false (got "${raw}")`);
+      }
+      if (name === "keep") options.keep = raw === undefined || raw === "true";
+      continue;
+    }
     if (raw === undefined) {
       raw = argv[++i];
       if (raw === undefined || raw.startsWith("--")) {
@@ -103,6 +127,7 @@ export function parseArgs(argv: readonly string[]): Options {
         options.pass = value;
         break;
       }
+      case "check-concurrency": options.checkConcurrency = integer(name, raw, 1); checkConcurrencySet = true; break;
       case "url": {
         let parsed: URL;
         try {
@@ -119,5 +144,6 @@ export function parseArgs(argv: readonly string[]): Options {
     }
   }
 
+  if (!checkConcurrencySet) options.checkConcurrency = Math.max(1, options.cores - 1);
   return options;
 }

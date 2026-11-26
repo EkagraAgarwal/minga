@@ -6,18 +6,20 @@ import { join } from "node:path";
 import { pathToFileURL } from "node:url";
 
 import { HEADER } from "../src/core/protocol.ts";
-import type { ProjectInfo } from "../src/core/protocol.ts";
+import type { ProjectInfo, SubmissionView } from "../src/core/protocol.ts";
 import { agentIdFromPublicKey, canonicalRequest, generateKeyPair, verifyMessage } from "../src/identity/keys.ts";
 import type { FetchLike } from "../src/cli/client.ts";
 import { createClient } from "../src/cli/client.ts";
 import {
   formatRules, headKeygenCommand, joinCommand, nextCommand, parseAcceptPolicy, parseCli,
-  parseRuleArgs, readSubmissionFiles, renderSubmission, submitCommand,
+  parseRuleArgs, readSubmissionFiles, renderSubmission, statusCommand, submitCommand,
 } from "../src/cli/commands.ts";
 import { doctorCommand } from "../src/cli/doctor.ts";
 import { initCommand, renderProjectToml, tomlBasicString } from "../src/cli/init.ts";
 import { renderJoinDoc } from "../src/cli/join-doc.ts";
 import { findPackageRoot, serveCommand, type RunResult } from "../src/cli/runtime.ts";
+import { parseProject } from "../src/project/config.ts";
+import type { SessionIdentity } from "../src/cli/store.ts";
 import { agentPath, readAgent, readHead, writeAgent, writeHead } from "../src/cli/store.ts";
 
 const project: ProjectInfo = {
@@ -90,6 +92,8 @@ interface FakeServerOptions {
   finalDelayMs?: number;
   assignment?: unknown | null;
   nextDelayMs?: number;
+  outputTail?: string;
+  stale?: boolean;
 }
 
 /** In-process v2 server: async submit + GET /api/submission/<id>?wait + next wait. */
@@ -129,12 +133,13 @@ function startFakeServer(options: FakeServerOptions = {}) {
           points: verdict === "accepted" ? 10 : 0,
         };
         submissions.set(id, entry);
-        setTimeout(() => { entry.status = "checking"; }, Math.floor(finalDelay / 2));
+        setTimeout(() => { entry.status = "checking"; entry.runs = 1; }, Math.floor(finalDelay / 2));
         setTimeout(() => {
           entry.status = verdict;
           entry.ok = verdict === "accepted";
           entry.exitCode = verdict === "accepted" ? 0 : 1;
-          entry.outputTail = verdict === "accepted" ? "" : "AssertionError: nope\n  at a.ts:1";
+          entry.outputTail = options.outputTail ?? (verdict === "accepted" ? "" : "AssertionError: nope\n  at a.ts:1");
+          if (options.stale !== undefined) entry.stale = options.stale;
           entry.commit = verdict === "accepted" ? "deadbeef" : undefined;
           entry.checkedAt = new Date().toISOString();
         }, finalDelay);
@@ -435,11 +440,39 @@ describe("submit and result logic", () => {
       expect(mock.calls.map((c) => new URL(c.url).pathname)).toEqual(["/api/submit", "/api/submission/S-7"]);
       expect(new URL(mock.calls[1]!.url).searchParams.get("wait")).toBe("30");
       expect(JSON.parse(mock.calls[0]!.init.body as string).files).toEqual({ "a.ts": "export const a = 1;\n" });
-      expect(progress).toEqual(["queued S-7 #2", "verdict accepted S-7"]);
+      expect(progress).toEqual(["queued S-7 (#2 in line)"]);
+      expect(progress.join("\n")).not.toContain("verdict");
       expect(result.text).toContain("verdict: accepted");
       expect(result.text).toContain("exit code: 0");
       expect(result.text).toContain("commit: abc1234");
       expect(result.text).toContain("points: 10");
+      expect(result.text).toContain("next: minga next --wait 600");
+    });
+  });
+
+  test("progress is only queued/checking; the verdict is in the final block", async () => {
+    await withTempDir(async (dir) => {
+      writeFileSync(join(dir, "a.ts"), "x");
+      let polls = 0;
+      const view = {
+        id: "S-3", attempt: "A-1", task: "T-1", agent: "a", model: "m", claim: "solves",
+        message: "m", files: ["a.ts"], bytes: 1, queuedAt: "", runs: 1, points: 10,
+      };
+      const mock = mockFetch((call) => {
+        if (call.url.endsWith("/api/submit")) return json({ submission: "S-3", status: "queued", position: 1 });
+        polls++;
+        return json(polls === 1
+          ? { ...view, status: "checking" }
+          : { ...view, status: "accepted", exitCode: 0, commit: "abc1234" });
+      });
+      const progress: string[] = [];
+      const result = await submitCommand(createClient("https://minga.test", generateKeyPair(), mock.fn), {
+        attempt: "A-1", claim: "solves", message: "m", files: ["a.ts"], root: dir,
+        onProgress: (line) => progress.push(line),
+      });
+      expect(progress).toEqual(["queued S-3 (#1 in line)", "checking S-3 (run 1)"]);
+      expect(result.text).toContain("verdict: accepted");
+      expect(progress.join("\n")).not.toContain("verdict");
     });
   });
 
@@ -459,9 +492,35 @@ describe("submit and result logic", () => {
       const result = await submitCommand(createClient("https://minga.test", generateKeyPair(), mock.fn), {
         attempt: "A-1", claim: "progress", message: "m", files: ["a.ts"], root: dir, wait: false,
       });
-      expect(result.text).toBe("queued S-9 #1");
+      expect(result.text).toBe("submission S-9: queued #1");
       expect(mock.calls).toHaveLength(1);
     });
+  });
+
+  test("empty check output and stale rejections explain what happened", () => {
+    const base: SubmissionView = {
+      id: "S-2", status: "rejected", exitCode: 1, points: 0, attempt: "A-1", task: "T-1",
+      agent: "a", model: "m", claim: "solves", message: "m", files: [], bytes: 0,
+      queuedAt: "", runs: 1,
+    };
+    const empty = renderSubmission({ ...base, outputTail: "" });
+    expect(empty).toContain("output: (the check printed nothing; exit code 1)");
+    expect(empty).not.toContain("output tail:");
+    expect(empty).toContain('next: fix and run "minga submit A-1 ..." again');
+    expect(empty).toContain('"minga release A-1 --handoff');
+
+    const closed = renderSubmission({
+      ...base, stale: true, outputTail: "task T-1 was closed (solved) before this check finished",
+    });
+    expect(closed).toContain("stale: the task closed first");
+    const moving = renderSubmission({
+      ...base, stale: true, outputTail: "the branch kept moving while this was checked; submit again",
+    });
+    expect(moving).toContain("stale: the branch kept moving");
+
+    const normal = renderSubmission({ ...base, outputTail: "AssertionError: nope" });
+    expect(normal).toContain("output tail:");
+    expect(normal).not.toContain("stale:");
   });
 
   test("files outside the root and .minga/ are refused", async () => {
@@ -478,7 +537,7 @@ describe("next with wait", () => {
   test("a single call when wait is 0", async () => {
     const mock = mockFetch(() => json({ assignment: null, retryAfterSeconds: 42 }));
     const result = await nextCommand(createClient("https://minga.test", generateKeyPair(), mock.fn));
-    expect(result.text).toBe("nothing to do, retry in 42s");
+    expect(result.text).toBe('nothing to do right now; run "minga next --wait 600" to wait for a task');
     expect(mock.calls).toHaveLength(1);
     expect(JSON.parse(mock.calls[0]!.init.body as string).wait).toBeUndefined();
   });
@@ -503,6 +562,73 @@ describe("next with wait", () => {
   });
 });
 
+// ---------------------------------------------------------------- status recovery
+
+describe("status recovery", () => {
+  test("status shows the last attempt, lease remaining and queue position", async () => {
+    await withTempDir(async (dir) => {
+      const keys = generateKeyPair();
+      const identity: SessionIdentity = {
+        url: "https://minga.test",
+        agent: agentIdFromPublicKey(keys.publicKey),
+        publicKey: keys.publicKey,
+        privateKey: keys.privateKey,
+        model: "m",
+        harness: "h",
+        lastAssignment: {
+          attempt: "A-5", role: "build",
+          leaseUntil: new Date(Date.now() + 5 * 60_000).toISOString(), task: "T-4",
+        },
+        lastSubmission: "S-7",
+      };
+      writeAgent(dir, identity);
+      const loaded = readAgent(dir)!;
+      expect(loaded.lastAssignment).toEqual(identity.lastAssignment);
+      expect(loaded.lastSubmission).toBe("S-7");
+
+      const mock = mockFetch((call) => {
+        if (call.url.endsWith("/api/project")) return json(project);
+        return json({
+          id: "S-7", status: "queued", position: 2, attempt: "A-5", task: "T-4",
+          agent: loaded.agent, model: "m", claim: "solves", message: "m", files: [],
+          bytes: 0, queuedAt: "", runs: 0, points: 0,
+        });
+      });
+      const result = await statusCommand(createClient("https://minga.test", keys, mock.fn), loaded);
+      expect(result.text).toContain("attempt: A-5 (build) on T-4");
+      expect(result.text).toMatch(/lease [1-5]m left/);
+      expect(result.text).toContain("submission: S-7 queued #2");
+      expect(mock.calls.map((call) => new URL(call.url).pathname)).toEqual([
+        "/api/project", "/api/submission/S-7",
+      ]);
+      expect(result.data.submission!.status).toBe("queued");
+      expect(result.data.assignment!.attempt).toBe("A-5");
+    });
+  });
+
+  test("an expired lease and a missing submission stay readable", async () => {
+    await withTempDir(async (dir) => {
+      const keys = generateKeyPair();
+      writeAgent(dir, {
+        url: "https://minga.test", agent: agentIdFromPublicKey(keys.publicKey),
+        publicKey: keys.publicKey, privateKey: keys.privateKey, model: "m", harness: "h",
+        lastAssignment: { attempt: "A-1", role: "plan", leaseUntil: "2020-01-01T00:00:00.000Z", task: "T-1" },
+        lastSubmission: "S-99",
+      });
+      const mock = mockFetch((call) => {
+        if (call.url.endsWith("/api/project")) return json(project);
+        return json({ error: "no submission" }, 404);
+      });
+      const result = await statusCommand(
+        createClient("https://minga.test", keys, mock.fn), readAgent(dir)!,
+      );
+      expect(result.text).toContain("lease expired");
+      expect(result.text).toContain("submission: S-99 (unavailable)");
+      expect(result.data.submission).toBeUndefined();
+    });
+  });
+});
+
 // ---------------------------------------------------------------- init
 
 describe("init", () => {
@@ -516,7 +642,8 @@ describe("init", () => {
       expect(result.data.projectToml).toContain('name = "a \\"quoted\\" name"');
       expect(result.data.projectToml).toContain("goal = \"line one\\nline two\"");
       expect(result.data.projectToml).toContain('paths = ["src/**", "docs/**"]');
-      expect(result.data.projectToml).toContain("# [rules]");
+      expect(result.data.projectToml).toContain("\n[rules]\n");
+      expect(result.data.projectToml).toContain("\n[rules.roles]\n");
       expect(result.data.projectToml).toContain("# [[task]]");
       expect(result.data.head).toMatch(/^ed25519:/);
       expect(result.data.headKeyFile).toBe(join(dir, ".minga", "head.json"));
@@ -547,6 +674,36 @@ describe("init", () => {
   test("TOML basic strings escape controls", () => {
     expect(tomlBasicString('a\\b"c\n\t\u0001')).toBe('"a\\\\b\\"c\\n\\t\\u0001"');
     expect(renderProjectToml({ ...base, head: "ed25519:abc" })).toContain('head = "ed25519:abc"');
+  });
+
+  test("uncommenting any single rules line still yields a valid config", () => {
+    withTempDir((dir) => {
+      mkdirSync(join(dir, ".git"));
+      const result = initCommand({ dir, ...base });
+      const toml = result.data.projectToml;
+      expect(() => Bun.TOML.parse(toml)).not.toThrow();
+      expect(parseProject(toml).rules.width).toBe(3);
+
+      const ruleLines = toml.split("\n").filter((line) =>
+        /^# (width|lease_minutes|max_attempts_per_agent|default_points|accept|explore|build|attack|distill|plan) = /.test(line),
+      );
+      expect(ruleLines).toHaveLength(10);
+      for (const line of ruleLines) {
+        const edited = toml.replace(line, line.slice(2));
+        expect(() => Bun.TOML.parse(edited)).not.toThrow();
+        expect(() => parseProject(edited)).not.toThrow();
+      }
+
+      // The bug this guards: an uncommented width must stay inside [rules].
+      const widthOnly = Bun.TOML.parse(toml.replace("# width = 3", "width = 3")) as Record<string, unknown>;
+      expect(widthOnly.width).toBeUndefined();
+      expect((widthOnly.rules as Record<string, unknown>).width).toBe(3);
+
+      const planOnly = Bun.TOML.parse(toml.replace("# plan = 0", "plan = 0")) as {
+        rules: { roles: Record<string, unknown> };
+      };
+      expect(planOnly.rules.roles.plan).toBe(0);
+    });
   });
 });
 
@@ -594,21 +751,35 @@ describe("serve and doctor", () => {
     })).rejects.toThrow(/needs Bun 1.3 or newer/);
   });
 
-  test("doctor reports one check per item and a config dry-run", () => {
+  test("doctor reports one check per item and a compact config line", () => {
     withTempDir((dir) => {
       mkdirSync(join(dir, ".git"));
       writeFileSync(join(dir, "project.toml"), 'name = "x"\n');
+      const dryRun = {
+        ok: true,
+        project: {
+          name: "x", check: "bun test {files}", paths: ["src/**"], branch: "main",
+          head: "0123456789abcdef0123456789abcdef01234567", recheck: "on-overlap", checkKeep: [],
+        },
+        checkConcurrency: 3,
+        seedTasks: 2,
+      };
       const runner = (command: string, args: string[]): RunResult => {
         if (command === "bun" && args[0] === "--version") return { status: 0, stdout: "1.4.4", stderr: "" };
         if (command === "git") return { status: 0, stdout: "git version 2.44.0", stderr: "" };
-        if (args.includes("--dry-run")) return { status: 0, stdout: '{"name":"x","tasks":0}', stderr: "" };
+        if (args.includes("--dry-run")) return { status: 0, stdout: JSON.stringify(dryRun, null, 2), stderr: "" };
         return { status: 1, stdout: "", stderr: "unexpected command" };
       };
       const result = doctorCommand({ dir, packageRoot: root }, { syncRunner: runner });
       expect(result.data.checks.map((c) => c.name)).toEqual(["node", "bun", "git", "repo", "project.toml", "config"]);
       expect(result.data.checks.every((c) => c.ok)).toBe(true);
       expect(result.text).toContain("ok  node");
-      expect(result.text).toContain('ok  config  {"name":"x","tasks":0}');
+      expect(result.text).toContain(
+        'ok  config  x: check "bun test {files}", branch main @ 0123456, 3 check slot(s), recheck on-overlap',
+      );
+      expect(result.text.split("config").length).toBe(2);
+      expect(result.text).not.toContain('"checkConcurrency"');
+      expect(result.data.configDryRun).toEqual(dryRun);
 
       const broken = doctorCommand({ dir: join(dir, "nope"), packageRoot: root }, { syncRunner: runner });
       expect(broken.data.checks.find((c) => c.name === "repo")!.ok).toBe(false);
@@ -709,13 +880,15 @@ describe("bundle on plain Node", () => {
           "--root", dir, "--dir", dir, "--url", accepted.url,
         ], dir);
         expect(ok.status).toBe(0);
-        expect(ok.stdout).toContain("queued S-1 #1");
-        expect(ok.stdout).toContain("checking S-1");
-        expect(ok.stdout).toContain("verdict accepted S-1");
+        expect(ok.stderr).toContain("queued S-1 (#1 in line)");
+        expect(ok.stderr).toContain("checking S-1 (run 1)");
+        expect(ok.stderr).not.toContain("verdict");
+        expect(ok.stdout).not.toContain("verdict accepted S-1");
         expect(ok.stdout).toContain("verdict: accepted");
         expect(ok.stdout).toContain("exit code: 0");
         expect(ok.stdout).toContain("commit: deadbeef");
         expect(ok.stdout).toContain("points: 10");
+        expect(ok.stdout).toContain("next: minga next --wait 600");
 
         withIdentity(dir, rejected.url);
         const bad = await runKit([
@@ -723,9 +896,11 @@ describe("bundle on plain Node", () => {
           "--root", dir, "--dir", dir, "--url", rejected.url,
         ], dir);
         expect(bad.status).toBe(2);
+        expect(bad.stderr).not.toContain("verdict rejected");
         expect(bad.stdout).toContain("verdict: rejected");
         expect(bad.stdout).toContain("output tail:");
         expect(bad.stdout).toContain("AssertionError: nope");
+        expect(bad.stdout).toContain('next: fix and run "minga submit A-2 ..." again');
       });
     } finally {
       accepted.server.stop();
@@ -744,7 +919,8 @@ describe("bundle on plain Node", () => {
           "--root", dir, "--dir", dir, "--url", server.url, "--no-wait",
         ], dir);
         expect(queued.status).toBe(0);
-        expect(queued.stdout).toContain("queued S-1 #1");
+        expect(queued.stderr).toContain("queued S-1 (#1 in line)");
+        expect(queued.stdout).toContain("submission S-1: queued #1");
         expect(queued.stdout).not.toContain("verdict:");
 
         const pending = await runKit(["result", "S-1", "--dir", dir, "--url", server.url], dir);
@@ -787,6 +963,107 @@ describe("bundle on plain Node", () => {
     } finally {
       server.server.stop();
     }
+  });
+
+  test("next without --wait gives the wait command and exits 3", async () => {
+    const server = startFakeServer({ assignment: null });
+    try {
+      await withTempDir(async (dir) => {
+        withIdentity(dir, server.url);
+        const none = await runKit(["next", "--dir", dir, "--url", server.url], dir);
+        expect(none.status).toBe(3);
+        expect(none.stdout.trim()).toBe('nothing to do right now; run "minga next --wait 600" to wait for a task');
+      });
+    } finally {
+      server.server.stop();
+    }
+  });
+
+  test("next and submit persist work that status recovers", async () => {
+    const server = startFakeServer({ assignment, verdict: "accepted", finalDelayMs: 100 });
+    try {
+      await withTempDir(async (dir) => {
+        withIdentity(dir, server.url);
+        writeFileSync(join(dir, "a.ts"), "x");
+        const got = await runKit(["next", "--dir", dir, "--url", server.url], dir);
+        expect(got.status).toBe(0);
+        let stored = JSON.parse(readFileSync(join(dir, ".minga", "agent.json"), "utf8"));
+        expect(stored.lastAssignment).toEqual({
+          attempt: "A-5", role: "build", leaseUntil: assignment.leaseUntil, task: "T-4",
+        });
+
+        const sent = await runKit([
+          "submit", "A-5", "--claim", "solves", "-m", "m", "a.ts",
+          "--root", dir, "--dir", dir, "--url", server.url,
+        ], dir);
+        expect(sent.status).toBe(0);
+        stored = JSON.parse(readFileSync(join(dir, ".minga", "agent.json"), "utf8"));
+        expect(stored.lastSubmission).toBe("S-1");
+
+        const status = await runKit(["status", "--dir", dir, "--url", server.url], dir);
+        expect(status.status).toBe(0);
+        expect(status.stdout).toContain("attempt: A-5 (build) on T-4");
+        expect(status.stdout).toContain("lease expired");
+        expect(status.stdout).toContain("submission: S-1 accepted");
+      });
+    } finally {
+      server.server.stop();
+    }
+  });
+
+  test("--json stdout is pure JSON; progress stays on stderr", async () => {
+    const server = startFakeServer({ verdict: "rejected", finalDelayMs: 100 });
+    try {
+      await withTempDir(async (dir) => {
+        withIdentity(dir, server.url);
+        writeFileSync(join(dir, "a.ts"), "x");
+        const result = await runKit([
+          "submit", "A-1", "--claim", "solves", "-m", "m", "a.ts",
+          "--root", dir, "--dir", dir, "--url", server.url, "--json",
+        ], dir);
+        expect(result.status).toBe(2);
+        expect(() => JSON.parse(result.stdout)).not.toThrow();
+        expect(JSON.parse(result.stdout).status).toBe("rejected");
+        expect(result.stdout).not.toContain("verdict rejected");
+        expect(result.stderr).toContain("queued S-1 (#1 in line)");
+        expect(result.stderr).not.toContain("verdict rejected");
+      });
+    } finally {
+      server.server.stop();
+    }
+  });
+
+  test("a failed check with no output says so", async () => {
+    const server = startFakeServer({
+      verdict: "rejected", finalDelayMs: 100, outputTail: "",
+    });
+    try {
+      await withTempDir(async (dir) => {
+        withIdentity(dir, server.url);
+        writeFileSync(join(dir, "a.ts"), "x");
+        const result = await runKit([
+          "submit", "A-1", "--claim", "solves", "-m", "m", "a.ts",
+          "--root", dir, "--dir", dir, "--url", server.url,
+        ], dir);
+        expect(result.status).toBe(2);
+        expect(result.stdout).toContain("output: (the check printed nothing; exit code 1)");
+        expect(result.stdout).not.toContain("output tail:");
+        expect(result.stdout).toContain('next: fix and run "minga submit A-1 ..." again');
+      });
+    } finally {
+      server.server.stop();
+    }
+  });
+
+  test("AGENTS.md opens with a six-line fast path for both roles", () => {
+    const lines = readFileSync(join(import.meta.dir, "..", "AGENTS.md"), "utf8").split("\n");
+    expect(lines[0]).toBe("## Fast path");
+    expect(lines.slice(0, 6).filter((line) => line.startsWith("Host:")).length).toBe(2);
+    expect(lines.slice(0, 6).filter((line) => line.startsWith("Volunteer:")).length).toBe(3);
+    expect(lines[6]).toBe("");
+    expect(lines[7]).toBe("# AGENTS.md");
+    expect(lines.slice(1, 6).join("\n")).toContain("minga serve");
+    expect(lines.slice(1, 6).join("\n")).toContain("npx -y minga-swarm@latest join");
   });
 
   test("--json errors print {error} on stdout and exit 1", async () => {

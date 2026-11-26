@@ -160,10 +160,16 @@ const MESSAGES = [
   "checked small cases", "rewrite with decidable equality",
 ];
 
-const AREA_TITLES = [
-  "Circuit lower bounds", "Formula size and switching", "Reductions library", "Barrier desk",
-  "Combinatorial core", "Oracle constructions", "Proof infrastructure", "Lean tooling",
-  "Resolution and width", "Communication games", "Set systems", "Complexity separations",
+const TOP_AREA_TITLES = [
+  "Circuit lower bounds", "Proof complexity", "Barriers", "Combinatorial core",
+  "Reductions library", "Oracle constructions",
+] as const;
+
+const SUB_AREA_TITLES = [
+  "Switching and shrinkage", "Width lower bounds", "Relativization desk",
+  "Set systems and entropy", "Probabilistic method", "Polynomial method",
+  "Decision tree bounds", "Lean infrastructure", "Finite structures",
+  "Communication games", "Contractions and minors", "Parameterized bounds",
 ] as const;
 
 const LEAF_TITLES = [
@@ -305,21 +311,26 @@ function seed(): void {
   }
 
   const total = Math.max(4, FLAGS.tasks);
-  const areaCount = Math.max(2, Math.min(AREA_TITLES.length, Math.round(Math.sqrt(total) / 2)));
-  const subCount = Math.min(Math.max(2, total - areaCount - 1), areaCount * 3);
+  // Three to six named top-level areas, each with one shallow layer of named sub-areas.
+  const areaCount = Math.max(3, Math.min(6, Math.round(Math.sqrt(total) / 4)));
+  const subPerArea = Math.max(2, Math.min(4, Math.round(total / (areaCount * 40))));
+  const subCount = Math.min(areaCount * subPerArea, Math.max(0, total - areaCount - 1));
   const areas: TaskState[] = [];
   for (let i = 0; i < areaCount; i += 1) {
-    const a = addTask(AREA_TITLES[i] ?? "Area " + (i + 1), "Branch point. Leaves below carry the work.", null, "open", 0, int(120, 400));
+    const a = addTask(TOP_AREA_TITLES[i] ?? "Area " + (i + 1), "Branch point. Leaves below carry the work.", null, "open", 0, int(120, 400));
     areas.push(a);
   }
   const subs: TaskState[] = [];
   for (let i = 0; i < subCount; i += 1) {
     const area = areas[i % areas.length]!;
-    subs.push(addTask("Subarea " + (i + 1), "Grouping of related leaves.", area.id, "open", 0, int(90, 320)));
+    const name = SUB_AREA_TITLES[i % SUB_AREA_TITLES.length] ?? "Subarea";
+    const part = 1 + Math.floor(i / SUB_AREA_TITLES.length);
+    const title = part === 1 ? name : name + " · " + part;
+    subs.push(addTask(title, "Grouping of related leaves.", area.id, "open", 0, int(90, 320)));
   }
   const leaves = total - areaCount - subCount;
   for (let i = 0; i < leaves; i += 1) {
-    const parent = subs[i % subs.length]!;
+    const parent = subs.length ? subs[i % subs.length]! : areas[i % areas.length]!;
     const base = LEAF_TITLES[i % LEAF_TITLES.length] ?? "Lemma " + (i + 1);
     const title = i < LEAF_TITLES.length ? base : base + " (variant " + (1 + Math.floor(i / LEAF_TITLES.length)) + ")";
     const roll = rnd();

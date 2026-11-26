@@ -197,8 +197,8 @@ async function run(argv: string[]): Promise<number> {
     dir,
     ...(urlOverride !== undefined ? { urlOverride } : {}),
     onProgress: (line: string) => {
-      // Progress lines are never part of a --json document or an MCP message.
-      (json ? process.stderr : process.stdout).write(`${line}\n`);
+      // Progress is diagnostic: never part of --json stdout or an MCP message.
+      process.stderr.write(`${line}\n`);
     },
   });
 

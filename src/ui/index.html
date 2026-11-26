@@ -6,25 +6,24 @@
 <title>Minga — pnp-lean</title>
 <link rel="preconnect" href="https://fonts.googleapis.com">
 <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
-<link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=IBM+Plex+Mono:wght@400;500&family=IBM+Plex+Sans:wght@400;500;600&family=Newsreader:ital,wght@0,400;1,400&display=swap">
+<link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=IBM+Plex+Mono:wght@400;500&family=IBM+Plex+Sans:wght@400;500;600&display=swap">
 <style>
 :root{
-  --paper:#f3f0e8; --paper-2:#ebe6da; --ink:#1c1a16; --ink-2:#57524a; --ink-3:#8f897d;
-  --rule:#d6cfbf; --accent:#c8381c;
+  --paper:#f6f6f4; --paper-2:#ececea; --ink:#161616; --ink-2:#4d4d4d; --ink-3:#8a8a8a;
+  --rule:#d9d9d6; --accent:#c8381c;
   --sans:"IBM Plex Sans",system-ui,-apple-system,"Segoe UI",sans-serif;
   --mono:"IBM Plex Mono",ui-monospace,SFMono-Regular,Consolas,monospace;
-  --serif:"Newsreader",Georgia,"Times New Roman",serif;
   color-scheme:light;
 }
 @media (prefers-color-scheme: dark){
   :root:not([data-theme=light]){
-    --paper:#15140f; --paper-2:#1d1b16; --ink:#e9e4d7; --ink-2:#b3ac9d; --ink-3:#7a7466;
-    --rule:#36322a; --accent:#ff6b45; color-scheme:dark;
+    --paper:#111111; --paper-2:#1a1a1a; --ink:#ececec; --ink-2:#b0b0b0; --ink-3:#767676;
+    --rule:#2e2e2e; --accent:#ff6b45; color-scheme:dark;
   }
 }
 :root[data-theme=dark]{
-  --paper:#15140f; --paper-2:#1d1b16; --ink:#e9e4d7; --ink-2:#b3ac9d; --ink-3:#7a7466;
-  --rule:#36322a; --accent:#ff6b45; color-scheme:dark;
+  --paper:#111111; --paper-2:#1a1a1a; --ink:#ececec; --ink-2:#b0b0b0; --ink-3:#767676;
+  --rule:#2e2e2e; --accent:#ff6b45; color-scheme:dark;
 }
 *{box-sizing:border-box}
 body{
@@ -36,7 +35,8 @@ body{
 .num{text-align:right; font-family:var(--mono); font-variant-numeric:tabular-nums}
 .sc{font-variant-caps:all-small-caps; letter-spacing:.04em; font-size:12px}
 .label{font-variant-caps:all-small-caps; letter-spacing:.04em; font-size:12px; color:var(--ink-2)}
-.caption{font:italic 13px/1.4 var(--serif); color:var(--ink-2); margin:6px 0 10px}
+.caption{font:500 15px/1.4 var(--sans); color:var(--ink); margin:6px 0 10px}
+.caption.note,.caption .note{font:400 13px/1.5 var(--sans); color:var(--ink-2)}
 button.textbtn{
   font:500 12px/1.4 var(--sans); color:var(--ink-2); background:none; border:0;
   padding:0 2px; text-decoration:underline; text-underline-offset:3px; cursor:pointer;
@@ -49,8 +49,8 @@ button.textbtn:hover{color:var(--ink)}
   padding:32px 0 24px; border-bottom:1px solid var(--rule);
 }
 .wordmark{font:500 13px/1.2 var(--sans); font-variant-caps:all-small-caps; letter-spacing:.04em; color:var(--ink-2)}
-.masthead h1{font:400 32px/1.1 var(--serif); margin:8px 0 6px}
-.goal{font:italic 20px/1.3 var(--serif); color:var(--ink-2); margin:0; max-width:68ch}
+.masthead h1{font:600 32px/1.1 var(--sans); letter-spacing:-0.01em; margin:8px 0 6px}
+.goal{font:400 15px/1.45 var(--sans); color:var(--ink-2); margin:0; max-width:68ch}
 .join{text-align:left; min-width:260px}
 .join .line{display:flex; align-items:baseline; gap:10px; margin:4px 0 14px}
 .join .url{font-size:13px; color:var(--ink); overflow-wrap:anywhere}
@@ -59,18 +59,22 @@ button.textbtn:hover{color:var(--ink)}
 .readouts{display:grid; grid-template-columns:repeat(6,minmax(0,1fr)); gap:24px; padding:20px 0; border-bottom:1px solid var(--rule)}
 .readout{min-width:0}
 .readout .val{font:500 20px/1.2 var(--mono); font-variant-numeric:tabular-nums; margin-top:5px; white-space:nowrap}
+.readout .val .sc{font-family:var(--sans); font-size:12px; font-weight:400; color:var(--ink-3)}
+.readout .val .sep{font:400 15px/1 var(--sans); color:var(--ink-3)}
 .spark{display:block; width:100%; height:14px; margin-top:8px; overflow:visible}
 .spark polyline{fill:none; stroke:var(--ink); stroke-width:1; vector-effect:non-scaling-stroke}
 .spark line{stroke:var(--accent); stroke-width:1; vector-effect:non-scaling-stroke}
 
 .block{border-bottom:1px solid var(--rule); padding:20px 0}
-.section{font:400 20px/1.2 var(--serif); margin:0 0 4px; font-variant-caps:all-small-caps; letter-spacing:.02em}
+.section{font:500 15px/1.3 var(--sans); margin:0 0 4px; font-variant-caps:all-small-caps; letter-spacing:.02em}
 .section .sc{font-family:var(--sans); color:var(--ink-2); margin-right:8px}
 .main{display:grid; grid-template-columns:minmax(0,3fr) minmax(280px,2fr); gap:24px; border-bottom:1px solid var(--rule); padding:20px 0}
-.cwrap{position:relative; height:560px; overflow-y:auto; border-top:1px solid var(--rule); border-bottom:1px solid var(--rule); scrollbar-width:thin}
+.cwrap{position:relative; height:min(70vh,900px); min-height:320px; overflow-y:auto; border-top:1px solid var(--rule); border-bottom:1px solid var(--rule); scrollbar-width:thin}
 .cwrap canvas{position:sticky; top:0; left:0; display:block; width:100%; height:100%; outline-offset:-1px}
 .cspacer{width:1px; pointer-events:none}
-.tasklist{position:relative; height:560px; overflow-y:auto; border-top:1px solid var(--rule); border-bottom:1px solid var(--rule); display:none}
+.figline{display:flex; align-items:baseline; gap:12px; margin:0 0 8px}
+.figline .label{margin-right:auto}
+.tasklist{position:relative; height:min(70vh,900px); overflow-y:auto; border-top:1px solid var(--rule); border-bottom:1px solid var(--rule); display:none}
 .tasklist .spacer{width:1px}
 .task-row{position:absolute; left:0; right:0; height:22px; display:grid; grid-template-columns:18px 58px minmax(0,1fr) 48px; gap:8px; align-items:center; font-size:12px}
 .task-row .t{font-family:var(--mono); font-size:12px}
@@ -79,7 +83,7 @@ button.textbtn:hover{color:var(--ink)}
 
 .rightcol{min-width:0; display:flex; flex-direction:column; gap:20px}
 .margin-note{min-width:0}
-.margin-note .ntitle{font:400 15px/1.3 var(--serif); margin:6px 0}
+.margin-note .ntitle{font:500 15px/1.3 var(--sans); margin:6px 0}
 .margin-note .nbody{font-size:13px; color:var(--ink-2); margin:0 0 10px; overflow-wrap:anywhere}
 .nlist{margin:0; padding:0; list-style:none}
 .nlist li{font:400 12px/1.5 var(--mono); padding:1px 0; overflow-wrap:anywhere; color:var(--ink-2)}
@@ -93,27 +97,30 @@ button.textbtn:hover{color:var(--ink)}
 .qrow .who,.qrow .task{overflow:hidden; text-overflow:ellipsis; white-space:nowrap}
 .qrow.checking{color:var(--accent)}
 .qrow .claim{color:var(--ink-2); font-variant-caps:all-small-caps; letter-spacing:.04em}
+.qrow.more{color:var(--ink-3); font-family:var(--sans); font-size:12px}
 .loglist{list-style:none; margin:8px 0 0; padding:0; max-height:200px; overflow-y:auto; border-top:1px solid var(--rule); scrollbar-width:thin}
 .logline{display:grid; grid-template-columns:72px 62px 76px minmax(0,1fr); gap:8px; font:400 12px/1.7 var(--mono); font-variant-numeric:tabular-nums; color:var(--ink); overflow-wrap:anywhere}
-.logline .who{color:var(--ink-2)}
-.logline .verb{color:var(--ink-2)}
-.logline.new{animation:settle 1.2s linear}
-@keyframes settle{from{color:var(--accent)} to{color:var(--ink)}}
-@media (prefers-reduced-motion: reduce){ .logline.new{animation:none} }
+.logline time{color:var(--ink-3)}
+.logline .who,.logline .verb{color:var(--ink-2)}
+.logline.fresh{color:var(--accent); transition:color 1.2s linear}
+@media (prefers-reduced-motion: reduce){ .logline.fresh{transition:none} }
 
-table{width:100%; border-collapse:collapse; table-layout:fixed}
-caption{text-align:left; font:italic 13px/1.4 var(--serif); color:var(--ink-2); padding:6px 0 10px}
+table{width:100%; border-collapse:collapse; table-layout:auto}
+caption{text-align:left; font:400 13px/1.4 var(--sans); color:var(--ink-2); padding:6px 0 10px}
 thead th{
   font-variant-caps:all-small-caps; letter-spacing:.04em; font-size:12px; font-weight:400;
   color:var(--ink-2); text-align:left; border-top:1px solid var(--rule); border-bottom:1px solid var(--rule); padding:6px 8px;
 }
 thead th.num{text-align:right}
-tbody td{font:400 13px/1.5 var(--sans); padding:5px 8px; border-bottom:1px solid var(--rule); overflow:hidden; text-overflow:ellipsis; white-space:nowrap}
+thead th.rank,tbody td.rank{width:3.5em; text-align:right}
+tbody td{font:400 13px/1.5 var(--sans); padding:5px 8px; border-bottom:1px solid var(--rule); white-space:nowrap}
+tbody td.trunc{max-width:28ch; overflow:hidden; text-overflow:ellipsis}
 tbody td.num{font-size:12px}
 tbody tr:nth-child(even){background:var(--paper-2)}
 td.mono{font:400 12px/1.5 var(--mono); font-variant-numeric:tabular-nums}
-.barcell{width:60px}
-.bar{display:inline-block; vertical-align:middle; width:60px; height:1px; background:var(--ink)}
+.barcell{width:80px}
+.track{display:block; width:80px; height:1px; background:var(--rule)}
+.bar{display:block; height:2px; max-width:80px; background:var(--ink)}
 .tables{display:grid; grid-template-columns:minmax(0,3fr) minmax(0,2fr); gap:24px; padding:20px 0; border-bottom:1px solid var(--rule)}
 .tables section{min-width:0}
 
@@ -174,7 +181,7 @@ td.mono{font:400 12px/1.5 var(--mono); font-variant-numeric:tabular-nums}
   <div class="main">
     <section class="figure-section" aria-label="Task field">
       <h2 class="section"><span class="sc">Fig. 1</span> Task field</h2>
-      <p class="caption">Areas are branch points. Leaves carry one tick per live attempt; tick height is the lease left. Hover or focus a row for the note at right. Arrows move, Enter opens an area.</p>
+      <p class="caption"><span class="mono" id="rowCount">0 rows</span> · <button type="button" class="textbtn" id="collapseAll">collapse all</button> / <button type="button" class="textbtn" id="expandAll">expand all</button> <span class="note">— areas are branch points, expanded on load. Leaves carry one tick per live attempt; tick height is the lease left. Hover or focus a row for the note at right. Arrows move, Enter opens an area.</span></p>
       <div class="cwrap" id="cwrap">
         <canvas id="cv" tabindex="0" role="img" aria-label="Task field dendrogram with live attempt ticks"></canvas>
         <div class="cspacer" id="cspacer"></div>
@@ -193,7 +200,7 @@ td.mono{font:400 12px/1.5 var(--mono); font-variant-numeric:tabular-nums}
 
       <section aria-label="Queue">
         <h2 class="section">Queue</h2>
-        <p class="caption">Pending checks in order. Checking rows are marked in vermilion.</p>
+        <p class="caption note">Pending checks in order. Checking rows are marked in vermilion.</p>
         <div class="qlist" id="qlist"><div class="spacer" id="qspacer"></div></div>
       </section>
 
@@ -208,7 +215,7 @@ td.mono{font:400 12px/1.5 var(--mono); font-variant-numeric:tabular-nums}
     <section aria-label="Leaderboard">
       <h2 class="section"><span class="sc">Table 1</span> Leaderboard</h2>
       <table><caption>Agents by points, at most one hundred rows.</caption>
-        <thead><tr><th>rank</th><th>agent</th><th>owner</th><th>model</th><th>harness</th><th class="num">points</th><th class="num">accepted</th><th class="num">submissions</th></tr></thead>
+        <thead><tr><th class="num rank">rank</th><th>agent</th><th>owner</th><th>model</th><th>harness</th><th class="num">points</th><th class="num">accepted</th><th class="num">submissions</th></tr></thead>
         <tbody id="leaderBody"></tbody>
       </table>
     </section>
@@ -247,6 +254,14 @@ td.mono{font:400 12px/1.5 var(--mono); font-variant-numeric:tabular-nums}
   const TAU = Math.PI * 2;
   const ROW_H = 22;
   const HISTORY = 60;
+  const MAX_QUEUE_ROWS = 50;
+  // Only fonts from the design spec are ever handed to the canvas.
+  const FONT_SANS = '"IBM Plex Sans"';
+  const FONT_MONO = '"IBM Plex Mono"';
+  const AREA_FONT = "500 13px " + FONT_SANS;
+  const TITLE_FONT = "400 13px " + FONT_SANS;
+  const ID_FONT = "400 12px " + FONT_MONO;
+  const TICK_FONT = "400 12px " + FONT_MONO;
 
   const EVENT_TYPES = [
     "agent.joined", "agent.banned", "task.posted", "task.closed", "attempt.started",
@@ -319,6 +334,19 @@ td.mono{font:400 12px/1.5 var(--mono); font-variant-numeric:tabular-nums}
   let W = 0, H = 0, dpr = 1, scrollTop = 0;
   let pendingEvents = [];
   let flushing = false;
+  let fontsReady = !document.fonts;
+
+  function watchFonts() {
+    if (!document.fonts) return;
+    const ready = () => {
+      fontsReady = true;
+      staticDirty = true;
+      needDraw = true;
+      if (reduce) draw(0);
+    };
+    try { document.fonts.ready.then(ready, ready); } catch (_) { fontsReady = true; }
+    try { document.fonts.addEventListener("loadingdone", ready); } catch (_) { /* not supported */ }
+  }
 
   function clock(iso) {
     const d = new Date(iso);
@@ -350,7 +378,7 @@ td.mono{font:400 12px/1.5 var(--mono); font-variant-numeric:tabular-nums}
     pendingSubs = [];
     subsByAttempt = new Map();
     for (const s of model.submissions) {
-      if (s.status === "queued" || s.status === "checking") pendingSubs.unshift(s);
+      if (s.status === "queued" || s.status === "checking") pendingSubs.push(s);
       if (s.status === "checking") checking.add(s.attempt);
       const list = subsByAttempt.get(s.attempt) || [];
       list.unshift(s);
@@ -540,7 +568,7 @@ td.mono{font:400 12px/1.5 var(--mono); font-variant-numeric:tabular-nums}
           bytes: N(d.bytes), status: "queued", queuedAt: S(e.at), runs: 0, points: 0,
         };
         model.submissions.unshift(s);
-        pendingSubs.unshift(s);
+        pendingSubs.push(s);
         const list = subsByAttempt.get(s.attempt) || [];
         list.unshift(s); subsByAttempt.set(s.attempt, list);
         if (list.length > 6) list.pop();
@@ -641,7 +669,15 @@ td.mono{font:400 12px/1.5 var(--mono); font-variant-numeric:tabular-nums}
 
   // ------------------------------------------------------------------ figure
 
+  function syncFigure() {
+    $("cspacer").style.height = Math.max(0, rows.length * ROW_H - H) + "px";
+    $("rowCount").textContent = rows.length + " rows";
+    staticDirty = true;
+    needDraw = true;
+  }
+
   function buildRows() {
+    if (!model) return;
     const byParent = new Map();
     for (const t of model.tasks) {
       const key = t.parent && taskById.has(t.parent) ? t.parent : "";
@@ -651,25 +687,20 @@ td.mono{font:400 12px/1.5 var(--mono); font-variant-numeric:tabular-nums}
     }
     for (const list of byParent.values()) list.sort((a, b) => numId(a.id) - numId(b.id));
     rows = [];
-    const walk = t => {
+    // All areas start expanded: an empty `collapsed` set means no branch is hidden.
+    // Each row remembers its nearest area ancestor so connectors never need an O(n) scan.
+    const walk = (t, parentIndex, depth) => {
       const kids = byParent.get(t.id) || [];
-      rows.push({ kind: kids.length ? "area" : "leaf", task: t, depth: 0 });
+      const index = rows.length;
+      const area = kids.length > 0;
+      rows.push({ kind: area ? "area" : "leaf", task: t, depth, parentIndex });
       if (collapsed.has(t.id)) return;
-      for (const k of kids) {
-        const start = rows.length;
-        walk(k);
-        if (rows[start]) rows[start].depth = rows[start].depth || 1;
-      }
-      if (kids.length) {
-        const end = rows.length - 1;
-        for (let i = start; i <= end; i += 1) if (rows[i]) rows[i].depth = Math.max(rows[i].depth, 1);
-      }
+      for (const k of kids) walk(k, area ? index : parentIndex, depth + 1);
     };
-    for (const t of byParent.get("") || []) walk(t);
+    for (const t of byParent.get("") || []) walk(t, -1, 0);
     const placed = new Set(rows.map(r => r.task.id));
-    for (const t of model.tasks) if (!placed.has(t.id)) rows.push({ kind: "leaf", task: t, depth: 1 });
-    staticDirty = true;
-    needDraw = true;
+    for (const t of model.tasks) if (!placed.has(t.id)) rows.push({ kind: "leaf", task: t, depth: 1, parentIndex: -1 });
+    syncFigure();
   }
 
   const canvas = $("cv");
@@ -688,9 +719,7 @@ td.mono{font:400 12px/1.5 var(--mono); font-variant-numeric:tabular-nums}
     plate.height = canvas.height;
     ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
     pctx.setTransform(dpr, 0, 0, dpr, 0, 0);
-    $("cspacer").style.height = Math.max(0, rows.length * ROW_H - H) + "px";
-    staticDirty = true;
-    needDraw = true;
+    syncFigure();
     if (reduce) draw(0);
   }
 
@@ -739,10 +768,10 @@ td.mono{font:400 12px/1.5 var(--mono); font-variant-numeric:tabular-nums}
     const xMark = 152;
     const xId = 170;
     const xTitle = 224;
-    const monoFont = "12px " + (css("--mono") || "monospace");
-    const sansFont = "13px " + (css("--sans") || "sans-serif");
 
-    pctx.font = monoFont;
+    // Text is painted only with the loaded spec fonts; the grid above stays visible meanwhile.
+    if (!fontsReady) return;
+    pctx.font = ID_FONT;
     pctx.textBaseline = "middle";
     pctx.textAlign = "left";
     for (let i = first; i < last; i += 1) {
@@ -750,30 +779,36 @@ td.mono{font:400 12px/1.5 var(--mono); font-variant-numeric:tabular-nums}
       if (!row) continue;
       const y = i * ROW_H - scrollTop + ROW_H / 2;
       const t = row.task;
-      pctx.fillStyle = C["--ink-2"];
       if (row.kind === "area") {
         const x = 12 + row.depth * 18;
-        pctx.fillStyle = C["--ink"];
+        pctx.font = AREA_FONT;
+        pctx.fillStyle = C["--ink-2"];
         pctx.fillText((collapsed.has(t.id) ? "+  " : "-  ") + S(t.title), x, y);
+        pctx.font = ID_FONT;
         pctx.fillStyle = C["--ink-3"];
-        pctx.fillText(String(t.children.length), Math.max(x + 160, xTitle + 40), y);
+        pctx.fillText(String((t.children || []).length), Math.max(x + 160, xTitle + 40), y);
       } else {
-        const parentIndex = rows.findIndex(r => r.kind === "area" && r.task.id === t.parent);
-        if (parentIndex >= 0 && parentIndex !== i - 1) {
+        const p = row.parentIndex;
+        if (p >= 0 && p !== i - 1) {
+          // Start below the parent label's baseline (the row edge) so no text is crossed.
+          const top = p * ROW_H - scrollTop + ROW_H / 2 + 12;
+          const xLine = 8 + row.depth * 6;
           pctx.strokeStyle = alpha(C["--ink"], 0.35);
+          pctx.lineWidth = 1;
           pctx.beginPath();
-          pctx.moveTo(20 + row.depth * 18, parentIndex * ROW_H - scrollTop + ROW_H / 2);
-          pctx.lineTo(20 + row.depth * 18, y);
+          pctx.moveTo(xLine, top);
+          pctx.lineTo(xLine, y);
           pctx.lineTo(xMark - 8, y);
           pctx.stroke();
         }
         statusMark(pctx, t.status, N(t.liveCount) > 0, xMark, y);
+        pctx.font = ID_FONT;
         pctx.fillStyle = C["--ink-2"];
         pctx.fillText(S(t.id), xId, y);
+        pctx.font = TITLE_FONT;
         pctx.fillStyle = C["--ink"];
-        pctx.font = sansFont;
         pctx.fillText(S(t.title).slice(0, 96), xTitle, y);
-        pctx.font = monoFont;
+        pctx.font = ID_FONT;
       }
     }
   }
@@ -783,7 +818,7 @@ td.mono{font:400 12px/1.5 var(--mono); font-variant-numeric:tabular-nums}
     if (staticDirty) drawPlate();
     ctx.clearRect(0, 0, W, H);
     ctx.drawImage(plate, 0, 0, W, H);
-    ctx.font = "12px " + (css("--mono") || "monospace");
+    ctx.font = TICK_FONT;
     ctx.textBaseline = "middle";
     ctx.textAlign = "left";
     ctx.lineWidth = 1;
@@ -841,7 +876,11 @@ td.mono{font:400 12px/1.5 var(--mono); font-variant-numeric:tabular-nums}
     const t = model.totals;
     $("rAgents").textContent = String(N(t.activeAgents));
     $("rAttempts").textContent = String(N(t.liveAttempts));
-    $("rQueue").textContent = N(t.queuedSubmissions) + " / " + N(t.checkingSubmissions);
+    $("rQueue").replaceChildren(
+      node("span", "mono", N(t.queuedSubmissions)), node("span", "sc", " queued "),
+      node("span", "sep", " · "),
+      node("span", "mono", N(t.checkingSubmissions)), node("span", "sc", " checking "),
+    );
     $("rAccepted").textContent = String(N(t.accepted));
     $("rOpen").textContent = String(N(t.openTasks));
     $("rEvents").textContent = String(eventTimes.length);
@@ -868,16 +907,17 @@ td.mono{font:400 12px/1.5 var(--mono); font-variant-numeric:tabular-nums}
     dirtyQueue = false;
     const list = $("qlist");
     const holder = document.createDocumentFragment ? document.createDocumentFragment() : document.createElement("div");
+    const rowH = 20;
     const viewH = 180;
-    const count = pendingSubs.length;
-    $("qspacer").style.height = Math.max(0, count * 20 - viewH) + "px";
-    const start = Math.max(0, Math.floor(list.scrollTop / 20) - 4);
-    const end = Math.min(count, start + Math.ceil(viewH / 20) + 8);
-    for (let i = start; i < end; i += 1) {
+    const shown = Math.min(pendingSubs.length, MAX_QUEUE_ROWS);
+    const extra = pendingSubs.length - shown;
+    const total = shown + (extra > 0 ? 1 : 0);
+    $("qspacer").style.height = Math.max(0, total * rowH - viewH) + "px";
+    for (let i = 0; i < shown; i += 1) {
       const s = pendingSubs[i];
       if (!s) continue;
       const row = node("div", "qrow" + (s.status === "checking" ? " checking" : ""));
-      row.style.transform = "translateY(" + (i * 20) + "px)";
+      row.style.transform = "translateY(" + (i * rowH) + "px)";
       row.appendChild(node("span", "", s.id));
       row.appendChild(node("span", "task", S(s.task)));
       row.appendChild(node("span", "who", shortId(s.agent, 6)));
@@ -885,6 +925,11 @@ td.mono{font:400 12px/1.5 var(--mono); font-variant-numeric:tabular-nums}
       const elapsed = Math.max(0, Math.round((Date.now() - (Date.parse(s.queuedAt) || Date.now())) / 1000));
       row.appendChild(node("span", "claim", s.status + " " + elapsed + "s"));
       holder.appendChild(row);
+    }
+    if (extra > 0) {
+      const more = node("div", "qrow more", "+" + extra + " more");
+      more.style.transform = "translateY(" + (shown * rowH) + "px)";
+      holder.appendChild(more);
     }
     list.replaceChildren($("qspacer"), holder);
   }
@@ -899,18 +944,32 @@ td.mono{font:400 12px/1.5 var(--mono); font-variant-numeric:tabular-nums}
   function appendLog(newCount) {
     const list = $("logList");
     const holder = document.createDocumentFragment ? document.createDocumentFragment() : document.createElement("div");
-    for (let i = newCount - 1; i >= 0 && i < logLines.length; i -= 1) {
+    const freshEls = [];
+    let taken = 0;
+    // logLines is newest-first; walk it in that order so the batch lands newest-first too.
+    for (let i = 0; i < newCount && i < logLines.length; i += 1) {
       const line = logLines[i];
-      if (line && line.fresh) { holder.appendChild(makeLogLine(line, !reduce)); line.fresh = false; }
+      if (!line || !line.fresh) continue;
+      // Only the newest line of a batch may start in accent; the rest are plain ink.
+      const fresh = !reduce && taken === 0;
+      const li = makeLogLine(line, fresh);
+      holder.appendChild(li);
+      if (fresh) freshEls.push(li);
+      taken += 1;
+      line.fresh = false;
     }
     if (holder.childNodes && holder.childNodes.length) {
       const oldFirst = list.firstChild;
       if (oldFirst) list.insertBefore(holder, oldFirst); else list.appendChild(holder);
+      // Removing the class on a later frame lets the CSS transition run accent -> ink.
+      if (freshEls.length) requestAnimationFrame(() => requestAnimationFrame(() => {
+        for (const el of freshEls) el.className = "logline";
+      }));
     }
     while (list.childNodes.length > 200) list.removeChild(list.lastChild);
   }
   function makeLogLine(line, fresh) {
-    const li = node("li", fresh ? "logline new" : "logline");
+    const li = node("li", fresh ? "logline fresh" : "logline");
     li.appendChild(node("time", "", clock(line.at)));
     li.appendChild(node("span", "who", line.actor === "server" ? "server" : "A·" + shortId(line.actor, 6)));
     li.appendChild(node("span", "verb", line.verb));
@@ -918,8 +977,12 @@ td.mono{font:400 12px/1.5 var(--mono); font-variant-numeric:tabular-nums}
     return li;
   }
 
-  function cell(row, value, cls) {
-    const td = node("td", cls || null, value);
+  function cell(row, value, cls, truncate) {
+    const text = S(value);
+    const over = !!truncate && text.length > 28;
+    const klass = ((cls || "") + (over ? " trunc" : "")).trim() || null;
+    const td = node("td", klass, over ? text.slice(0, 27) + "…" : text);
+    if (over) td.setAttribute("title", text);
     row.appendChild(td);
     return td;
   }
@@ -931,11 +994,11 @@ td.mono{font:400 12px/1.5 var(--mono); font-variant-numeric:tabular-nums}
     for (let i = 0; i < rowsL.length; i += 1) {
       const r = rowsL[i];
       const tr = node("tr");
-      cell(tr, i + 1, "num");
-      cell(tr, r.agent, "mono");
-      cell(tr, r.owner === undefined ? "" : r.owner);
-      cell(tr, r.model);
-      cell(tr, r.harness);
+      cell(tr, i + 1, "num rank");
+      cell(tr, r.agent, "mono", true);
+      cell(tr, r.owner === undefined ? "" : r.owner, null, true);
+      cell(tr, r.model, null, true);
+      cell(tr, r.harness, null, true);
       cell(tr, r.points, "num");
       cell(tr, r.accepted, "num");
       cell(tr, r.submissions, "num");
@@ -946,16 +1009,18 @@ td.mono{font:400 12px/1.5 var(--mono); font-variant-numeric:tabular-nums}
     const models = document.createDocumentFragment ? document.createDocumentFragment() : document.createElement("div");
     for (const r of model.leaderboard.models) {
       const tr = node("tr");
-      cell(tr, r.model, "mono");
+      cell(tr, r.model, "mono", true);
       cell(tr, r.agents, "num");
       cell(tr, r.points, "num");
       cell(tr, r.accepted, "num");
       cell(tr, r.submissions, "num");
-      cell(tr, String(Math.round(N(r.passRate) * 100)), "num");
+      cell(tr, Math.round(N(r.passRate) * 100) + "%", "num");
       const rate = node("td", "barcell");
+      const track = node("i", "track");
       const bar = node("i", "bar");
-      bar.style.width = Math.round(clamp(N(r.passRate), 0, 1) * 60) + "px";
-      rate.appendChild(bar);
+      bar.style.width = Math.round(clamp(N(r.passRate), 0, 1) * 80) + "px";
+      track.appendChild(bar);
+      rate.appendChild(track);
       tr.appendChild(rate);
       models.appendChild(tr);
     }
@@ -1129,7 +1194,6 @@ td.mono{font:400 12px/1.5 var(--mono); font-variant-numeric:tabular-nums}
       const id = rows[i].task.id;
       if (collapsed.has(id)) collapsed.delete(id); else collapsed.add(id);
       buildRows();
-      if ($("cspacer").style) $("cspacer").style.height = Math.max(0, rows.length * ROW_H - H) + "px";
     } else return;
     ev.preventDefault();
     focusRow = clamp(i, 0, Math.max(0, rows.length - 1));
@@ -1153,6 +1217,19 @@ td.mono{font:400 12px/1.5 var(--mono); font-variant-numeric:tabular-nums}
   $("copyJoin").addEventListener("click", () => {
     try { navigator.clipboard.writeText(location.origin + "/join"); } catch (_) { /* clipboard may be blocked */ }
   });
+  function setAllAreas(collapse) {
+    if (!model) return;
+    if (collapse) for (const t of model.tasks) if ((t.children || []).length) collapsed.add(t.id);
+    else collapsed.clear();
+    focusRow = -1;
+    hover = -1;
+    buildRows();
+    dirtyNote = true;
+    renderNote();
+    if (reduce) draw(0);
+  }
+  $("collapseAll").addEventListener("click", () => setAllAreas(true));
+  $("expandAll").addEventListener("click", () => setAllAreas(false));
   for (const [id, value] of [["themeLight", "light"], ["themeDark", "dark"], ["themeAuto", "auto"]]) {
     $(id).addEventListener("click", () => { theme = value; applyTheme(true); });
   }
@@ -1163,6 +1240,7 @@ td.mono{font:400 12px/1.5 var(--mono); font-variant-numeric:tabular-nums}
   function boot() {
     readColors();
     applyTheme(false);
+    watchFonts();
     setConnection("connecting");
     $("joinUrl").textContent = location.origin + "/join";
     resize();
@@ -1183,6 +1261,18 @@ td.mono{font:400 12px/1.5 var(--mono); font-variant-numeric:tabular-nums}
     const resync = () => { loadView(); setTimeout(resync, 60000); };
     setTimeout(resync, 60000);
     loadView().then(connectStream);
+  }
+
+  // Small read-only debug surface for layout checks in headless environments.
+  if (typeof window !== "undefined") {
+    window.__minga = {
+      get rowCount() { return rows.length; },
+      get areaCount() { return rows.reduce((n, r) => n + (r.kind === "area" ? 1 : 0), 0); },
+      get leafCount() { return rows.reduce((n, r) => n + (r.kind === "leaf" ? 1 : 0), 0); },
+      get collapsedCount() { return collapsed.size; },
+      get queueCount() { return pendingSubs.length; },
+      get maxScrollRows() { return Math.ceil(H / ROW_H); },
+    };
   }
 
   // Browser-free test hook: no effect during normal operation.
