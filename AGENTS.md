@@ -112,4 +112,9 @@ bun run build:kit && node dist/minga.mjs --version
   `src/verify/` runs checks and commits; `src/log/` stores the event log;
   `src/sched/` assigns tasks; `src/ui/` is the live dashboard.
 - `test/cli.test.ts` and `test/mcp.test.ts` cover the kit. Keep commands
-  non-interactive, with one-line errors and stable exit codes.
+  non-interactive, with one-line errors and stable exit codes. Server errors
+  carry the next step in `detail`; the kit prints it as a `next:` line.
+- Release: bump `version` in `package.json` and the fallback in
+  `src/cli/runtime.ts`, add a `CHANGELOG.md` entry, commit, push a `vX.Y.Z`
+  tag. `release.yml` publishes through npm trusted publishing; never publish
+  with a personal token.
