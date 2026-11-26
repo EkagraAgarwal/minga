@@ -28,10 +28,27 @@ export function generateKeyPair(): KeyPair {
   };
 }
 
+// Parsed key objects, cached: parsing dominates verify cost when thousands of agents sign
+// every request. Bounded so a flood of distinct keys cannot grow memory without limit.
+const KEY_CACHE_MAX = 20_000;
+const publicKeys = new Map<string, ReturnType<typeof createPublicKey>>();
+const privateKeys = new Map<string, ReturnType<typeof createPrivateKey>>();
+function cached<K>(cache: Map<string, K>, id: string, make: () => K): K {
+  let key = cache.get(id);
+  if (key === undefined) {
+    key = make();
+    if (cache.size >= KEY_CACHE_MAX) cache.delete(cache.keys().next().value!);
+    cache.set(id, key);
+  }
+  return key;
+}
+
 function publicKeyObject(publicKey: string) {
-  const raw = fromB64u(publicKey);
-  if (raw.length !== 32) throw new Error("public key must be 32 raw bytes (base64url)");
-  return createPublicKey({ key: Buffer.concat([SPKI_PREFIX, raw]), format: "der", type: "spki" });
+  return cached(publicKeys, publicKey, () => {
+    const raw = fromB64u(publicKey);
+    if (raw.length !== 32) throw new Error("public key must be 32 raw bytes (base64url)");
+    return createPublicKey({ key: Buffer.concat([SPKI_PREFIX, raw]), format: "der", type: "spki" });
+  });
 }
 
 /** Throws when the string is not a valid base64url ed25519 public key. */
@@ -46,7 +63,7 @@ export function agentIdFromPublicKey(publicKey: string): AgentId {
 }
 
 export function signMessage(privateKey: string, message: string): string {
-  const key = createPrivateKey({ key: fromB64u(privateKey), format: "der", type: "pkcs8" });
+  const key = cached(privateKeys, privateKey, () => createPrivateKey({ key: fromB64u(privateKey), format: "der", type: "pkcs8" }));
   return b64u(sign(null, Buffer.from(message, "utf8"), key));
 }
 

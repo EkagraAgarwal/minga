@@ -2,13 +2,18 @@
  * State is a pure fold over the event log. No I/O, no clock: every timestamp
  * comes from `event.at`, so replaying the same log always yields the same
  * state.
+ *
+ * Alongside the records the reducer keeps `state.index`: small lists of open
+ * work so readers (view, scheduler) never have to scan all attempts or
+ * submissions.
  */
 import type {
-  ComputeLeaderboard, InitialState, IsLive, LiveAttempts, NextId, Reduce, Replay,
+  AgentLiveAttempts, ComputeLeaderboard, InitialState, IsLive, LiveAttempts,
+  NextId, Reduce, Replay,
 } from "../core/contracts.ts";
 import type {
   AgentState, AttemptState, LeaderRow, ModelRow, MingaEvent, NoteState, ProposalState,
-  Rules, State, SubmissionState, TaskState,
+  Rules, State, StateIndex, SubmissionState, TaskState,
 } from "../core/types.ts";
 
 const PREFIX: Record<"task" | "attempt" | "note" | "submission" | "proposal", string> = {
@@ -36,6 +41,49 @@ function cloneRules(rules: Rules): Rules {
   };
 }
 
+function emptyIndex(): StateIndex {
+  return {
+    openByAgent: {},
+    openByTask: {},
+    openAttempts: [],
+    pendingSubmissions: [],
+    failures: {},
+  };
+}
+
+/** Remove every occurrence of `id` (normally one) without changing oldest-first order. */
+function removeId(list: string[], id: string): void {
+  for (let i = list.indexOf(id); i !== -1; i = list.indexOf(id)) list.splice(i, 1);
+}
+
+function indexAttempt(index: StateIndex, attempt: AttemptState): void {
+  (index.openByAgent[attempt.agent] ??= []).push(attempt.id);
+  (index.openByTask[attempt.task] ??= []).push(attempt.id);
+  index.openAttempts.push(attempt.id);
+}
+
+function unindexAttempt(index: StateIndex, attempt: AttemptState): void {
+  const byAgent = index.openByAgent[attempt.agent];
+  if (byAgent) {
+    removeId(byAgent, attempt.id);
+    if (byAgent.length === 0) delete index.openByAgent[attempt.agent];
+  }
+  const byTask = index.openByTask[attempt.task];
+  if (byTask) {
+    removeId(byTask, attempt.id);
+    if (byTask.length === 0) delete index.openByTask[attempt.task];
+  }
+  removeId(index.openAttempts, attempt.id);
+}
+
+/** True when an attempt's submission is still queued or checking. */
+function hasPendingSubmission(state: State, attemptId: string): boolean {
+  for (const id of state.index.pendingSubmissions) {
+    if (state.submissions[id]?.attempt === attemptId) return true;
+  }
+  return false;
+}
+
 export const initialState: InitialState = (rules: Rules): State => ({
   seq: 0,
   rules: cloneRules(rules),
@@ -46,6 +94,7 @@ export const initialState: InitialState = (rules: Rules): State => ({
   submissions: {},
   proposals: {},
   counters: { task: 0, attempt: 0, note: 0, submission: 0, proposal: 0 },
+  index: emptyIndex(),
 });
 
 export const reduce: Reduce = (state: State, event: MingaEvent): State => {
@@ -56,6 +105,9 @@ export const reduce: Reduce = (state: State, event: MingaEvent): State => {
   }
   state.seq = event.seq;
   const at = event.at;
+  // States replayed from older code may not have the index yet.
+  state.index ??= emptyIndex();
+  const index = state.index;
 
   // Any event by a known agent is a heartbeat.
   if (event.actor !== "server") {
@@ -145,6 +197,7 @@ export const reduce: Reduce = (state: State, event: MingaEvent): State => {
       };
       state.attempts[d.attempt] = attempt;
       task.attempts.push(d.attempt);
+      indexAttempt(index, attempt);
       const agent = state.agents[d.agent];
       if (agent) agent.model = d.model;
       state.counters.attempt = Math.max(state.counters.attempt, idNumber(d.attempt));
@@ -169,6 +222,7 @@ export const reduce: Reduce = (state: State, event: MingaEvent): State => {
       const d = event.data;
       const attempt = state.attempts[d.attempt];
       if (!attempt) break;
+      if (attempt.endedAt === undefined) unindexAttempt(index, attempt);
       attempt.endedAt = at;
       attempt.endReason = d.reason;
       break;
@@ -192,10 +246,89 @@ export const reduce: Reduce = (state: State, event: MingaEvent): State => {
       break;
     }
 
+    case "submission.queued": {
+      const d = event.data;
+      const submission: SubmissionState = {
+        id: d.submission,
+        attempt: d.attempt,
+        task: d.task,
+        agent: d.agent,
+        model: d.model,
+        claim: d.claim,
+        message: d.message,
+        files: [...d.files],
+        bytes: d.bytes,
+        status: "queued",
+        queuedAt: at,
+        runs: 0,
+        points: 0,
+      };
+      state.submissions[d.submission] = submission;
+      index.pendingSubmissions.push(d.submission);
+      state.counters.submission = Math.max(
+        state.counters.submission,
+        idNumber(d.submission),
+      );
+      break;
+    }
+
+    case "submission.started": {
+      const d = event.data;
+      const submission = state.submissions[d.submission];
+      if (!submission || (submission.status !== "queued" && submission.status !== "checking")) break;
+      submission.status = "checking";
+      submission.startedAt = at;
+      submission.base = d.base;
+      submission.runs += 1;
+      break;
+    }
+
     case "submission.checked": {
       const d = event.data;
-      const submission: SubmissionState = { ...d, at };
-      state.submissions[d.submission] = submission;
+      const existing = state.submissions[d.submission];
+      const status = d.ok ? "accepted" : "rejected";
+      if (existing) {
+        existing.status = status;
+        existing.checkedAt = at;
+        existing.checkedSeq = event.seq;
+        existing.ok = d.ok;
+        existing.exitCode = d.exitCode;
+        existing.timedOut = d.timedOut;
+        existing.stale = d.stale;
+        existing.durationMs = d.durationMs;
+        existing.commit = d.commit;
+        existing.points = d.points;
+        if (d.base !== undefined) existing.base = d.base;
+        removeId(index.pendingSubmissions, d.submission);
+      } else {
+        // v1 logs have no submission.queued event: synthesize the record.
+        const submission: SubmissionState = {
+          id: d.submission,
+          attempt: d.attempt,
+          task: d.task,
+          agent: d.agent,
+          model: d.model,
+          claim: d.claim,
+          message: "",
+          files: [...d.files],
+          bytes: 0,
+          status,
+          queuedAt: at,
+          runs: 1,
+          checkedAt: at,
+          checkedSeq: event.seq,
+          ok: d.ok,
+          exitCode: d.exitCode,
+          timedOut: d.timedOut,
+          stale: d.stale,
+          durationMs: d.durationMs,
+          commit: d.commit,
+          points: d.points,
+        };
+        if (d.base !== undefined) submission.base = d.base;
+        state.submissions[d.submission] = submission;
+        removeId(index.pendingSubmissions, d.submission);
+      }
       state.counters.submission = Math.max(
         state.counters.submission,
         idNumber(d.submission),
@@ -207,6 +340,10 @@ export const reduce: Reduce = (state: State, event: MingaEvent): State => {
           agent.accepted += 1;
           agent.points += d.points;
         }
+      }
+      if (!d.ok && !d.stale) {
+        const byTask = (index.failures[d.agent] ??= {});
+        byTask[d.task] = (byTask[d.task] ?? 0) + 1;
       }
       break;
     }
@@ -286,18 +423,28 @@ export const nextId: NextId = (state, kind) =>
 
 export const isLive: IsLive = (state, attemptId, now) => {
   const attempt = state.attempts[attemptId];
-  if (!attempt) return false;
-  if (attempt.endedAt !== undefined) return false;
-  return Date.parse(attempt.leaseUntil) > now.getTime();
+  if (!attempt || attempt.endedAt !== undefined) return false;
+  return Date.parse(attempt.leaseUntil) > now.getTime() || hasPendingSubmission(state, attemptId);
 };
+
+/** Filters live ids from an index list, tolerating states built before the index existed. */
+function liveIds(state: State, ids: readonly string[], now: Date): string[] {
+  const result: string[] = [];
+  for (const id of ids) if (isLive(state, id, now)) result.push(id);
+  return result;
+}
 
 export const liveAttempts: LiveAttempts = (state, taskId, now) => {
-  const task = state.tasks[taskId];
-  if (!task) return [];
-  return task.attempts.filter((id) => isLive(state, id, now));
+  const ids = state.index?.openByTask?.[taskId] ?? state.tasks[taskId]?.attempts ?? [];
+  return liveIds(state, ids, now);
 };
 
-export const computeLeaderboard: ComputeLeaderboard = (state) => {
+export const agentLiveAttempts: AgentLiveAttempts = (state, agent, now) => {
+  const ids = state.index?.openByAgent?.[agent] ?? [];
+  return liveIds(state, ids, now);
+};
+
+export const computeLeaderboard: ComputeLeaderboard = (state, limit) => {
   const agents: LeaderRow[] = [];
   for (const agent of Object.values(state.agents)) {
     if (agent.banned) continue;
@@ -347,5 +494,8 @@ export const computeLeaderboard: ComputeLeaderboard = (state) => {
   }));
   models.sort((a, b) => b.points - a.points || (a.model < b.model ? -1 : a.model > b.model ? 1 : 0));
 
-  return { agents, models };
+  return {
+    agents: limit === undefined ? agents : agents.slice(0, Math.max(0, limit)),
+    models,
+  };
 };

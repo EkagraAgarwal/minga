@@ -42,6 +42,13 @@ function makeState(): State {
     submissions: {},
     proposals: {},
     counters: { task: 0, attempt: 0, note: 0, submission: 0, proposal: 0 },
+    index: {
+      openByAgent: {},
+      openByTask: {},
+      openAttempts: [],
+      pendingSubmissions: [],
+      failures: {},
+    },
   };
 }
 
@@ -107,6 +114,11 @@ function addAttempt(
   };
   state.attempts[id] = attempt;
   state.tasks[task]?.attempts.push(id);
+  if (attempt.endedAt === undefined) {
+    (state.index.openByAgent[attempt.agent] ??= []).push(id);
+    (state.index.openByTask[attempt.task] ??= []).push(id);
+    state.index.openAttempts.push(id);
+  }
   return attempt;
 }
 
@@ -118,24 +130,34 @@ function addSubmission(
   ok: boolean,
   overrides: Partial<SubmissionState> = {},
 ): SubmissionState {
+  const status = overrides.status ?? (ok ? "accepted" : "rejected");
   const submission: SubmissionState = {
-    submission: id,
+    id,
     attempt: "A-0",
     task,
     agent,
     model: "gpt-4o",
     claim: "progress",
     files: [],
+    message: "",
+    bytes: 0,
+    status,
+    queuedAt: iso(0),
+    runs: 1,
+    checkedAt: iso(1),
     ok,
     exitCode: ok ? 0 : 1,
     timedOut: false,
-    outputTail: "",
     durationMs: 1,
     points: ok ? 5 : 0,
-    at: iso(0),
     ...overrides,
   };
   state.submissions[id] = submission;
+  if (status === "queued" || status === "checking") state.index.pendingSubmissions.push(id);
+  if (!ok && !submission.stale) {
+    const byTask = (state.index.failures[agent] ??= {});
+    byTask[task] = (byTask[task] ?? 0) + 1;
+  }
   return submission;
 }
 
@@ -170,6 +192,17 @@ describe("expiredAttempts", () => {
     addAttempt(state, "A-3", "T-1", "c", { leaseUntil: iso(10), endedAt: iso(10) });
 
     expect(expiredAttempts(state, NOW)).toEqual(["A-1"]);
+  });
+
+  test("skips attempts with a pending submission", () => {
+    const state = makeState();
+    addTask(state, "T-1");
+    addTask(state, "T-2");
+    addAttempt(state, "A-1", "T-1", "a", { leaseUntil: iso(10) });
+    addAttempt(state, "A-2", "T-2", "b", { leaseUntil: iso(12) });
+    addSubmission(state, "S-1", "T-1", "a", true, { status: "queued", attempt: "A-1" });
+
+    expect(expiredAttempts(state, NOW)).toEqual(["A-2"]);
   });
 });
 
@@ -318,6 +351,51 @@ describe("pickTask", () => {
     // Both tasks are otherwise identical, so the first-seen task wins on the tie.
     expect(pickTask({ state, agent: "me", now: NOW, rng: () => 0 })?.task).toBe("T-1");
   });
+
+  test("a pending submission holds a task and the agent's slot past the lease", () => {
+    const state = makeState();
+    state.rules.maxAttemptsPerAgent = 1;
+    addAgent(state, "me", "claude-3");
+    addTask(state, "T-1");
+    addTask(state, "T-2");
+    addAttempt(state, "A-1", "T-1", "me", { leaseUntil: iso(10) });
+    addSubmission(state, "S-1", "T-1", "me", true, { status: "checking", attempt: "A-1" });
+
+    expect(pickTask({ state, agent: "me", now: NOW, rng: () => 0 })).toBeNull();
+  });
+
+  test("uses the failure index instead of scanning submissions", () => {
+    const state = makeState();
+    addAgent(state, "me");
+    addTask(state, "T-1");
+    addTask(state, "T-2");
+    addSubmission(state, "S-1", "T-1", "me", false);
+    // A recorded failure without a submission record still counts.
+    state.index.failures["me"] = { "T-1": 2 };
+    delete state.submissions["S-1"];
+
+    expect(pickTask({ state, agent: "me", now: NOW, rng: () => 0 })?.task).toBe("T-2");
+  });
+
+  test("1,000 picks over 5,000 tasks and 2,000 agents average under 2 ms", () => {
+    const state = makeState();
+    state.rules.width = 5;
+    state.rules.maxAttemptsPerAgent = 5;
+    for (let i = 0; i < 2000; i += 1) addAgent(state, `a${i}`, `model-${i % 20}`);
+    for (let i = 1; i <= 5000; i += 1) addTask(state, `T-${i}`);
+    for (let i = 0; i < 200; i += 1) {
+      addAttempt(state, `A-${i + 1}`, `T-${i + 1}`, `a${i}`, { leaseUntil: LEASE });
+    }
+    const rng = mulberry32(99);
+    const startedAt = performance.now();
+    for (let i = 0; i < 1000; i += 1) {
+      expect(pickTask({ state, agent: `a${i % 2000}`, now: NOW, rng })).not.toBeNull();
+    }
+    const avg = (performance.now() - startedAt) / 1000;
+    // eslint-disable-next-line no-console
+    console.log(`1,000 pickTask calls: ${avg.toFixed(3)} ms avg`);
+    expect(avg).toBeLessThan(2);
+  }, 30_000);
 
   test("is deterministic with a seeded rng", () => {
     const build = (): State => {

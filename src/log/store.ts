@@ -57,28 +57,37 @@ export const openEventStore: OpenEventStore = (path: string): EventStore => {
   const sinceStmt = db.prepare(
     "SELECT seq, at, type, actor, data FROM events WHERE seq > ? ORDER BY seq ASC LIMIT ?",
   );
+  const getStmt = db.prepare(
+    "SELECT seq, at, type, actor, data FROM events WHERE seq = ?",
+  );
 
   const listeners = new Set<(event: MingaEvent) => void>();
 
-  const head = (): number => {
-    const row = headStmt.get() as { seq: number | null } | null;
-    return row?.seq ?? 0;
-  };
+  // Cached after the initial read: SELECT MAX(seq) on every append costs more
+  // than the insert itself at 50k events.
+  let lastSeq = (headStmt.get() as { seq: number | null } | null)?.seq ?? 0;
+
+  const head = (): number => lastSeq;
 
   const append = (event: NewEvent, at?: Date): MingaEvent => {
-    const seq = head() + 1;
+    const seq = ++lastSeq;
     const stored: MingaEvent = {
       ...event,
       seq,
       at: (at ?? new Date()).toISOString(),
     } as MingaEvent;
-    insertStmt.run(
-      stored.seq,
-      stored.at,
-      stored.type,
-      stored.actor,
-      JSON.stringify(stored.data),
-    );
+    try {
+      insertStmt.run(
+        stored.seq,
+        stored.at,
+        stored.type,
+        stored.actor,
+        JSON.stringify(stored.data),
+      );
+    } catch (err) {
+      lastSeq = seq - 1;
+      throw err;
+    }
     for (const listener of listeners) {
       try {
         listener(stored);
@@ -92,6 +101,11 @@ export const openEventStore: OpenEventStore = (path: string): EventStore => {
   const since = (after: number, limit?: number): MingaEvent[] => {
     const rows = sinceStmt.all(after, limit ?? -1) as EventRow[];
     return rows.map(toEvent);
+  };
+
+  const get = (seq: number): MingaEvent | undefined => {
+    const row = getStmt.get(seq) as EventRow | undefined;
+    return row ? toEvent(row) : undefined;
   };
 
   const subscribe = (listener: (event: MingaEvent) => void): (() => void) => {
@@ -115,5 +129,5 @@ export const openEventStore: OpenEventStore = (path: string): EventStore => {
     db.close();
   };
 
-  return { append, since, head, subscribe, close };
+  return { append, since, head, get, subscribe, close };
 };

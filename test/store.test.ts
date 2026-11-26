@@ -132,6 +132,39 @@ describe("event store", () => {
     }
   });
 
+  test("get returns one event by seq, or undefined", () => {
+    const store = openEventStore(":memory:");
+    const a = store.append(joined("aaa"), new Date(T0));
+    const b = store.append(posted("T-1"), new Date("2026-01-01T00:01:00.000Z"));
+
+    expect(store.get(a.seq)).toEqual(a);
+    expect(store.get(b.seq)).toEqual(b);
+    expect(store.get(0)).toBeUndefined();
+    expect(store.get(3)).toBeUndefined();
+    expect(store.get(-1)).toBeUndefined();
+    store.close();
+  });
+
+  test("get round-trips a large payload without reading other events", () => {
+    const store = openEventStore(":memory:");
+    const input: NewEvent = {
+      type: "submission.checked",
+      actor: "aaa",
+      data: {
+        submission: "S-1", attempt: "A-1", task: "T-1", agent: "aaa", model: "m",
+        claim: "solves", files: ["a.ts"], ok: true, exitCode: 0, timedOut: false,
+        outputTail: "line\n".repeat(2000), durationMs: 12, points: 5,
+      },
+    };
+    const stored = store.append(input, new Date(T0));
+    store.append(posted("T-2"), new Date(T0));
+
+    const got = store.get(stored.seq) as Extract<MingaEvent, { type: "submission.checked" }>;
+    expect(got as unknown).toEqual(stored as unknown);
+    expect(got.data.outputTail.length).toBe("line\n".repeat(2000).length);
+    store.close();
+  });
+
   test("persists across reopen with a file database", () => {
     const path = tempDbPath();
     const first = openEventStore(path);
@@ -145,6 +178,8 @@ describe("event store", () => {
     const events = second.since(0);
     expect(events.map((e) => e.type)).toEqual(["agent.joined", "task.posted"]);
     expect(events.map((e) => e.at)).toEqual([T0, "2026-01-01T00:01:00.000Z"]);
+    expect(second.get(1)).toEqual(events[0]);
+    expect(second.get(2)).toEqual(events[1]);
 
     // Writing resumes at the existing head.
     expect(second.append(posted("T-2"), new Date(T0)).seq).toBe(3);
@@ -154,4 +189,20 @@ describe("event store", () => {
     expect(third.head()).toBe(3);
     third.close();
   });
+
+  test("appends 50,000 events to a file DB in under 3 seconds", () => {
+    const path = tempDbPath();
+    const store = openEventStore(path);
+    const event = posted("T-1");
+    const startedAt = performance.now();
+    for (let i = 0; i < 50_000; i += 1) store.append(event, new Date(T0));
+    const elapsed = performance.now() - startedAt;
+    // eslint-disable-next-line no-console
+    console.log(`50,000 file-DB appends: ${elapsed.toFixed(1)} ms`);
+
+    expect(store.head()).toBe(50_000);
+    expect(store.get(50_000)?.seq).toBe(50_000);
+    store.close();
+    expect(elapsed).toBeLessThan(3000);
+  }, 30_000);
 });

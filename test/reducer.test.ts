@@ -1,6 +1,6 @@
 import { describe, expect, test } from "bun:test";
 import {
-  computeLeaderboard, initialState, isLive, liveAttempts, nextId, reduce, replay,
+  agentLiveAttempts, computeLeaderboard, initialState, isLive, liveAttempts, nextId, reduce, replay,
 } from "../src/log/reducer.ts";
 import type { MingaEvent, NewEvent, Rules } from "../src/core/types.ts";
 
@@ -58,6 +58,35 @@ const start = (
   data: { attempt, task, agent, role: "build", approach: "try it", model, leaseUntil },
 });
 
+/** v2 lifecycle helpers. */
+const queued = (
+  id: string,
+  attempt: string,
+  agent: string,
+  task: string,
+): NewEvent => ({
+  type: "submission.queued",
+  actor: agent,
+  data: {
+    submission: id,
+    attempt,
+    task,
+    agent,
+    model: "model-a",
+    claim: "solves",
+    message: "do it",
+    files: ["src/x.ts"],
+    bytes: 42,
+  },
+});
+
+const started = (id: string, base = "abc123", round = 0, at = T0): NewEvent => ({
+  type: "submission.started",
+  actor: "server",
+  data: { submission: id, base, round },
+});
+
+/** v1-style checked event (no prior queued event). */
 const submission = (
   id: string,
   agent: string,
@@ -89,6 +118,13 @@ describe("initialState", () => {
     const state = initialState(RULES);
     expect(state.seq).toBe(0);
     expect(state.counters).toEqual({ task: 0, attempt: 0, note: 0, submission: 0, proposal: 0 });
+    expect(state.index).toEqual({
+      openByAgent: {},
+      openByTask: {},
+      openAttempts: [],
+      pendingSubmissions: [],
+      failures: {},
+    });
     expect(state.agents).toEqual({});
 
     state.rules.roles.explore = 99;
@@ -348,8 +384,21 @@ describe("submissions", () => {
       ev(submission("S-7", "aaa", "model-a", false, 0)),
     ]);
 
-    expect(state.submissions["S-1"]).toMatchObject({ ok: true, points: 12, at: T0 });
-    expect(state.submissions["S-7"]).toMatchObject({ ok: false, points: 0, at: T0 });
+    expect(state.submissions["S-1"]).toMatchObject({
+      id: "S-1",
+      ok: true,
+      points: 12,
+      queuedAt: T0,
+      checkedAt: T0,
+      checkedSeq: 3,
+      runs: 1,
+      message: "",
+      bytes: 0,
+      status: "accepted",
+    });
+    expect(state.submissions["S-1"]).not.toHaveProperty("at");
+    expect(state.submissions["S-1"]).not.toHaveProperty("outputTail");
+    expect(state.submissions["S-7"]).toMatchObject({ ok: false, points: 0, status: "rejected" });
     const agent = state.agents["aaa"]!;
     expect(agent.points).toBe(12);
     expect(agent.accepted).toBe(1);
@@ -537,4 +586,323 @@ describe("computeLeaderboard", () => {
       { model: "bad-model", agents: 1, points: 0, accepted: 0, submissions: 1, passRate: 0 },
     ]);
   });
+
+  test("limit caps agents but never models", () => {
+    const ev = logger();
+    const events: MingaEvent[] = [ev(post("T-1"))];
+    for (const agent of ["a", "b", "c"]) {
+      events.push(ev(join(agent, { model: "m" })));
+      events.push(ev(submission(`S-${agent}`, agent, "m", true, 1)));
+    }
+    const board = computeLeaderboard(replay(RULES, events), 2);
+    expect(board.agents.map((row) => row.agent)).toEqual(["a", "b"]);
+    expect(board.models).toHaveLength(1);
+    expect(computeLeaderboard(replay(RULES, events), 0).agents).toEqual([]);
+  });
+});
+
+/** Deterministic rng for the randomized index test. */
+function mulberry32(seed: number): () => number {
+  let a = seed >>> 0;
+  return () => {
+    a = (a + 0x6d2b79f5) >>> 0;
+    let t = a;
+    t = Math.imul(t ^ (t >>> 15), t | 1);
+    t ^= t + Math.imul(t ^ (t >>> 7), t | 61);
+    return ((t ^ (t >>> 14)) >>> 0) / 4294967296;
+  };
+}
+
+function bruteForceIndex(state: ReturnType<typeof initialState>) {
+  const open = Object.values(state.attempts).filter((a) => a.endedAt === undefined);
+  const byAgent: Record<string, string[]> = {};
+  const byTask: Record<string, string[]> = {};
+  for (const attempt of open) {
+    (byAgent[attempt.agent] ??= []).push(attempt.id);
+    (byTask[attempt.task] ??= []).push(attempt.id);
+  }
+  return {
+    openByAgent: byAgent,
+    openByTask: byTask,
+    openAttempts: open.map((a) => a.id),
+  };
+}
+
+describe("state index", () => {
+  test("stays consistent under a random start/end sequence", () => {
+    const ev = logger();
+    const state = initialState(RULES);
+    const events: MingaEvent[] = [];
+    for (let i = 0; i < 12; i += 1) events.push(ev(join(`a${i}`)));
+    for (let i = 1; i <= 25; i += 1) events.push(ev(post(`T-${i}`)));
+
+    const rng = mulberry32(20260101);
+    let attemptNo = 0;
+    const open: string[] = [];
+    for (let i = 0; i < 3000; i += 1) {
+      if (open.length === 0 || (open.length < 30 && rng() < 0.6)) {
+        attemptNo += 1;
+        const id = `A-${attemptNo}`;
+        events.push(ev(start(id, `T-${1 + Math.floor(rng() * 25)}`, `a${Math.floor(rng() * 12)}`)));
+        open.push(id);
+      } else {
+        const at = Math.floor(rng() * open.length);
+        const id = open.splice(at, 1)[0]!;
+        events.push(ev({
+          type: "attempt.ended",
+          actor: "server",
+          data: { attempt: id, reason: "released" },
+        }));
+      }
+    }
+    for (const event of events) reduce(state, event);
+
+    expect(state.index).toMatchObject(bruteForceIndex(state));
+    // Empty per-key arrays are deleted, not left behind.
+    for (const list of Object.values(state.index.openByAgent)) expect(list.length).toBeGreaterThan(0);
+    for (const list of Object.values(state.index.openByTask)) expect(list.length).toBeGreaterThan(0);
+  });
+
+  test("queued -> started -> checked keeps the submission out of pending once final", () => {
+    const ev = logger();
+    const state = replay(RULES, [
+      ev(join("aaa")),
+      ev(post("T-1")),
+      ev(start("A-1", "T-1", "aaa")),
+      ev(queued("S-1", "A-1", "aaa", "T-1"), "2026-01-01T00:01:00.000Z"),
+      ev(started("S-1", "deadbeef"), "2026-01-01T00:02:00.000Z"),
+      ev({
+        type: "submission.checked",
+        actor: "server",
+        data: {
+          submission: "S-1",
+          attempt: "A-1",
+          task: "T-1",
+          agent: "aaa",
+          model: "model-a",
+          claim: "solves",
+          files: ["src/x.ts"],
+          base: "deadbeef",
+          ok: true,
+          exitCode: 0,
+          timedOut: false,
+          outputTail: "ignored tail",
+          durationMs: 123,
+          commit: "cafebabe",
+          points: 9,
+        },
+      }, "2026-01-01T00:03:00.000Z"),
+    ]);
+
+    const s = state.submissions["S-1"]!;
+    expect(s).toEqual({
+      id: "S-1",
+      attempt: "A-1",
+      task: "T-1",
+      agent: "aaa",
+      model: "model-a",
+      claim: "solves",
+      message: "do it",
+      files: ["src/x.ts"],
+      bytes: 42,
+      status: "accepted",
+      queuedAt: "2026-01-01T00:01:00.000Z",
+      startedAt: "2026-01-01T00:02:00.000Z",
+      base: "deadbeef",
+      runs: 1,
+      checkedAt: "2026-01-01T00:03:00.000Z",
+      checkedSeq: 6,
+      ok: true,
+      exitCode: 0,
+      timedOut: false,
+      durationMs: 123,
+      commit: "cafebabe",
+      points: 9,
+    });
+    expect(s).not.toHaveProperty("outputTail");
+    expect(state.index.pendingSubmissions).toEqual([]);
+    expect(state.agents["aaa"]).toMatchObject({ points: 9, accepted: 1, submissions: 1 });
+  });
+
+  test("a second run increments runs and a stale rejection does not count as a failure", () => {
+    const ev = logger();
+    const check = (stale: boolean): NewEvent => ({
+      type: "submission.checked",
+      actor: "server",
+      data: {
+        submission: "S-1", attempt: "A-1", task: "T-1", agent: "aaa", model: "model-a",
+        claim: "solves", files: [], base: "", stale, ok: false, exitCode: 1,
+        timedOut: true, outputTail: "no", durationMs: 5, points: 0,
+      },
+    });
+    const state = replay(RULES, [
+      ev(join("aaa")),
+      ev(post("T-1")),
+      ev(start("A-1", "T-1", "aaa")),
+      ev(queued("S-1", "A-1", "aaa", "T-1")),
+      ev(started("S-1", "first")),
+      ev(started("S-1", "second", 1)),
+      ev(check(false)),
+    ]);
+    expect(state.submissions["S-1"]!.runs).toBe(2);
+    expect(state.submissions["S-1"]!.base).toBe("");
+    expect(state.index.failures).toEqual({ aaa: { "T-1": 1 } });
+
+    const staleEv = logger();
+    const staleState = replay(RULES, [
+      staleEv(join("aaa")),
+      staleEv(post("T-1")),
+      staleEv(queued("S-1", "A-1", "aaa", "T-1")),
+      staleEv(check(true)),
+    ]);
+    expect(staleState.index.failures).toEqual({});
+    expect(staleState.index.pendingSubmissions).toEqual([]);
+  });
+
+  test("v1 checked-only logs synthesize a record and still update the agent", () => {
+    const ev = logger();
+    const state = replay(RULES, [
+      ev(join("aaa")),
+      ev(post("T-1")),
+      ev(submission("S-7", "aaa", "model-a", false, 0)),
+    ]);
+    expect(state.submissions["S-7"]).toMatchObject({
+      id: "S-7",
+      message: "",
+      bytes: 0,
+      runs: 1,
+      queuedAt: T0,
+      checkedAt: T0,
+      status: "rejected",
+    });
+    expect(state.submissions["S-7"]).not.toHaveProperty("outputTail");
+    expect(state.index.pendingSubmissions).toEqual([]);
+    expect(state.index.failures).toEqual({ aaa: { "T-1": 1 } });
+    expect(state.agents["aaa"]!.submissions).toBe(1);
+  });
+});
+
+describe("liveness with pending submissions", () => {
+  const LATE = new Date("2026-01-01T01:00:00.000Z");
+
+  test("a queued submission keeps an attempt past its lease, on every index view", () => {
+    const ev = logger();
+    const state = replay(RULES, [
+      ev(join("aaa")),
+      ev(post("T-1")),
+      ev(start("A-1", "T-1", "aaa", "2026-01-01T00:05:00.000Z")),
+      ev(queued("S-1", "A-1", "aaa", "T-1")),
+    ]);
+
+    expect(isLive(state, "A-1", LATE)).toBe(true);
+    expect(liveAttempts(state, "T-1", LATE)).toEqual(["A-1"]);
+    expect(agentLiveAttempts(state, "aaa", LATE)).toEqual(["A-1"]);
+
+    const ev2 = logger();
+    const checked = replay(RULES, [
+      ev2(join("aaa")),
+      ev2(post("T-1")),
+      ev2(start("A-1", "T-1", "aaa", "2026-01-01T00:05:00.000Z")),
+      ev2(queued("S-1", "A-1", "aaa", "T-1")),
+      ev2({
+        type: "submission.checked",
+        actor: "server",
+        data: {
+          submission: "S-1", attempt: "A-1", task: "T-1", agent: "aaa", model: "model-a",
+          claim: "solves", files: [], ok: true, exitCode: 0, timedOut: false,
+          outputTail: "", durationMs: 1, points: 1,
+        },
+      }),
+    ]);
+    expect(isLive(checked, "A-1", LATE)).toBe(false);
+    expect(liveAttempts(checked, "T-1", LATE)).toEqual([]);
+    expect(agentLiveAttempts(checked, "aaa", LATE)).toEqual([]);
+  });
+
+  test("agentLiveAttempts uses per-agent ordering and ignores ended attempts", () => {
+    const ev = logger();
+    const state = replay(RULES, [
+      ev(join("aaa")),
+      ev(join("bbb")),
+      ev(post("T-1")),
+      ev(start("A-1", "T-1", "aaa")),
+      ev(start("A-2", "T-1", "bbb")),
+      ev(start("A-3", "T-1", "aaa")),
+      ev({ type: "attempt.ended", actor: "aaa", data: { attempt: "A-1", reason: "released" } }),
+    ]);
+    expect(agentLiveAttempts(state, "aaa", new Date(T0))).toEqual(["A-3"]);
+    expect(agentLiveAttempts(state, "bbb", new Date(T0))).toEqual(["A-2"]);
+    expect(agentLiveAttempts(state, "missing", new Date(T0))).toEqual([]);
+  });
+});
+
+describe("reducer performance", () => {
+  test("folds 200,000 mixed events in under 4 seconds", () => {
+    const state = initialState(RULES);
+    let seq = 0;
+    const fold = (event: NewEvent): void => {
+      seq += 1;
+      reduce(state, { ...event, seq, at: T0 } as MingaEvent);
+    };
+    for (let i = 0; i < 20; i += 1) fold(join(`a${i}`));
+    for (let i = 1; i <= 1000; i += 1) fold(post(`T-${i}`));
+
+    let attemptNo = 0;
+    let submissionNo = 0;
+    let noteNo = 0;
+    let lastAttempt = "";
+    let lastSubmission = "";
+    const startedAt = performance.now();
+    for (let i = 0; i < 200_000; i += 1) {
+      switch (i % 8) {
+        case 0:
+          attemptNo += 1;
+          lastAttempt = `A-${attemptNo}`;
+          fold(start(lastAttempt, `T-${1 + (i % 1000)}`, `a${i % 20}`));
+          break;
+        case 1:
+          submissionNo += 1;
+          lastSubmission = `S-${submissionNo}`;
+          fold(queued(lastSubmission, lastAttempt, `a${i % 20}`, `T-${1 + (i % 1000)}`));
+          break;
+        case 2:
+          fold(started(lastSubmission));
+          break;
+        case 3:
+          fold({
+            type: "submission.checked",
+            actor: "server",
+            data: {
+              submission: lastSubmission, attempt: lastAttempt, task: `T-${1 + (i % 1000)}`,
+              agent: `a${i % 20}`, model: "model-a", claim: "progress", files: [],
+              ok: i % 6 === 0, exitCode: 0, timedOut: false, outputTail: "x".repeat(200),
+              durationMs: 1, points: 1,
+            },
+          });
+          break;
+        case 4:
+          fold({ type: "attempt.ended", actor: "server", data: { attempt: lastAttempt, reason: "submitted" } });
+          break;
+        case 5:
+          noteNo += 1;
+          fold({
+            type: "note.added", actor: "a0",
+            data: { note: `N-${noteNo}`, task: `T-${1 + (i % 1000)}`, agent: "a0", kind: "idea", text: "n" },
+          });
+          break;
+        case 6:
+          fold({ type: "attempt.beat", actor: "server", data: { attempt: lastAttempt, leaseUntil: "2026-01-01T00:10:00.000Z" } });
+          break;
+        default:
+          fold(join(`a${i % 20}`, { rejoin: true }));
+          break;
+      }
+    }
+    const elapsed = performance.now() - startedAt;
+    expect(state.seq).toBe(200_000 + 1020);
+    expect(state.index.pendingSubmissions).toEqual([]);
+    // eslint-disable-next-line no-console
+    console.log(`fold 200,000 mixed events: ${elapsed.toFixed(1)} ms`);
+    expect(elapsed).toBeLessThan(4000);
+  }, 20_000);
 });

@@ -2,9 +2,9 @@
  * Pure scheduling decisions: which task and role an agent gets next, which
  * leases have expired, and whether a proposal has reached a vote threshold.
  *
- * Scheduler liveness is deliberately computed inline (an attempt is live while
- * it has not ended and its lease is in the future) instead of importing the log
- * module, so this file stays a pure function of `State`.
+ * Liveness is computed from `state.index` inline instead of importing the log
+ * module, so this file stays a pure function of `State`. A queued or checking
+ * submission keeps its attempt's slot past the lease.
  */
 import type {
   DecideByVotes,
@@ -16,8 +16,20 @@ import type {
 import type { AttemptId, AttemptState, Role, State, TaskId, TaskState } from "../core/types.ts";
 import { ROLES } from "../core/types.ts";
 
-function isLive(attempt: AttemptState, nowMs: number): boolean {
-  return attempt.endedAt === undefined && Date.parse(attempt.leaseUntil) > nowMs;
+/** Attempt ids with a pending submission, computed once per call. */
+function pendingAttempts(state: State): Set<AttemptId> {
+  const pending = new Set<AttemptId>();
+  const ids = state.index?.pendingSubmissions ?? [];
+  for (const id of ids) {
+    const submission = state.submissions[id];
+    if (submission) pending.add(submission.attempt);
+  }
+  return pending;
+}
+
+function isLive(attempt: AttemptState, nowMs: number, pending: ReadonlySet<AttemptId>): boolean {
+  return attempt.endedAt === undefined &&
+    (Date.parse(attempt.leaseUntil) > nowMs || pending.has(attempt.id));
 }
 
 /** Lowercased model name up to its first "-", "/" or ":"; "" maps to "unknown". */
@@ -29,14 +41,19 @@ export const modelFamily: ModelFamily = (model) => {
   return family === "" ? "unknown" : family;
 };
 
-/** Attempts that have not ended and whose leaseUntil <= now. */
+/**
+ * Unended attempts whose leaseUntil <= now. Attempts with a pending submission
+ * are skipped: their slot is still held while the check runs.
+ */
 export const expiredAttempts: ExpiredAttempts = (state, now) => {
   const nowMs = now.getTime();
+  const pending = pendingAttempts(state);
+  const open = state.index?.openAttempts ?? Object.keys(state.attempts);
   const expired: AttemptId[] = [];
-  for (const attempt of Object.values(state.attempts)) {
-    if (attempt.endedAt === undefined && Date.parse(attempt.leaseUntil) <= nowMs) {
-      expired.push(attempt.id);
-    }
+  for (const id of open) {
+    const attempt = state.attempts[id];
+    if (!attempt || attempt.endedAt !== undefined || pending.has(id)) continue;
+    if (Date.parse(attempt.leaseUntil) <= nowMs) expired.push(id);
   }
   return expired;
 };
@@ -80,13 +97,23 @@ export const pickTask: PickTask = (input) => {
 
   if (agentState?.banned) return null;
 
-  const liveAttempts = Object.values(state.attempts).filter((attempt) => isLive(attempt, nowMs));
-  const heldAttempts = liveAttempts.filter((attempt) => attempt.agent === agent);
+  const pending = pendingAttempts(state);
+  const liveOf = (ids: readonly AttemptId[]): AttemptState[] => {
+    const live: AttemptState[] = [];
+    for (const id of ids) {
+      const attempt = state.attempts[id];
+      if (attempt && isLive(attempt, nowMs, pending)) live.push(attempt);
+    }
+    return live;
+  };
+
+  // Only the agent's open attempts and the global open-attempt list are walked.
+  const heldAttempts = liveOf(state.index?.openByAgent?.[agent] ?? []);
   if (heldAttempts.length >= state.rules.maxAttemptsPerAgent) return null;
 
   const liveCountByTask = new Map<TaskId, number>();
   const liveFamiliesByTask = new Map<TaskId, Set<string>>();
-  for (const attempt of liveAttempts) {
+  for (const attempt of liveOf(state.index?.openAttempts ?? Object.keys(state.attempts))) {
     liveCountByTask.set(attempt.task, (liveCountByTask.get(attempt.task) ?? 0) + 1);
     let families = liveFamiliesByTask.get(attempt.task);
     if (!families) {
@@ -97,9 +124,10 @@ export const pickTask: PickTask = (input) => {
   }
 
   const heldTasks = new Set<TaskId>(heldAttempts.map((attempt) => attempt.task));
+  const failures = state.index?.failures?.[agent] ?? {};
   const failedTasks = new Set<TaskId>();
-  for (const submission of Object.values(state.submissions)) {
-    if (submission.agent === agent && submission.ok === false) failedTasks.add(submission.task);
+  for (const task of Object.keys(failures)) {
+    if ((failures[task] ?? 0) > 0) failedTasks.add(task);
   }
 
   const agentFamily = modelFamily(agentState?.model ?? "");

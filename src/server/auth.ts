@@ -13,17 +13,23 @@ export class HttpError extends Error {
 
 /** Remembers nonces for the skew window so a captured request cannot be replayed. */
 export class NonceCache {
+  // Insertion order is expiry order (every entry lives the same time), so pruning only
+  // ever looks at the oldest entries: amortized O(1) per request at any scale.
   private seen = new Map<string, number>();
   check(agent: string, nonce: string, nowMs: number): boolean {
-    if (this.seen.size > 50_000) this.prune(nowMs);
+    this.prune(nowMs);
     const key = `${agent}:${nonce}`;
     if (this.seen.has(key)) return false;
     this.seen.set(key, nowMs + 2 * MAX_CLOCK_SKEW_MS);
     return true;
   }
   prune(nowMs: number): void {
-    for (const [k, exp] of this.seen) if (exp <= nowMs) this.seen.delete(k);
+    for (const [k, exp] of this.seen) {
+      if (exp > nowMs) break;
+      this.seen.delete(k);
+    }
   }
+  get size(): number { return this.seen.size; }
 }
 
 /** Simple token bucket per agent: `perMinute` requests, burst of the same size. */
