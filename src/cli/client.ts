@@ -12,7 +12,7 @@ import type {
   HeadRuleRequest, HeadRuleResponse, JoinRequest, JoinResponse, LeaderboardResponse, NextRequest,
   NextResponse, NoteRequest, NoteResponse, ProposeRequest, ProposeResponse, ProjectInfo,
   ReleaseRequest, ReleaseResponse, SubmitRequest, SubmitResponse, SubmissionView,
-  VoteRequest, VoteResponse,
+  TasksResponse, VoteRequest, VoteResponse,
 } from "../core/protocol.ts";
 import type { AgentId } from "../core/types.ts";
 import { agentIdFromPublicKey, signRequest } from "../identity/keys.ts";
@@ -41,6 +41,8 @@ export interface Client {
   state(): Promise<StateResponse>;
   events(after?: number, limit?: number): Promise<EventsResponse>;
   leaderboard(): Promise<LeaderboardResponse>;
+  /** GET /api/tasks: every task, compact, for a tree overview. */
+  tasks(): Promise<TasksResponse>;
   /** GET /api/submission/<id>?wait=<seconds>. Long-polls at most 30 s per call. */
   submission(id: string, waitSeconds?: number): Promise<SubmissionView>;
 
@@ -109,6 +111,7 @@ export function createClient(baseUrl: string, keys: KeyPair, fetchImpl: FetchLik
       return send<EventsResponse>("GET", `/api/events?${query}`);
     },
     leaderboard: () => send<LeaderboardResponse>("GET", "/api/leaderboard"),
+    tasks: () => send<TasksResponse>("GET", "/api/tasks"),
     submission: (id, waitSeconds = 0) => {
       const wait = Math.max(0, Math.min(30, Math.floor(waitSeconds)));
       const query = wait > 0 ? `?wait=${wait}` : "";

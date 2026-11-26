@@ -4,7 +4,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 
 import type { ProjectInfo } from "../src/core/protocol.ts";
-import { agentIdFromPublicKey } from "../src/identity/keys.ts";
+import { agentIdFromPublicKey, generateKeyPair } from "../src/identity/keys.ts";
 import type { FetchLike } from "../src/cli/client.ts";
 import type { ParsedCli } from "../src/cli/commands.ts";
 import type { DispatchOutcome } from "../src/cli/dispatch.ts";
@@ -54,6 +54,19 @@ async function withTempDir<T>(fn: (dir: string) => T | Promise<T>): Promise<T> {
   }
 }
 
+function withIdentityForMcp(dir: string, url = "http://minga.test"): void {
+  mkdirSync(join(dir, ".minga"), { recursive: true });
+  const keys = generateKeyPair();
+  writeFileSync(join(dir, ".minga", "agent.json"), JSON.stringify({
+    url,
+    agent: agentIdFromPublicKey(keys.publicKey),
+    publicKey: keys.publicKey,
+    privateKey: keys.privateKey,
+    model: "m",
+    harness: "h",
+  }));
+}
+
 describe("MCP protocol", () => {
   test("initialize negotiates 2025-06-18 and advertises tools", async () => {
     const handler = createMcpHandler({ dir: process.cwd(), execute: canned() });
@@ -72,13 +85,13 @@ describe("MCP protocol", () => {
     expect(await handler(JSON.stringify({ jsonrpc: "2.0", id: 3, method: "notifications/initialized" }))).toBeNull();
   });
 
-  test("tools/list exposes all twelve tools with JSON Schema inputs", async () => {
+  test("tools/list exposes all thirteen tools with JSON Schema inputs", async () => {
     const handler = createMcpHandler({ dir: process.cwd(), execute: canned() });
     const reply = decode(await handler(rpc(4, "tools/list")));
     expect(reply.result.tools.map((t: { name: string }) => t.name)).toEqual([
       "minga_join", "minga_next", "minga_beat", "minga_note", "minga_submit", "minga_result",
       "minga_release", "minga_propose_task", "minga_propose_impossible", "minga_vote",
-      "minga_status", "minga_board",
+      "minga_status", "minga_board", "minga_tasks",
     ]);
     for (const tool of reply.result.tools) {
       expect(typeof tool.description).toBe("string");
@@ -86,17 +99,22 @@ describe("MCP protocol", () => {
       expect(tool.inputSchema.type).toBe("object");
       expect(typeof tool.inputSchema.properties).toBe("object");
     }
-    expect(MCP_TOOLS.length).toBe(12);
+    expect(MCP_TOOLS.length).toBe(13);
 
     const joined = reply.result.tools.find((t: { name: string }) => t.name === "minga_join");
     const next = reply.result.tools.find((t: { name: string }) => t.name === "minga_next");
     const submitted = reply.result.tools.find((t: { name: string }) => t.name === "minga_submit");
     const result = reply.result.tools.find((t: { name: string }) => t.name === "minga_result");
+    const tasks = reply.result.tools.find((t: { name: string }) => t.name === "minga_tasks");
     expect(joined.description).toContain("minga_next");
     expect(joined.description).toContain("minga_submit");
+    expect(joined.description).toContain("if done is true, stop");
     expect(next.description).toContain("call again if assignment is null");
     expect(next.description).toContain("30 seconds");
+    expect(next.description).toContain("if done is true, stop");
+    expect(next.description).toContain("git pull");
     expect(next.inputSchema.properties.wait.description).toContain("default 30");
+    expect(tasks.inputSchema.properties.open.type).toBe("boolean");
     expect(submitted.description).toContain("waits for the verdict");
     expect(submitted.description).toContain("~10 minutes");
     expect(submitted.description).toContain("wait:false");
@@ -124,6 +142,23 @@ describe("tool calls", () => {
     expect(reply.result.content).toEqual([{ type: "text", text: "joined Minga as agent abc" }]);
     expect(reply.result.structuredContent).toEqual({ agent: "abc" });
     expect(reply.result.isError).toBeUndefined();
+  });
+
+  test("minga_next done is spelled out in the text and structuredContent", async () => {
+    const handler = createMcpHandler({
+      dir: process.cwd(),
+      execute: canned({
+        code: 4,
+        result: {
+          text: "the project has no open tasks left. Stop here.",
+          data: { assignment: null, done: true },
+        },
+      }),
+    });
+    const reply = decode(await handler(rpc(12, "tools/call", { name: "minga_next", arguments: {} })));
+    expect(reply.result.content[0].text).toBe("the project has no open tasks left. Stop here.");
+    expect(reply.result.structuredContent).toEqual({ assignment: null, done: true });
+    expect(reply.result.structuredContent.done).toBe(true);
   });
 
   test("thrown errors and non-zero exit codes become isError results", async () => {
@@ -186,6 +221,10 @@ describe("tool calls", () => {
     expect(toolToCli("minga_release", { attempt: "A-1", handoff: "h" }).command).toBe("release");
     expect(toolToCli("minga_status", {}).command).toBe("status");
     expect(toolToCli("minga_board", {}).command).toBe("board");
+    expect(toolToCli("minga_tasks", {})).toEqual({ command: "tasks", options: {}, positionals: [] });
+    expect(toolToCli("minga_tasks", { open: true })).toEqual({
+      command: "tasks", options: { open: true }, positionals: [],
+    });
     expect(toolToCli("minga_note", { task: "T-1", kind: "idea", text: "x" }).positionals).toEqual(["T-1", "idea", "x"]);
     expect(toolToCli("minga_beat", { attempt: "A-1" }).command).toBe("beat");
   });
@@ -251,6 +290,61 @@ describe("MCP round trip through the real dispatcher", () => {
       expect(beat.result.isError).toBeUndefined();
       const stored = JSON.parse(readFileSync(agentPath(dir), "utf8")) as { publicKey: string };
       expect(seen["/api/beat"]).toBe(agentIdFromPublicKey(stored.publicKey));
+    });
+  });
+
+  test("minga_tasks returns the task tree and raw response through the dispatcher", async () => {
+    const overview = {
+      tasks: [
+        { id: "T-1", title: "Root", parent: null, status: "open", points: 0, live: 0, leaf: false },
+        { id: "T-3", title: "isPrime", parent: "T-1", status: "open", points: 20, live: 1, leaf: true },
+      ],
+      open: 1,
+      done: false,
+    };
+    const fetchImpl: FetchLike = async (url) => {
+      expect(new URL(url).pathname).toBe("/api/tasks");
+      return new Response(JSON.stringify(overview), { status: 200, headers: { "content-type": "application/json" } });
+    };
+    await withTempDir(async (dir) => {
+      withIdentityForMcp(dir);
+      const handler = createMcpHandler({ dir, fetchImpl });
+      const reply = decode(await handler(rpc(19, "tools/call", {
+        name: "minga_tasks", arguments: { open: true },
+      })));
+      expect(reply.result.isError).toBeUndefined();
+      expect(reply.result.content[0].text).toContain("  T-3  open   1 live  20 pts  isPrime");
+      expect(reply.result.content[0].text).toContain("open leaf tasks: 1");
+      expect(reply.result.structuredContent).toEqual(overview);
+    });
+  });
+
+  test("minga_next surfaces the assigned head in text and structuredContent", async () => {
+    const head = "1234567890abcdef1234";
+    const fetchImpl: FetchLike = async (url, init) => {
+      if (init?.method === "POST") {
+        const assignment = {
+          attempt: "A-1", role: "build", leaseUntil: "2026-01-01T00:10:00.000Z", head,
+          task: { id: "T-1", title: "Root", body: "", parent: null, points: 10 },
+          path: [], notes: [], others: [],
+        };
+        return new Response(JSON.stringify({ assignment }), {
+          status: 200, headers: { "content-type": "application/json" },
+        });
+      }
+      return new Response(JSON.stringify(project), {
+        status: 200, headers: { "content-type": "application/json" },
+      });
+    };
+    await withTempDir(async (dir) => {
+      withIdentityForMcp(dir);
+      const handler = createMcpHandler({ dir, fetchImpl });
+      const reply = decode(await handler(rpc(23, "tools/call", {
+        name: "minga_next", arguments: { wait: 0 },
+      })));
+      expect(reply.result.isError).toBeUndefined();
+      expect(reply.result.content[0].text).toContain(`head ${head.slice(0, 7)} (git pull if your checkout is older)`);
+      expect(reply.result.structuredContent.assignment.head).toBe(head);
     });
   });
 

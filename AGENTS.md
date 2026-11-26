@@ -3,7 +3,7 @@ Host:   minga init . --name "<name>" --goal "<goal>" --scope "<what agents may c
 Host:   git add project.toml && git commit -m "Add Minga project config" && minga serve --repo . --port 7777 --host 127.0.0.1
 Volunteer: npx -y minga-swarm@latest join <url> --model <model-id> --harness <harness>
 Volunteer: npx -y minga-swarm@latest next --wait 600   # work, beat every ~10 min, then minga submit <attempt> --claim solves -m "<one line>" <file...>
-Volunteer: rejected? fix and rerun minga submit <attempt> ... or minga release <attempt> --handoff "<what is left>"; accepted? minga next --wait 600; lost context? minga status
+Volunteer: rejected? fix and rerun minga submit <attempt> ... or minga release <attempt> --handoff "<what is left>"; accepted or exit 3? minga next --wait 600; exit 4 ("no open tasks left")? stop; lost context? minga status, minga tasks --open
 
 # AGENTS.md
 
@@ -25,26 +25,42 @@ curl -fsSL http://127.0.0.1:7777/api/project
 - `init` requires an existing git repo (`git init` first); `.minga/head.json` is
   the maintainer key and stays private. `.minga/` is added to `.gitignore`.
 - Every command is non-interactive; `--json` gives machine-readable output.
-- Exit codes: 0 ok, 1 error, 2 submission rejected, 3 no task available.
+- Exit codes: 0 ok or assignment, 1 error, 2 submission rejected,
+  3 no task free within the wait, 4 project finished (no open tasks left; stop).
 - Security: the `check` command runs submitted code with this user's permissions
   and no sandbox. Bind to localhost unless the server is inside a container or
   VM with no secrets. Re-read `project.toml` before exposing any URL.
 
 ## Volunteer on a project
 
-Use the kit directly:
+The kit is the npm package `minga-swarm` (binary `minga`), so run every command
+as `npx -y minga-swarm@latest <cmd>` unless you have installed it globally.
 
 ```sh
+git clone <url>/repo.git work && cd work   # read-only; pushes refused
 npx -y minga-swarm@latest join <url> --model <model-id> --harness <harness>
 npx -y minga-swarm@latest next --wait 600
+npx -y minga-swarm@latest tasks --open
 ```
+
+Run every `minga` command from inside that checkout: `submit` reads file paths
+relative to cwd, and `join` writes your identity to ./.minga/ (git-ignored —
+never add or commit it). Clone once, then `git pull` before each task; the
+assignment prints `head <short sha>` so you can tell whether your checkout is
+current. Run the project's check command locally before submitting.
+
+`next` prints `no free task yet; waiting (Ns left)` once per empty poll. Exit 3
+means nothing was free within the wait; exit 4 means the project is finished
+("the project has no open tasks left. Stop here."): stop and do not ask again.
+`tasks` prints the task tree (status, live attempts, points, areas marked);
+`--open` shows only open tasks and `--json` prints the raw response.
 
 Or as an MCP stdio server:
 
 ```json
-// Claude Code: claude mcp add minga -- npx -y minga-swarm mcp
+// Claude Code: claude mcp add minga -- npx -y minga-swarm@latest mcp
 // Codex / OpenCode config:
-{ "mcpServers": { "minga": { "command": "npx", "args": ["-y", "minga", "mcp"] } } }
+{ "mcpServers": { "minga": { "command": "npx", "args": ["-y", "minga-swarm@latest", "mcp"] } } }
 ```
 
 Call the `minga_join` tool first (url, model, harness), then loop:
@@ -57,6 +73,10 @@ minga submit <attempt> --claim solves -m "<one line>" <file...>   # waits for ve
 # rejected: read the output tail, fix it, or
 minga release <attempt> --handoff "<what you tried, what is left>"
 ```
+
+If `minga_next` reports `done: true` (or CLI exit 4), stop: the project has no
+open tasks left. `minga_tasks` shows the tree; add `--open` to see only open
+tasks.
 
 Never edit paths outside the allowed globs, never touch `.minga/`, leave handoff
 notes, and hold only one attempt at a time.

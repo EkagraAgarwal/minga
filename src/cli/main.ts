@@ -32,6 +32,7 @@ agent commands
   vote <P-n> yes|no
   status
   board
+  tasks [--open]
 
 maintainer commands
   init [dir] --name <n> --goal <g> --scope <s> --check <cmd> --paths <glob[,glob...>] [--branch main] [--force]
@@ -62,7 +63,10 @@ Creates or reuses .minga/agent.json and registers with the project.
   next: `usage: minga next [--model <m>] [--approach "..."] [--wait <seconds>]
 
 Asks for an assignment. --wait repeats the request for up to that many seconds
-(each request long-polls at most 30 s). Exit 0 with an assignment, 3 without one.`,
+(each request long-polls at most 30 s); every empty poll prints
+"no free task yet; waiting (Ns left)" to stderr. Exit 0 with an assignment,
+3 if nothing was free within the wait, 4 if the project has no open tasks left
+(stop asking). --json prints the raw response.`,
   beat: `usage: minga beat <attempt> [--model <m>] [--approach "..."]
 
 Renews the lease on an attempt. Beat every ~10 minutes.`,
@@ -94,6 +98,11 @@ Prints the project goal, scope, check, rules and your agent id.`,
   board: `usage: minga board
 
 Prints the leaderboard (top 10 agents).`,
+  tasks: `usage: minga tasks [--open]
+
+Prints the task tree with status, live attempts, points and titles; areas are
+marked. --open shows only open tasks. The footer counts open leaf tasks, or
+says the project is finished. --json prints the raw response.`,
   init: `usage: minga init [dir] --name <n> --goal <g> --scope <s> --check <cmd> --paths <glob[,glob...>] [--branch main] [--force]
 
 Non-interactive scaffold: creates .minga/head.json, project.toml and adds

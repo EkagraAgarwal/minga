@@ -6,13 +6,13 @@ import { join } from "node:path";
 import { pathToFileURL } from "node:url";
 
 import { HEADER } from "../src/core/protocol.ts";
-import type { ProjectInfo, SubmissionView } from "../src/core/protocol.ts";
+import type { ProjectInfo, SubmissionView, TasksResponse } from "../src/core/protocol.ts";
 import { agentIdFromPublicKey, canonicalRequest, generateKeyPair, verifyMessage } from "../src/identity/keys.ts";
 import type { FetchLike } from "../src/cli/client.ts";
 import { createClient } from "../src/cli/client.ts";
 import {
   formatRules, headKeygenCommand, joinCommand, nextCommand, parseAcceptPolicy, parseCli,
-  parseRuleArgs, readSubmissionFiles, renderSubmission, statusCommand, submitCommand,
+  parseRuleArgs, readSubmissionFiles, renderSubmission, statusCommand, submitCommand, tasksCommand,
 } from "../src/cli/commands.ts";
 import { doctorCommand } from "../src/cli/doctor.ts";
 import { initCommand, renderProjectToml, tomlBasicString } from "../src/cli/init.ts";
@@ -91,6 +91,9 @@ interface FakeServerOptions {
   verdict?: "accepted" | "rejected";
   finalDelayMs?: number;
   assignment?: unknown | null;
+  /** When true, /api/next answers done:true immediately (project finished). */
+  done?: boolean;
+  tasks?: TasksResponse;
   nextDelayMs?: number;
   outputTail?: string;
   stale?: boolean;
@@ -113,12 +116,16 @@ function startFakeServer(options: FakeServerOptions = {}) {
       if (req.method === "GET" && url.pathname === "/api/leaderboard") {
         return json({ agents: [], models: [] });
       }
+      if (req.method === "GET" && url.pathname === "/api/tasks") {
+        return json(options.tasks ?? { tasks: [], open: 0, done: true });
+      }
       if (req.method === "POST" && url.pathname === "/api/join") {
         const body = await req.json() as { publicKey: string };
         return json({ agent: agentIdFromPublicKey(body.publicKey), rejoin: false, project, live: [] });
       }
       if (req.method === "POST" && url.pathname === "/api/next") {
         const body = await req.json() as { wait?: number };
+        if (options.done) return json({ assignment: null, done: true });
         const chosen = options.assignment === undefined ? null : options.assignment;
         if (chosen === null && (body.wait ?? 0) > 0) await sleep(Math.min(nextDelay, body.wait! * 1000));
         return json(chosen === null ? { assignment: null, retryAfterSeconds: 5 } : { assignment: chosen });
@@ -237,6 +244,7 @@ describe("argument parsing", () => {
     { name: "mcp", argv: ["mcp", "--dir", "work"], command: "mcp", positionals: [], options: { dir: "work" } },
     { name: "vote", argv: ["vote", "P-2", "yes"], command: "vote", positionals: ["P-2", "yes"], options: {} },
     { name: "status", argv: ["status", "--json"], command: "status", positionals: [], options: { json: true } },
+    { name: "tasks --open", argv: ["tasks", "--open"], command: "tasks", positionals: [], options: { open: true } },
     {
       name: "head keygen",
       argv: ["head", "keygen", "--url", "https://m.example"],
@@ -387,6 +395,18 @@ describe("join, store and head", () => {
     expect(result.text).toContain("width=2");
     expect(result.text).toContain("accept=head-or-votes:2");
     expect(result.text).toContain("A-2");
+    expect(result.text).toContain("git clone https://minga.test/repo.git work && cd work");
+    expect(result.text).toContain("submit reads files relative to cwd");
+  });
+
+  test("the join clone command does not double a trailing slash", async () => {
+    const keys = generateKeyPair();
+    const mock = mockFetch(() => json({ agent: agentIdFromPublicKey(keys.publicKey), rejoin: false, project, live: [] }));
+    const { result } = await joinCommand(createClient("https://minga.test/", keys, mock.fn), {
+      url: "https://minga.test/", keys, model: "m", harness: "h",
+    });
+    expect(result.text).toContain("git clone https://minga.test/repo.git work && cd work");
+    expect(result.text).not.toContain("minga.test//repo.git");
   });
 
   test("missing identity is null and keygen is idempotent", async () => {
@@ -556,9 +576,93 @@ describe("next with wait", () => {
     expect(result.text).toContain("T-1 Root > T-4 Wire the parser");
     expect(result.text).toContain("start at parse");
     expect(result.text).toContain("A-6 fedcba9876543210 claude-y attack — fuzz it");
+    expect(result.text).not.toContain("git pull if your checkout is older");
     const waits = mock.calls.map((c) => JSON.parse(c.init.body as string).wait as number);
     expect(waits[0]).toBe(30);
     expect(Math.max(...waits)).toBeLessThanOrEqual(30);
+  });
+
+  test("shows the assigned branch head with a pull hint", async () => {
+    const mock = mockFetch(() => json({ assignment: { ...assignment, head: "0123456789abcdef0123" } }));
+    const result = await nextCommand(createClient("https://minga.test", generateKeyPair(), mock.fn));
+    expect(result.text).toContain("head 0123456 (git pull if your checkout is older)");
+    expect(result.data.assignment?.head).toBe("0123456789abcdef0123");
+  });
+
+  test("prints one remaining-time progress line per empty poll", async () => {
+    const progress: string[] = [];
+    let calls = 0;
+    const mock = mockFetch(() => {
+      calls++;
+      return json(calls < 3 ? { assignment: null, retryAfterSeconds: 0 } : { assignment });
+    });
+    await nextCommand(createClient("https://minga.test", generateKeyPair(), mock.fn), {
+      wait: 60,
+      onProgress: (line) => progress.push(line),
+    });
+    expect(progress).toHaveLength(2);
+    for (const line of progress) {
+      const match = /^no free task yet; waiting \((\d+)s left\)$/.exec(line);
+      expect(match).not.toBeNull();
+      expect(Number(match![1])).toBeGreaterThan(0);
+    }
+  });
+
+  test("stops immediately with the done message when the server says done", async () => {
+    const progress: string[] = [];
+    const mock = mockFetch(() => json({ assignment: null, done: true }));
+    const result = await nextCommand(createClient("https://minga.test", generateKeyPair(), mock.fn), {
+      wait: 600,
+      onProgress: (line) => progress.push(line),
+    });
+    expect(mock.calls).toHaveLength(1);
+    expect(result.text).toBe("the project has no open tasks left. Stop here.");
+    expect(result.data).toEqual({ assignment: null, done: true });
+    expect(progress).toEqual([]);
+  });
+});
+
+describe("tasks overview", () => {
+  const overview: TasksResponse = {
+    tasks: [
+      { id: "T-1", title: "Root", parent: null, status: "solved", points: 0, live: 0, leaf: false },
+      { id: "T-2", title: "An area", parent: "T-1", status: "open", points: 0, live: 1, leaf: false },
+      { id: "T-3", title: "isPrime", parent: "T-2", status: "open", points: 20, live: 2, leaf: true },
+      { id: "T-4", title: "closed leaf", parent: "T-2", status: "solved", points: 5, live: 0, leaf: true },
+    ],
+    open: 1,
+    done: false,
+  };
+
+  test("renders an indented tree with areas and an open-leaf footer", async () => {
+    const mock = mockFetch(() => json(overview));
+    const result = await tasksCommand(createClient("https://minga.test", generateKeyPair(), mock.fn));
+    expect(new URL(mock.calls[0]!.url).pathname).toBe("/api/tasks");
+    expect(result.data).toEqual(overview);
+    expect(result.text).toContain("T-1  solved 0 live  0 pts  Root [area]");
+    expect(result.text).toContain("  T-2  open   1 live  0 pts  An area [area]");
+    expect(result.text).toContain("    T-3  open   2 live  20 pts  isPrime");
+    expect(result.text).toContain("    T-4  solved 0 live  5 pts  closed leaf");
+    expect(result.text).toContain("open leaf tasks: 1");
+    expect(result.text).not.toContain("project finished");
+  });
+
+  test("--open keeps only open tasks but preserves their depth", async () => {
+    const mock = mockFetch(() => json(overview));
+    const result = await tasksCommand(createClient("https://minga.test", generateKeyPair(), mock.fn), {
+      openOnly: true,
+    });
+    expect(result.text).toContain("  T-2  open   1 live  0 pts  An area [area]");
+    expect(result.text).toContain("    T-3  open   2 live  20 pts  isPrime");
+    expect(result.text).not.toContain("T-1  solved");
+    expect(result.text).not.toContain("closed leaf");
+  });
+
+  test("a finished project has a done footer", async () => {
+    const mock = mockFetch(() => json({ tasks: [], open: 0, done: true }));
+    const result = await tasksCommand(createClient("https://minga.test", generateKeyPair(), mock.fn));
+    expect(result.text).toBe("project finished");
+    expect(result.data.done).toBe(true);
   });
 });
 
@@ -810,14 +914,24 @@ describe("join document", () => {
     expect(doc).toContain("src/**, docs/**");
     expect(doc).toContain("npx -y minga-swarm@latest <cmd>");
     expect(doc).toContain("curl -fsSL https://minga.example/kit/minga.mjs -o minga.mjs && node minga.mjs <cmd>");
+    expect(doc).toContain("GET THE CODE");
+    expect(doc).toContain("git clone https://minga.example/repo.git work && cd work");
+    expect(doc).toContain("git-ignores .minga/");
+    expect(doc).toContain("git pull");
+    expect(doc).toContain("Run the project's check command locally");
     expect(doc).toContain("minga next --wait 600");
     expect(doc).toContain("minga beat <attempt>");
     expect(doc).toContain("--handoff");
-    expect(doc).toContain("npx -y minga-swarm mcp");
+    expect(doc).toContain("npx -y minga-swarm@latest mcp");
     expect(doc).toContain("minga_join");
     expect(doc).toContain("EXIT CODES");
     expect(doc).toContain("2 submission rejected");
     expect(doc).toContain("3 no task available");
+    expect(doc).toContain("4 project finished");
+    expect(doc).toContain('"no free task yet; waiting (Ns left)"');
+    expect(doc).toContain("minga tasks [--open]");
+    expect(doc).toContain("npx -y minga-swarm@latest mcp");
+    expect(doc).toContain("If done is true, stop");
     expect(doc).toContain('head agent or 2 votes decides');
     expect(doc).not.toContain("minga.example//");
     expect(doc.split("\n").length).toBeLessThan(100);
@@ -944,6 +1058,63 @@ describe("bundle on plain Node", () => {
         const none = await runKit(["next", "--wait", "2", "--dir", dir, "--url", server.url], dir);
         expect(none.status).toBe(3);
         expect(none.stdout).toContain("nothing to do, retry in 5s");
+        const pollLines = none.stderr.trim().split("\n");
+        expect(pollLines.length).toBeGreaterThan(1);
+        for (const line of pollLines) {
+          expect(line).toMatch(/^no free task yet; waiting \((\d+)s left\)$/);
+        }
+      });
+    } finally {
+      server.server.stop();
+    }
+  });
+
+  test("next stops with exit 4 and the done message when the project is finished", async () => {
+    const server = startFakeServer({ done: true });
+    try {
+      await withTempDir(async (dir) => {
+        withIdentity(dir, server.url);
+        const done = await runKit(["next", "--wait", "600", "--dir", dir, "--url", server.url], dir);
+        expect(done.status).toBe(4);
+        expect(done.stdout).toContain("the project has no open tasks left. Stop here.");
+        expect(done.stderr).not.toContain("no free task yet");
+
+        const raw = await runKit(["next", "--json", "--dir", dir, "--url", server.url], dir);
+        expect(raw.status).toBe(4);
+        expect(JSON.parse(raw.stdout)).toEqual({ assignment: null, done: true });
+      });
+    } finally {
+      server.server.stop();
+    }
+  });
+
+  test("tasks prints the tree, --open filters it and --json is raw", async () => {
+    const overview: TasksResponse = {
+      tasks: [
+        { id: "T-1", title: "Root", parent: null, status: "solved", points: 0, live: 0, leaf: false },
+        { id: "T-3", title: "isPrime", parent: "T-1", status: "open", points: 20, live: 2, leaf: true },
+      ],
+      open: 1,
+      done: false,
+    };
+    const server = startFakeServer({ tasks: overview });
+    try {
+      await withTempDir(async (dir) => {
+        withIdentity(dir, server.url);
+        const tree = await runKit(["tasks", "--dir", dir, "--url", server.url], dir);
+        expect(tree.status).toBe(0);
+        expect(tree.stdout).toContain("T-1  solved 0 live  0 pts  Root [area]");
+        expect(tree.stdout).toContain("  T-3  open   2 live  20 pts  isPrime");
+        expect(tree.stdout).toContain("open leaf tasks: 1");
+
+        const open = await runKit(["tasks", "--open", "--dir", dir, "--url", server.url], dir);
+        expect(open.status).toBe(0);
+        expect(open.stdout).not.toContain("T-1  solved");
+        expect(open.stdout).toContain("  T-3  open   2 live  20 pts  isPrime");
+
+        const raw = await runKit(["tasks", "--json", "--dir", dir, "--url", server.url], dir);
+        expect(raw.status).toBe(0);
+        expect(JSON.parse(raw.stdout)).toEqual(overview);
       });
     } finally {
       server.server.stop();
@@ -951,7 +1122,7 @@ describe("bundle on plain Node", () => {
   });
 
   test("next with an assignment exits 0 and prints it compactly", async () => {
-    const server = startFakeServer({ assignment });
+    const server = startFakeServer({ assignment: { ...assignment, head: "abcdef1234567890abcdef" } });
     try {
       await withTempDir(async (dir) => {
         withIdentity(dir, server.url);
@@ -959,6 +1130,7 @@ describe("bundle on plain Node", () => {
         expect(got.status).toBe(0);
         expect(got.stdout).toContain("attempt   A-5");
         expect(got.stdout).toContain("T-4  Wire the parser");
+        expect(got.stdout).toContain("head abcdef1 (git pull if your checkout is older)");
       });
     } finally {
       server.server.stop();

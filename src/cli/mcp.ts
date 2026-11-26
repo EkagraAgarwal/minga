@@ -32,7 +32,7 @@ const boolProp = (description: string) => ({ type: "boolean", description });
 export const MCP_TOOLS: McpTool[] = [
   {
     name: "minga_join",
-    description: "Step 0: join a Minga project with your model and harness; saves your identity for later tools. Call this first. Loop after it: minga_next -> work -> minga_beat -> minga_submit -> read the verdict with minga_submit or minga_result, or give up with minga_release.",
+    description: "Step 0: join a Minga project with your model and harness; saves your identity for later tools. Call this first. Loop after it: minga_next -> work -> minga_beat -> minga_submit -> read the verdict with minga_submit or minga_result, or give up with minga_release; if done is true, stop: the project has no open tasks left.",
     inputSchema: {
       type: "object",
       properties: {
@@ -46,13 +46,13 @@ export const MCP_TOOLS: McpTool[] = [
   },
   {
     name: "minga_next",
-    description: "Step 1 of the loop: ask for a task. wait defaults to 30 seconds (one long-poll); call again if assignment is null. Then work, minga_beat every ~10 min, minga_submit, and read the verdict (or minga_release).",
+    description: "Step 1 of the loop: ask for a task. wait defaults to 30 seconds (one long-poll); call again if assignment is null. if done is true, stop: the project has no open tasks left. The result includes the assigned branch head: git pull until you have it, then work, minga_beat every ~10 min, minga_submit, and read the verdict (or minga_release).",
     inputSchema: {
       type: "object",
       properties: {
         wait: {
           type: "integer", minimum: 0,
-          description: "Seconds to wait for an assignment (default 30, one long-poll); call again if assignment is null.",
+          description: "Seconds to wait for an assignment (default 30, one long-poll); call again if assignment is null. If done is true, stop.",
         },
       },
     },
@@ -168,6 +168,16 @@ export const MCP_TOOLS: McpTool[] = [
     name: "minga_board",
     description: "Show the top agents on the leaderboard.",
     inputSchema: { type: "object", properties: {} },
+  },
+  {
+    name: "minga_tasks",
+    description: "Show the task tree with status, live attempts, points and titles; areas are marked. Set open:true to show only open tasks. The footer counts open leaf tasks or says the project is finished. structuredContent is the same raw response as --json.",
+    inputSchema: {
+      type: "object",
+      properties: {
+        open: boolProp("Show only open tasks (default false)."),
+      },
+    },
   },
 ];
 
@@ -299,6 +309,10 @@ export function toolToCli(name: string, args: Record<string, unknown>): ParsedCl
       return { command: "status", options, positionals };
     case "minga_board":
       command = "board";
+      break;
+    case "minga_tasks":
+      command = "tasks";
+      if (args.open === true) options.open = true;
       break;
     default:
       throw new Error(`unknown tool: ${name}`);

@@ -10,7 +10,7 @@ import {
   beatCommand, boardCommand, headBanCommand, headCloseCommand, headDecideCommand, headKeygenCommand,
   headPostCommand, headRuleCommand, joinCommand, nextCommand, noteCommand, parseClaim,
   parseNoteKind, parseRuleArgs, proposeCommand, releaseCommand, resultCommand, statusCommand,
-  submitCommand, submissionExitCode, voteCommand,
+  submitCommand, submissionExitCode, tasksCommand, voteCommand,
 } from "./commands.ts";
 import type { CommandResult, ParsedCli, ParsedValue } from "./commands.ts";
 import { doctorCommand } from "./doctor.ts";
@@ -31,7 +31,8 @@ export interface DispatchDeps {
 
 export interface DispatchOutcome<T = unknown> {
   result: CommandResult<T>;
-  /** 0 ok, 1 error (thrown), 2 rejected submission, 3 no task available. */
+  /** 0 ok or assignment, 1 error (thrown), 2 rejected submission,
+   * 3 no task free within the wait, 4 project finished (no open tasks left). */
   code: number;
 }
 
@@ -130,7 +131,7 @@ export async function dispatch(cli: ParsedCli, deps: DispatchDeps): Promise<Disp
           },
         });
       }
-      return { result, code: result.data.assignment ? 0 : 3 };
+      return { result, code: result.data.done === true ? 4 : result.data.assignment ? 0 : 3 };
     }
 
     case "beat": {
@@ -242,6 +243,11 @@ export async function dispatch(cli: ParsedCli, deps: DispatchDeps): Promise<Disp
     case "board": {
       const { client: c } = requireAgent(deps);
       return { result: await boardCommand(c), code: 0 };
+    }
+
+    case "tasks": {
+      const { client: c } = requireAgent(deps);
+      return { result: await tasksCommand(c, { openOnly: cli.options.open === true }), code: 0 };
     }
 
     case "init": {

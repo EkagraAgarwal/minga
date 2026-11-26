@@ -11,7 +11,7 @@ import { parseArgs } from "node:util";
 import type {
   Assignment, BeatResponse, JoinResponse, LeaderboardResponse, NextResponse, NoteResponse,
   ProposeResponse, ProjectInfo, ReleaseResponse, SubmitResponse, SubmissionView, VoteResponse,
-  HeadDecideResponse, HeadRuleResponse,
+  HeadDecideResponse, HeadRuleResponse, TasksResponse,
 } from "../core/protocol.ts";
 import type {
   AcceptPolicy, AgentId, Claim, NoteKind, ProposalId, ProposalKind, Rules, TaskId,
@@ -88,6 +88,9 @@ const COMMAND_OPTIONS: Record<string, OptionSet> = {
   vote: {},
   status: {},
   board: {},
+  tasks: {
+    open: { type: "boolean" },
+  },
   init: {
     name: { type: "string" },
     goal: { type: "string" },
@@ -332,6 +335,9 @@ export async function joinCommand(client: Client, input: JoinInput): Promise<Joi
     `goal: ${response.project.goal}`,
     `scope: ${response.project.scope}`,
     `rules: ${formatRules(response.project.rules)}`,
+    "",
+    `get the code: git clone ${input.url.replace(/\/+$/, "")}/repo.git work && cd work`,
+    "run minga from inside that checkout; submit reads files relative to cwd",
   ];
   if (response.live.length > 0) lines.push(`live attempts from before: ${response.live.join(", ")}`);
   return { identity, result: { text: lines.join("\n"), data: response } };
@@ -352,6 +358,7 @@ function formatAssignment(a: Assignment): string {
     `attempt   ${a.attempt}`,
     `role      ${a.role}`,
     `lease     ${a.leaseUntil}`,
+    ...(a.head ? [`head ${a.head.slice(0, 7)} (git pull if your checkout is older)`] : []),
     `task      ${a.task.id}  ${a.task.title}  (${a.task.points} points)`,
   ];
   if (a.path.length > 0) {
@@ -395,9 +402,16 @@ export async function nextCommand(client: Client, input: NextInput = {}): Promis
       ...(input.approach !== undefined ? { approach: input.approach } : {}),
       ...(chunk > 0 ? { wait: chunk } : {}),
     });
+    // done is a terminal answer: no open leaf task remains, so stop asking.
+    if (response.done === true) {
+      return { text: "the project has no open tasks left. Stop here.", data: response };
+    }
     if (response.assignment) return { text: formatAssignment(response.assignment), data: response };
     last = response;
-    input.onProgress?.(`waiting for a task (retry in ${response.retryAfterSeconds ?? 60}s)`);
+    if (chunk > 0) {
+      const left = Math.max(0, Math.ceil(total - (Date.now() - started) / 1000));
+      input.onProgress?.(`no free task yet; waiting (${left}s left)`);
+    }
 
     if (total === 0 || chunk <= 0) break;
     // A server that ignores `wait` must not spin the CPU in a tight loop.
@@ -735,6 +749,58 @@ export async function boardCommand(client: Client): Promise<CommandResult<Leader
     ? "no agents on the leaderboard yet"
     : [render(header), ...cells.map(render)].join("\n");
   return { text, data: leaderboard };
+}
+
+// ---------------------------------------------------------------- tasks overview
+
+export interface TasksInput {
+  /** Show only open tasks (areas included); the footer always reports open leaves. */
+  openOnly?: boolean;
+}
+
+/** Render a compact tree: status, live attempts, points and title, indented by parent. */
+export function tasksCommand(client: Client, input: TasksInput = {}): Promise<CommandResult<TasksResponse>> {
+  return client.tasks().then((overview) => ({ text: renderTasks(overview, input), data: overview }));
+}
+
+export function renderTasks(overview: TasksResponse, input: TasksInput = {}): string {
+  const byId = new Map(overview.tasks.map((t) => [t.id, t]));
+  const children = new Map<string | null, typeof overview.tasks>();
+  for (const t of overview.tasks) {
+    const parent = t.parent && byId.has(t.parent) ? t.parent : null;
+    const list = children.get(parent) ?? [];
+    list.push(t);
+    children.set(parent, list);
+  }
+
+  const lines: string[] = [];
+  const seen = new Set<string>();
+  const visit = (parent: string | null, depth: number): void => {
+    for (const t of children.get(parent) ?? []) {
+      if (seen.has(t.id)) continue;
+      seen.add(t.id);
+      if (!input.openOnly || t.status === "open") {
+        const area = byId.get(t.id)?.leaf === false ? " [area]" : "";
+        const line = `${t.id}  ${t.status.padEnd(6)} ${t.live} live  ${t.points} pts  ${t.title}${area}`;
+        lines.push(`${"  ".repeat(depth)}${line}`);
+      }
+      visit(t.id, depth + 1);
+    }
+  };
+  visit(null, 0);
+  // Orphans of a cycle still deserve a line.
+  for (const t of overview.tasks) {
+    if (!seen.has(t.id)) {
+      seen.add(t.id);
+      if (!input.openOnly || t.status === "open") {
+        const area = t.leaf ? "" : " [area]";
+        lines.push(`${t.id}  ${t.status.padEnd(6)} ${t.live} live  ${t.points} pts  ${t.title}${area}`);
+      }
+    }
+  }
+
+  const footer = overview.done ? "project finished" : `open leaf tasks: ${overview.open}`;
+  return lines.length > 0 ? [...lines, "", footer].join("\n") : footer;
 }
 
 // ---------------------------------------------------------------- head
