@@ -1243,10 +1243,10 @@ describe("bundle on plain Node", () => {
     });
   }
 
-  test("--version prints 0.1.0", async () => {
+  test("--version prints the package.json version", async () => {
     const result = await runKit(["--version"]);
     expect(result.status).toBe(0);
-    expect(result.stdout.trim()).toBe("0.1.0");
+    expect(result.stdout.trim()).toBe((await Bun.file(new URL("../package.json", import.meta.url)).json()).version);
   });
 
   test("submit waits for a verdict: exit 0 accepted, exit 2 rejected", async () => {
