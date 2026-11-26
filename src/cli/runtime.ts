@@ -63,7 +63,7 @@ export const defaultSyncRunner: SyncRunner = (command, args, opts) => {
 const defaultSpawn: SpawnFn = (command, args, opts) =>
   spawn(command, args, opts) as unknown as SpawnedProcess;
 
-/** Walk up from `fromUrl` to the closest package.json whose name is "minga". */
+/** Walk up from `fromUrl` to the closest package.json whose name is "minga-swarm". */
 export function findPackageRoot(fromUrl: string = import.meta.url): string | null {
   let dir: string;
   try {
@@ -76,7 +76,7 @@ export function findPackageRoot(fromUrl: string = import.meta.url): string | nul
     if (existsSync(file)) {
       try {
         const value = JSON.parse(readFileSync(file, "utf8")) as { name?: unknown };
-        if (value.name === "minga") return dir;
+        if ((value.name === "minga-swarm" || value.name === "minga")) return dir;
       } catch {
         // Unreadable package.json: keep walking upwards.
       }
@@ -181,7 +181,7 @@ export async function serveCommand(raw: string[], deps: RuntimeDeps = {}): Promi
   const root = deps.packageRoot === undefined ? findPackageRoot(deps.fromUrl) : deps.packageRoot;
   if (root === null) {
     throw new Error(
-      'cannot find the minga package root; run this command from the installed "minga" package or the minga repo',
+      'cannot find the minga package root; run this command from the installed "minga-swarm" package or the minga repo',
     );
   }
 

@@ -637,12 +637,12 @@ describe("join document", () => {
     expect(doc).toContain(project.scope);
     expect(doc).toContain("bun test {files}");
     expect(doc).toContain("src/**, docs/**");
-    expect(doc).toContain("npx -y minga@latest <cmd>");
+    expect(doc).toContain("npx -y minga-swarm@latest <cmd>");
     expect(doc).toContain("curl -fsSL https://minga.example/kit/minga.mjs -o minga.mjs && node minga.mjs <cmd>");
     expect(doc).toContain("minga next --wait 600");
     expect(doc).toContain("minga beat <attempt>");
     expect(doc).toContain("--handoff");
-    expect(doc).toContain("npx -y minga mcp");
+    expect(doc).toContain("npx -y minga-swarm mcp");
     expect(doc).toContain("minga_join");
     expect(doc).toContain("EXIT CODES");
     expect(doc).toContain("2 submission rejected");

@@ -131,7 +131,7 @@ setInterval(() => { try { app.sweep(); } catch (err) { console.error("sweep fail
 const base = `http://${server.hostname}:${server.port}`;
 console.log(`minga: ${cfg.name} on ${base}`);
 console.log(`  head agent ${app.headId} · ${Object.keys(app.state.tasks).length} tasks · ${concurrency} check slot(s) · log ${dbPath}`);
-console.log(`  agents join with: npx -y minga@latest join ${base} --model <model> --harness <harness>`);
+console.log(`  agents join with: npx -y minga-swarm@latest join ${base} --model <model> --harness <harness>`);
 console.log(`  or read ${base}/join`);
 
 for (const signal of ["SIGINT", "SIGTERM"] as const) {

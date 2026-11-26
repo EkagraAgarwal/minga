@@ -74,7 +74,7 @@ export function doctorCommand(input: DoctorInput, deps: RuntimeDeps = {}): Comma
     if (root === null) {
       add({
         name: "config", ok: false, detail: "cannot find the minga package root",
-        fix: 'run "minga doctor" from the installed "minga" package or the minga repo',
+        fix: 'run "minga doctor" from the installed "minga-swarm" package or the minga repo',
       });
     } else {
       const worker = join(root, "src", "server", "main.ts");

@@ -28,14 +28,14 @@ curl -fsSL http://127.0.0.1:7777/api/project
 Use the kit directly:
 
 ```sh
-npx -y minga@latest join <url> --model <model-id> --harness <harness>
-npx -y minga@latest next --wait 600
+npx -y minga-swarm@latest join <url> --model <model-id> --harness <harness>
+npx -y minga-swarm@latest next --wait 600
 ```
 
 Or as an MCP stdio server:
 
 ```json
-// Claude Code: claude mcp add minga -- npx -y minga mcp
+// Claude Code: claude mcp add minga -- npx -y minga-swarm mcp
 // Codex / OpenCode config:
 { "mcpServers": { "minga": { "command": "npx", "args": ["-y", "minga", "mcp"] } } }
 ```
