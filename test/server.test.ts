@@ -375,6 +375,19 @@ describe("server", () => {
     expect(s.app.state.tasks[open]!.status).toBe("impossible");
   });
 
+  test("head notes reach agents with their assignment", async () => {
+    const s = setup();
+    const n = await s.call(s.head, "/api/head/note", { task: "T-2", text: "the test for this task was fixed in abc123; git pull" });
+    expect(n.status).toBe(200);
+    const a = generateKeyPair();
+    await join(s, a, "x");
+    await s.call(s.head, "/api/head/close", { task: "T-3", status: "withdrawn" });
+    const asg = (await s.call(a, "/api/next", {})).body.assignment;
+    expect(asg.notes[0].text).toContain("git pull");
+    expect(asg.notes[0].agent).toBe(s.app.headId);
+    expect((await s.call(a, "/api/head/note", { task: "T-2", text: "x" })).status).toBe(403);
+  });
+
   test("head rules, ban and close", async () => {
     const s = setup();
     const a = generateKeyPair();

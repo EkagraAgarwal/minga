@@ -264,6 +264,10 @@ export interface HeadRuleResponse { rules: Rules }
 export interface HeadBanRequest { agent: AgentId; reason: string }
 export interface HeadBanResponse { ok: true }
 
+/** POST /api/head/note — the head leaves a note on a task (shown to agents with their assignment, like any note). */
+export interface HeadNoteRequest { task: TaskId; kind?: NoteKind; text: string }
+export interface HeadNoteResponse { note: NoteState }
+
 /** POST /api/head/close — withdraw a task (or mark it solved/impossible by fiat). */
 export interface HeadCloseRequest { task: TaskId; status: "withdrawn" | "impossible" | "solved"; reason?: string }
 export interface HeadCloseResponse { ok: true }

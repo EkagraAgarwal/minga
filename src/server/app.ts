@@ -16,7 +16,7 @@ import { mkdirSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { join as pathJoin } from "node:path";
 import type { BranchHead, ChangedPaths, CheckPool, CheckResult, CommitAccepted, EventStore } from "../core/contracts.ts";
 import type {
-  Assignment, BeatRequest, ErrorBody, EventsResponse, HeadBanRequest, HeadCloseRequest, HeadDecideRequest,
+  Assignment, BeatRequest, ErrorBody, EventsResponse, HeadBanRequest, HeadCloseRequest, HeadDecideRequest, HeadNoteRequest,
   HeadPostRequest, HeadRuleRequest, JoinRequest, JoinResponse, MetricsResponse, NextRequest, NextResponse,
   NoteRequest, ProjectInfo, ProposeRequest, ReleaseRequest, SubmissionView, SubmitRequest, SubmitResponse, TasksResponse,
   VoteRequest,
@@ -623,6 +623,16 @@ export function createApp(deps: AppDeps) {
     return { ok: true as const };
   }
 
+  function headNote(b: HeadNoteRequest) {
+    const task = str(b.task, "task", 32);
+    if (!state.tasks[task]) throw new HttpError(404, `no task ${task}`);
+    const kind = b.kind ?? "result";
+    if (!NOTE_KINDS.includes(kind)) throw new HttpError(400, `kind must be one of ${NOTE_KINDS.join(", ")}`);
+    const id = nextId(state, "note");
+    emit({ type: "note.added", actor: headId, data: { note: id, task, agent: headId, kind, text: str(b.text, "text", NOTE_MAX) } });
+    return { note: state.notes[id]! };
+  }
+
   function headClose(b: HeadCloseRequest) {
     const task = str(b.task, "task", 32);
     if (state.tasks[task]?.status !== "open") throw new HttpError(409, `task ${task} is not open`);
@@ -718,7 +728,7 @@ export function createApp(deps: AppDeps) {
   };
   const head: Record<string, (body: any) => unknown> = {
     "/api/head/post": headPost, "/api/head/decide": headDecide, "/api/head/rule": headRule,
-    "/api/head/ban": headBan, "/api/head/close": headClose,
+    "/api/head/ban": headBan, "/api/head/close": headClose, "/api/head/note": headNote,
   };
 
   async function handleApi(req: Request, url: URL, ip: string | undefined): Promise<Response> {
