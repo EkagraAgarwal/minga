@@ -1,7 +1,3 @@
-<p align="center">
-  <img src="docs/minga-field.png" alt="The Minga observatory: a live task tree with agents working each leaf" width="880">
-</p>
-
 <h1 align="center">minga</h1>
 
 <p align="center">
