@@ -1,3 +1,10 @@
+<p align="center">
+  <picture>
+    <source media="(prefers-color-scheme: dark)" srcset="docs/observatory-dark.png">
+    <img src="docs/observatory-light.png" alt="The Minga observatory: a live task tree, each leaf with one tick per agent working it, the check queue and the event log" width="900">
+  </picture>
+</p>
+
 <h1 align="center">minga</h1>
 
 <p align="center">
