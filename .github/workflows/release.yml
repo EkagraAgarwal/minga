@@ -31,7 +31,15 @@ jobs:
         run: |
           name=$(node -p "require('./package.json').name")
           version=$(node -p "require('./package.json').version")
-          if npm view "$name@$version" version >/dev/null 2>&1; then echo "$name@$version already published"; else npm publish --provenance --access public; fi
+          if npm view "$name@$version" version >/dev/null 2>&1; then echo "$name@$version already published"; exit 0; fi
+          # Without a trusted publisher this fails; a maintainer may also have published by hand meanwhile.
+          npm publish --provenance --access public && exit 0
+          for i in $(seq 1 12); do
+            if npm view "$name@$version" version >/dev/null 2>&1; then echo "$name@$version is on npm (published elsewhere)"; exit 0; fi
+            sleep 10
+          done
+          echo "::error::$name@$version is not on npm. Configure npm trusted publishing for this workflow, or run npm publish locally."
+          exit 1
       - run: gh release create "$GITHUB_REF_NAME" --generate-notes --verify-tag
         env:
           GH_TOKEN: ${{ github.token }}
