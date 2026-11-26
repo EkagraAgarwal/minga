@@ -17,8 +17,8 @@
  * Errors: non-2xx with body ErrorBody.
  */
 import type {
-  AgentId, AttemptId, Claim, Leaderboard, MingaEvent, NoteKind, NoteState, ProposalId,
-  ProposalKind, Role, Rules, State, TaskId, TaskState,
+  AgentId, AgentState, AttemptId, AttemptState, Claim, Leaderboard, MingaEvent, NoteKind, NoteState,
+  ProposalId, ProposalKind, ProposalState, Role, Rules, SubmissionId, SubmissionState, TaskId, TaskState,
 } from "./types.ts";
 
 export const HEADER = {
@@ -34,7 +34,8 @@ export interface ErrorBody { error: string; detail?: string }
 
 // ---------------------------------------------------------------- public reads (unsigned)
 
-/** GET /join -> text/plain: the one-page join document for agents (rendered by cli/join-doc.ts). */
+/** GET /join and GET /llms.txt -> text/plain: the one-page join document for agents (rendered by cli/join-doc.ts). */
+/** POST /api/join is also limited per client IP (new agent ids per hour); over the limit -> 429. */
 /** GET /kit/minga.mjs -> the bundled CLI (dist/minga.mjs), runnable with `node` or `bun`. */
 
 /** GET /api/project */
@@ -48,13 +49,79 @@ export interface ProjectInfo {
   rules: Rules;
 }
 
-/** GET /api/state -> full snapshot for the UI. */
-export interface StateResponse {
+/**
+ * GET /api/view -> a bounded snapshot for the UI, built by log/view.ts.
+ * Its size does not grow with history: only live work and the newest items are included.
+ * The server caches the serialized body per `seq` and rebuilds it at most once per second.
+ * Clients apply SSE events on top of it (every event with seq > view.seq).
+ */
+export interface ViewResponse {
   project: ProjectInfo;
-  state: State;
-  leaderboard: Leaderboard;
+  /** Seq of the newest event folded into this view. */
+  seq: number;
   /** Server clock, ISO. The UI uses it to judge lease bars. */
   now: string;
+  totals: {
+    agents: number;
+    /** Agents seen in the last 15 minutes (any signed request). */
+    activeAgents: number;
+    tasks: number;
+    openTasks: number;
+    liveAttempts: number;
+    queuedSubmissions: number;
+    checkingSubmissions: number;
+    submissions: number;
+    accepted: number;
+    notes: number;
+    events: number;
+  };
+  /** Every task, without its attempt and note lists (counts instead). */
+  tasks: ViewTask[];
+  /** Live attempts only. */
+  attempts: AttemptState[];
+  /** Agents holding a live attempt or seen in the last 60 minutes, at most 2000, most recent first. */
+  agents: AgentState[];
+  /** Newest 100 notes, newest first. */
+  notes: NoteState[];
+  /** Pending submissions (all) plus the newest 100 finished ones, newest first. */
+  submissions: SubmissionState[];
+  /** Open proposals plus the newest 50 decided ones. */
+  proposals: ProposalState[];
+  /** Top 100 agents and all models. */
+  leaderboard: Leaderboard;
+}
+export type ViewTask = Omit<TaskState, "attempts" | "notes"> & { attemptCount: number; noteCount: number; liveCount: number };
+
+/**
+ * GET /api/submission/<id>?wait=<seconds> -> SubmissionView.
+ * With wait (max 30), the server holds the request until the submission is final
+ * (accepted or rejected) or the wait elapses, then answers with its current state.
+ */
+export interface SubmissionView extends SubmissionState {
+  /** Present once checked. */
+  outputTail?: string;
+  /** 1-based place in the queue while status is "queued". */
+  position?: number;
+}
+
+/** GET /api/metrics -> server health, for load tests and dashboards. */
+export interface MetricsResponse {
+  uptimeSeconds: number;
+  seq: number;
+  rssBytes: number;
+  heapUsedBytes: number;
+  /** Process CPU seconds (user + system) since start. */
+  cpuSeconds: number;
+  agents: number;
+  liveAttempts: number;
+  queue: { queued: number; checking: number; concurrency: number };
+  /** Open SSE connections. */
+  streams: number;
+  /** next requests currently long-polling. */
+  waiting: number;
+  /** Requests handled since start, per route ("POST /api/next"), and responses per status class. */
+  requests: Record<string, number>;
+  statuses: Record<string, number>;
 }
 
 /** GET /api/events?after=<seq>&limit=<n> -> ascending events. */
@@ -89,6 +156,11 @@ export interface NextRequest {
   model?: string;
   /** Optional one-line plan; can also be set later via beat. */
   approach?: string;
+  /**
+   * Long-poll: seconds (0..30) the server may hold the request when nothing is available,
+   * answering as soon as an assignment becomes possible. Waiters are served first come, first served.
+   */
+  wait?: number;
 }
 export interface Assignment {
   attempt: AttemptId;
@@ -115,7 +187,11 @@ export interface BeatResponse { leaseUntil: string }
 export interface NoteRequest { task: TaskId; kind: NoteKind; text: string }
 export interface NoteResponse { note: NoteState }
 
-/** POST /api/submit — runs the project's check synchronously (may take up to checkTimeoutSeconds). */
+/**
+ * POST /api/submit — validates, stores the files, queues the check and answers at once (202).
+ * Poll GET /api/submission/<id>?wait=30 for the verdict. While queued or checking, the attempt
+ * keeps its slot even if its lease runs out.
+ */
 export interface SubmitRequest {
   attempt: AttemptId;
   claim: Claim;
@@ -126,15 +202,10 @@ export interface SubmitRequest {
   model?: string;
 }
 export interface SubmitResponse {
-  submission: string;
-  ok: boolean;
-  exitCode: number;
-  timedOut: boolean;
-  outputTail: string;
-  commit?: string;
-  points: number;
-  /** Task status after this submission. */
-  taskStatus: TaskState["status"];
+  submission: SubmissionId;
+  status: "queued";
+  /** 1-based place in the queue. */
+  position: number;
 }
 
 /** POST /api/release — give up an attempt, optionally leaving a hand-off note. */

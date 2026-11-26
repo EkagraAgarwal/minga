@@ -92,6 +92,23 @@ export interface ProjectConfig {
   head: string;
   /** Branch accepted work is committed to. */
   branch: string;
+  /**
+   * How many checks may run at once (project.toml `check_concurrency`).
+   * 0 means auto: max(1, cpu cores - 1). At most one check per task runs at a time.
+   */
+  checkConcurrency: number;
+  /**
+   * Paths (repo-relative, no globs) kept between checks in the warm worktrees, for build
+   * caches such as ".lake", "node_modules" or "target" (project.toml `check_keep`). Default [].
+   */
+  checkKeep: string[];
+  /**
+   * What happens when the branch moved while a check ran (project.toml `recheck`).
+   * "always" (default): run the check again on the new head before committing.
+   * "on-overlap": recheck only when a commit since the check's base touched one of the
+   * submitted paths; otherwise commit on top of the new head without rechecking.
+   */
+  recheck: "always" | "on-overlap";
   rules: Rules;
   seedTasks: SeedTask[];
 }
@@ -161,7 +178,35 @@ export type NoteAdded = Ev<"note.added", {
   text: string;
 }>;
 
-/** Emitted once per submission, after the check finished (pass or fail). */
+/**
+ * A submission entered the check queue. File contents are NOT in the log: the server keeps
+ * them in `.minga/submissions/<id>.json` until the check finishes, so the log and the live
+ * stream stay small.
+ */
+export type SubmissionQueued = Ev<"submission.queued", {
+  submission: SubmissionId;
+  attempt: AttemptId;
+  task: TaskId;
+  agent: AgentId;
+  model: string;
+  claim: Claim;
+  /** One line, becomes the commit subject. */
+  message: string;
+  files: string[];
+  /** Total UTF-8 bytes of the submitted files. */
+  bytes: number;
+}>;
+
+/** A check run began. Emitted again with round + 1 when the check is re-run on a newer head. */
+export type SubmissionStarted = Ev<"submission.started", {
+  submission: SubmissionId;
+  /** Commit sha of the branch head this run checks against. */
+  base: string;
+  /** 0 for the first run, 1.. for rechecks after the branch moved. */
+  round: number;
+}>;
+
+/** Emitted once per submission, after the final run (pass or fail). */
 export type SubmissionChecked = Ev<"submission.checked", {
   submission: SubmissionId;
   attempt: AttemptId;
@@ -170,6 +215,10 @@ export type SubmissionChecked = Ev<"submission.checked", {
   model: string;
   claim: Claim;
   files: string[];
+  /** Commit the final run checked against. "" when no run happened (e.g. task closed while queued). */
+  base?: string;
+  /** True when rejected without a verdict on the work: the branch kept moving past the recheck limit, or the task closed first. */
+  stale?: boolean;
   ok: boolean;
   exitCode: number;
   timedOut: boolean;
@@ -213,6 +262,8 @@ export type MingaEvent =
   | AttemptBeat
   | AttemptEnded
   | NoteAdded
+  | SubmissionQueued
+  | SubmissionStarted
   | SubmissionChecked
   | ProposalMade
   | ProposalVoted
@@ -283,7 +334,42 @@ export interface NoteState {
   at: string;
 }
 
-export type SubmissionState = SubmissionChecked["data"] & { at: string };
+export type SubmissionStatus = "queued" | "checking" | "accepted" | "rejected";
+
+/**
+ * In-memory view of a submission. Deliberately has no `outputTail`: that stays in the log
+ * only (read it via `checkedSeq` and EventStore.get), so memory stays flat at scale.
+ */
+export interface SubmissionState {
+  id: SubmissionId;
+  attempt: AttemptId;
+  task: TaskId;
+  agent: AgentId;
+  model: string;
+  claim: Claim;
+  message: string;
+  files: string[];
+  bytes: number;
+  status: SubmissionStatus;
+  queuedAt: string;
+  /** Start of the latest run. */
+  startedAt?: string;
+  /** Base of the latest run. */
+  base?: string;
+  /** Runs started so far (submission.started count). */
+  runs: number;
+  checkedAt?: string;
+  /** Seq of the submission.checked event, to read outputTail from the log. */
+  checkedSeq?: number;
+  ok?: boolean;
+  exitCode?: number;
+  timedOut?: boolean;
+  stale?: boolean;
+  durationMs?: number;
+  commit?: string;
+  /** Points awarded (0 until accepted). */
+  points: number;
+}
 
 export interface ProposalState {
   id: ProposalId;
@@ -319,6 +405,24 @@ export interface State {
   proposals: Record<ProposalId, ProposalState>;
   /** Highest number used per id prefix, so ids are never reused. */
   counters: Counters;
+  /**
+   * Indexes the reducer maintains so no request scans every attempt or submission.
+   * Always consistent with the records above. Never sent to clients.
+   */
+  index: StateIndex;
+}
+
+export interface StateIndex {
+  /** Attempts with no endedAt (live, or expired but not yet swept), per agent. Oldest first. */
+  openByAgent: Record<AgentId, AttemptId[]>;
+  /** Attempts with no endedAt, per task. Oldest first. */
+  openByTask: Record<TaskId, AttemptId[]>;
+  /** Every attempt with no endedAt, oldest first. */
+  openAttempts: AttemptId[];
+  /** Submissions with status "queued" or "checking", oldest first. */
+  pendingSubmissions: SubmissionId[];
+  /** Rejected (non-stale) submissions per agent per task: agent -> task -> count. Used by the scheduler. */
+  failures: Record<AgentId, Record<TaskId, number>>;
 }
 
 export interface LeaderRow {

@@ -10,6 +10,7 @@ import type {
   AgentId, AttemptId, Leaderboard, MingaEvent, NewEvent, ProjectConfig, ProposalId,
   Role, Rules, State, TaskId,
 } from "./types.ts";
+import type { ProjectInfo, ViewResponse } from "./protocol.ts";
 
 // ======================================================================
 // src/log/store.ts — append-only event log on bun:sqlite
@@ -21,6 +22,8 @@ export interface EventStore {
   since(after: number, limit?: number): MingaEvent[];
   /** Seq of the newest event, 0 when empty. */
   head(): number;
+  /** One event by seq, or undefined. */
+  get(seq: number): MingaEvent | undefined;
   /** Called synchronously after each append. Returns an unsubscribe function. */
   subscribe(listener: (event: MingaEvent) => void): () => void;
   close(): void;
@@ -38,11 +41,30 @@ export type Reduce = (state: State, event: MingaEvent) => State;
 export type Replay = (rules: Rules, events: Iterable<MingaEvent>) => State;
 /** Next free id for a prefix, e.g. nextId(state, "task") -> "T-13". Does not mutate. */
 export type NextId = (state: State, kind: "task" | "attempt" | "note" | "submission" | "proposal") => string;
-/** An attempt is live when it has not ended and leaseUntil > now. */
+/**
+ * An attempt is live when it has not ended and leaseUntil > now — or when it has a pending
+ * (queued or checking) submission, which keeps its slot while it waits.
+ */
 export type IsLive = (state: State, attempt: AttemptId, now: Date) => boolean;
-/** Live attempt ids on a task. */
+/** Live attempt ids on a task. Uses state.index.openByTask (no full scan). */
 export type LiveAttempts = (state: State, task: TaskId, now: Date) => AttemptId[];
-export type ComputeLeaderboard = (state: State) => Leaderboard;
+/** Live attempt ids held by an agent. Uses state.index.openByAgent. */
+export type AgentLiveAttempts = (state: State, agent: AgentId, now: Date) => AttemptId[];
+/** Sorted as documented on Leaderboard. `limit` caps the agents list (models are never capped). */
+export type ComputeLeaderboard = (state: State, limit?: number) => Leaderboard;
+
+// ======================================================================
+// src/log/view.ts — the bounded UI snapshot (pure, no I/O)
+// ======================================================================
+export interface ViewInput {
+  state: State;
+  project: ProjectInfo;
+  now: Date;
+  /** store.head(), for totals.events. */
+  events: number;
+}
+/** Builds ViewResponse exactly as documented in protocol.ts. Must not mutate state. O(tasks + open work + small constants). */
+export type BuildView = (input: ViewInput) => ViewResponse;
 
 // ======================================================================
 // src/project/config.ts — project.toml
@@ -75,6 +97,8 @@ export interface Pick { task: TaskId; role: Role }
  * (family = model string up to its first "-", "/" or ":", lowercased), tasks with
  * zero live attempts, tasks the agent has not failed before, older tasks. Small
  * randomness (via rng) breaks ties. Role: weighted random over rules.roles.
+ * Must run in O(open leaf tasks): use state.index (openByTask, openByAgent, failures),
+ * never scan state.attempts or state.submissions. It is called on every `next`.
  */
 export type PickTask = (input: PickInput) => Pick | null;
 /** Model family as defined above. */
@@ -93,9 +117,8 @@ export type DecideByVotes = (state: State, proposal: ProposalId) => { accepted: 
 // src/verify/runner.ts and src/verify/gitops.ts — the only code that touches git
 // ======================================================================
 export interface CheckInput {
-  /** The maintainer's repository (contains project.toml). Its working tree must never be modified. */
-  repoDir: string;
-  branch: string;
+  /** Commit sha to check against (normally the branch head when the run starts). */
+  base: string;
   /** Repo-relative POSIX path -> full new file content (UTF-8). Already validated with PathAllowed. */
   files: Record<string, string>;
   /** cfg.check. "{files}" is replaced with the shell-quoted, space-separated paths. */
@@ -111,12 +134,44 @@ export interface CheckResult {
   outputTail: string;
   durationMs: number;
 }
-/** Checks out `branch` HEAD into a fresh temp worktree, writes `files`, runs `command` there (shell), always removes the worktree. */
-export type RunCheck = (input: CheckInput) => Promise<CheckResult>;
+export interface CheckPoolOptions {
+  /** The maintainer's repository (contains project.toml). Its working tree and index must never be modified. */
+  repoDir: string;
+  /** Number of warm worktrees = max concurrent checks. >= 1. */
+  size: number;
+  /** Repo-relative paths preserved between runs in each worktree (build caches). */
+  keep: string[];
+  /** Where the worktrees live. Default `<repoDir>/.minga/worktrees`. */
+  dir?: string;
+}
+/**
+ * A fixed set of persistent ("warm") git worktrees, one per slot, reused between checks so
+ * build caches survive. A run takes a free slot (waiting FIFO if none), resets it to
+ * `base` (checkout --detach --force, then clean -ffdx except `keep`), writes `files`, runs
+ * `command` through the shell with a minimal allowlisted environment (MINGA_FILES set to the
+ * space-separated paths), kills the whole process tree on timeout, and frees the slot.
+ * The pool never runs two checks in one slot at once.
+ */
+export interface CheckPool {
+  run(input: CheckInput): Promise<CheckResult>;
+  readonly size: number;
+  /** Slots currently running a check. */
+  readonly busy: number;
+  /** Removes the worktrees (git worktree remove --force) and prunes. */
+  close(): Promise<void>;
+}
+export type CreateCheckPool = (opts: CheckPoolOptions) => Promise<CheckPool>;
+
+/** Sha of refs/heads/<branch>. Throws when the branch does not exist. */
+export type BranchHead = (repoDir: string, branch: string) => Promise<string>;
+/** Repo-relative paths changed between two commits (git diff --name-only from..to). */
+export type ChangedPaths = (repoDir: string, from: string, to: string) => Promise<string[]>;
 
 export interface CommitInput {
   repoDir: string;
   branch: string;
+  /** The commit becomes a child of this sha. The ref moves only if it still points here. */
+  parent: string;
   files: Record<string, string>;
   /** First line of the commit message. */
   message: string;
@@ -125,10 +180,13 @@ export interface CommitInput {
   /** Commit author/committer name. */
   author: string;
 }
+export type CommitOutcome = { ok: true; commit: string } | { ok: false; stale: true; head: string };
 /**
- * Commits `files` on top of `branch` using plumbing only (temp GIT_INDEX_FILE,
- * hash-object, update-index, write-tree, commit-tree, update-ref with the old
- * sha for compare-and-swap). Never touches the working tree or the real index.
- * Retries the CAS a few times if the branch moved. Returns the new commit sha.
+ * Commits `files` on top of `parent` using plumbing only (temp GIT_INDEX_FILE seeded from
+ * `parent`, hash-object, update-index, write-tree, commit-tree, then
+ * `update-ref refs/heads/<branch> <new> <parent>` as a compare-and-swap). Never touches the
+ * working tree or the real index. No retries: when the branch no longer points at `parent`,
+ * returns { ok: false, stale: true, head } and the caller decides whether to recheck.
+ * Calls for the same repo are serialized internally.
  */
-export type CommitAccepted = (input: CommitInput) => Promise<string>;
+export type CommitAccepted = (input: CommitInput) => Promise<CommitOutcome>;
