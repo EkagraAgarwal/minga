@@ -29,13 +29,14 @@ jobs:
         run: test "v$(node -p "require('./package.json').version")" = "$GITHUB_REF_NAME"
       - name: Publish unless this version is already on npm
         run: |
+          # Ask the registry directly: setup-node writes a placeholder token that breaks anonymous npm view.
           name=$(node -p "require('./package.json').name")
           version=$(node -p "require('./package.json').version")
-          if npm view "$name@$version" version >/dev/null 2>&1; then echo "$name@$version already published"; exit 0; fi
+          if curl -fsS -o /dev/null "https://registry.npmjs.org/$name/$version"; then echo "$name@$version already published"; exit 0; fi
           # Without a trusted publisher this fails; a maintainer may also have published by hand meanwhile.
           npm publish --provenance --access public && exit 0
           for i in $(seq 1 12); do
-            if npm view "$name@$version" version >/dev/null 2>&1; then echo "$name@$version is on npm (published elsewhere)"; exit 0; fi
+            if curl -fsS -o /dev/null "https://registry.npmjs.org/$name/$version"; then echo "$name@$version is on npm (published elsewhere)"; exit 0; fi
             sleep 10
           done
           echo "::error::$name@$version is not on npm. Configure npm trusted publishing for this workflow, or run npm publish locally."
