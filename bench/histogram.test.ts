@@ -36,6 +36,24 @@ describe("Histogram", () => {
     expect(a.percentile(1)).toBe(100);
   });
 
+  test("snapshots carry bucket counts that can be merged across processes", () => {
+    const workerA = new Histogram();
+    const workerB = new Histogram();
+    for (let i = 0; i < 10; i++) workerA.record(5);
+    for (let i = 0; i < 20; i++) workerB.record(5);
+    const a = JSON.parse(JSON.stringify(workerA.snapshot()));
+    const b = JSON.parse(JSON.stringify(workerB.snapshot()));
+    expect(a.counts).toHaveLength(workerA.buckets);
+
+    const merged = new Histogram();
+    merged.mergeSnapshot(a);
+    merged.mergeSnapshot(b);
+    expect(merged.count).toBe(30);
+    expect(merged.sum).toBe(150);
+    expect(merged.percentile(0.5)).toBeCloseTo(workerA.percentile(0.5), 5);
+    expect(merged.snapshot().counts).toHaveLength(workerA.buckets);
+  });
+
   test("empty and invalid values are well behaved", () => {
     const empty = new Histogram();
     expect(empty.count).toBe(0);

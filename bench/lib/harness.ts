@@ -111,10 +111,25 @@ export interface SwarmTotals {
   resubmits: number;
 }
 
+/** Shape of the `latencyMs` field returned by GET /api/metrics. */
+export type ServerLatency = Record<string, { count: number; p50: number; p99: number; max: number }>;
+
+/** Routes whose server-side p99 decides PASS/FAIL. Long polls are excluded by the server. */
+export const SERVER_TARGET_ROUTES = [
+  "POST /api/next", "POST /api/beat", "POST /api/note", "POST /api/submit", "POST /api/release",
+] as const;
+
+/** Client-side counterparts, reported for information only. */
+export const CLIENT_TARGET_ROUTES = [
+  "POST /api/next probe", "POST /api/beat", "POST /api/note", "POST /api/submit", "POST /api/release",
+] as const;
+
 export interface Targets {
-  /** Worst p99 across next(probe), beat, note, submit and release. */
-  p99Ms: number;
-  p99Pass: boolean;
+  /** Worst server-side p99 across next/beat/note/submit/release (long polls excluded). */
+  serverP99Ms: number;
+  serverP99Pass: boolean;
+  /** Worst client-side p99 across the same routes; informational, includes local queueing. */
+  clientP99Ms: number;
   errors5xx: number;
   errors5xxPass: boolean;
   /** A 409/410 after the harness fixes means protocol misuse; both must be zero. */
@@ -127,6 +142,58 @@ export interface Targets {
   rssPass: boolean;
   overall: boolean;
   notes: string[];
+}
+
+/**
+ * Combine client stats with the server-side latency read at the end of the run.
+ * Pure so it can be unit-tested without spawning processes.
+ */
+export function computeTargets(
+  routes: Record<string, RouteSnapshot>,
+  samples: MetricsSample[],
+  sse: SseStats,
+  pipelineCount: number,
+  serverLatency: ServerLatency,
+): Targets {
+  const clientP99Ms = Math.max(...CLIENT_TARGET_ROUTES.map((name) => routes[name]?.p99 ?? 0));
+  const serverP99Ms = Math.max(...SERVER_TARGET_ROUTES.map((name) => serverLatency[name]?.p99 ?? 0));
+  const serverProven = SERVER_TARGET_ROUTES.some((name) => (serverLatency[name]?.count ?? 0) > 0);
+  const errors5xx = Object.values(routes).reduce((n, r) => n + (r.errors5xx ?? 0), 0);
+  let errors409 = 0;
+  let errors410 = 0;
+  for (const entry of Object.values(routes)) {
+    errors409 += entry.errors409 ?? 0;
+    errors410 += entry.errors410 ?? 0;
+  }
+  const peakCpuPct = samples.reduce((peak, sample) => Math.max(peak, sample.cpuPct), 0);
+  const peakRssBytes = samples.reduce((peak, sample) => Math.max(peak, sample.rssBytes), 0);
+  const notes: string[] = [];
+  if (!serverProven) notes.push("no server-side latency in /api/metrics: p99 target is unproven");
+  if ((routes["POST /api/next probe"]?.count ?? 0) === 0) notes.push("no wait=0 probe samples: client-side next p99 is unproven");
+  if (samples.length === 0) notes.push("no /api/metrics samples: CPU and RSS targets are unproven");
+  if (sse.connections === 0) notes.push("no SSE connections established");
+  if (pipelineCount === 0) notes.push("no final submissions: check-pipeline numbers are unproven");
+  notes.push("client-side p99 is informational; PASS/FAIL uses server-side handling time");
+  notes.push("submit-to-verdict latency is informational; it depends on the project's check");
+
+  const targets: Targets = {
+    serverP99Ms,
+    serverP99Pass: serverProven && serverP99Ms < 250,
+    clientP99Ms,
+    errors5xx,
+    errors5xxPass: errors5xx === 0,
+    errors409,
+    errors410,
+    conflictPass: errors409 === 0 && errors410 === 0,
+    peakCpuPct,
+    cpuPass: samples.length > 0 && peakCpuPct < 85,
+    peakRssBytes,
+    rssPass: samples.length > 0 && peakRssBytes < 1.5 * 1024 * 1024 * 1024,
+    overall: true,
+    notes,
+  };
+  targets.overall = targets.serverP99Pass && targets.errors5xxPass && targets.conflictPass && targets.cpuPass && targets.rssPass;
+  return targets;
 }
 
 export interface HarnessResult {
@@ -142,6 +209,8 @@ export interface HarnessResult {
   sse: SseStats;
   totals: SwarmTotals;
   targets: Targets;
+  /** Server-side handling time per route, read from /api/metrics after the run. */
+  serverLatency: ServerLatency;
 }
 
 function emptyTotals(): SwarmTotals {
@@ -166,18 +235,37 @@ export async function runSwarm(opts: Options, baseUrl: string): Promise<HarnessR
     const elapsed = Math.round((Date.now() - startedAt) / 1000);
     const probe = stats.snapshot()["POST /api/next probe"];
     const conflicts = stats.totalConflicts();
-    console.log(
-      `[${String(elapsed).padStart(3)}s] joins=${totals.joins} assigned=${totals.assignments} ` +
-      `submitted=${totals.submissions} accepted=${totals.accepted} rejected=${totals.rejected} ` +
-      `nextProbe p99=${probe?.p99.toFixed(1) ?? "0.0"}ms 5xx=${stats.total5xx()} ` +
-      `409=${conflicts.errors409} 410=${conflicts.errors410}`,
-    );
+    if (opts.worker) {
+      // Children report progress as JSON lines; the parent merges and prints one status line.
+      console.log(JSON.stringify({
+        kind: "progress",
+        worker: opts.workerId ?? 0,
+        elapsed,
+        joins: totals.joins,
+        assignments: totals.assignments,
+        submitted: totals.submissions,
+        accepted: totals.accepted,
+        rejected: totals.rejected,
+        probeP99: probe?.p99 ?? 0,
+        errors5xx: stats.total5xx(),
+        errors409: conflicts.errors409,
+        errors410: conflicts.errors410,
+      }));
+    } else {
+      console.log(
+        `[${String(elapsed).padStart(3)}s] joins=${totals.joins} assigned=${totals.assignments} ` +
+        `submitted=${totals.submissions} accepted=${totals.accepted} rejected=${totals.rejected} ` +
+        `nextProbe p99=${probe?.p99.toFixed(1) ?? "0.0"}ms 5xx=${stats.total5xx()} ` +
+        `409=${conflicts.errors409} 410=${conflicts.errors410}`,
+      );
+    }
   }, 10_000);
 
-  // ---------------------------------------------------------- SSE viewers (20)
+  // ---------------------------------------------------------- SSE viewers (20 in total)
   const viewers: AbortController[] = [];
   const viewerTasks: Promise<void>[] = [];
-  for (let i = 0; i < 20; i++) {
+  const viewerCount = opts.viewerCount ?? 20;
+  for (let i = 0; i < viewerCount; i++) {
     const controller = new AbortController();
     viewers.push(controller);
     viewerTasks.push((async () => {
@@ -224,7 +312,9 @@ export async function runSwarm(opts: Options, baseUrl: string): Promise<HarnessR
   }
 
   // ------------------------------------------------- metrics + view sampler (5s)
-  const sampleTask = (async () => {
+  // One sampler for the whole run keeps CPU/RSS authoritative and avoids a
+  // burst of 10 workers opening /api/metrics and /api/view at the same instant.
+  const sampleTask = opts.sampleMetrics === false ? Promise.resolve() : (async () => {
     let previousCpu = 0;
     let previousAt = performance.now();
     let first = true;
@@ -261,9 +351,10 @@ export async function runSwarm(opts: Options, baseUrl: string): Promise<HarnessR
     }
   })();
 
-  // --------------------------------------------------- 5-agent wait=0 probe group
+  // --------------------------------------------------- 5-agent wait=0 probe group (total)
   const probeTasks: Promise<void>[] = [];
-  for (let i = 0; i < 5; i++) {
+  const probeCount = opts.probeCount ?? 5;
+  for (let i = 0; i < probeCount; i++) {
     probeTasks.push((async () => {
       const keys = generateKeyPair();
       const { model } = pickModel();
@@ -295,7 +386,7 @@ export async function runSwarm(opts: Options, baseUrl: string): Promise<HarnessR
   const agentTasks: Promise<void>[] = [];
   for (let i = 0; i < opts.agents; i++) {
     agentTasks.push((async () => {
-      const joinAt = startedAt + (i / opts.ramp) * 1000;
+      const joinAt = startedAt + ((opts.agentOffset ?? 0) + i) / opts.ramp * 1000;
       await sleep(joinAt - Date.now());
       if (stop) return;
       // Generate keys at join time so a 3000-agent ramp does not block startup.
@@ -426,35 +517,11 @@ export async function runSwarm(opts: Options, baseUrl: string): Promise<HarnessR
   await Promise.allSettled([sampleTask, ...probeTasks, ...viewerTasks]);
 
   const routes = stats.snapshot();
-  const targetNames = ["POST /api/next probe", "POST /api/beat", "POST /api/note", "POST /api/submit", "POST /api/release"];
-  const p99Ms = Math.max(...targetNames.map((name) => routes[name]?.p99 ?? 0));
-  const errors5xx = stats.total5xx();
-  const { errors409, errors410 } = stats.totalConflicts();
+  // A worker sends its client-side stats to the parent; only the parent reads
+  // /api/metrics at the end of the run, so serverLatency is filled in there.
+  const targets = computeTargets(routes, samples, sse, pipeline.count, {});
   const peakCpuPct = samples.reduce((peak, sample) => Math.max(peak, sample.cpuPct), 0);
   const peakRssBytes = samples.reduce((peak, sample) => Math.max(peak, sample.rssBytes), 0);
-  const notes: string[] = [];
-  if ((routes["POST /api/next probe"]?.count ?? 0) === 0) notes.push("no wait=0 probe samples: p99 target is unproven");
-  if (samples.length === 0) notes.push("no /api/metrics samples: CPU and RSS targets are unproven");
-  if (sse.connections === 0) notes.push("no SSE connections established");
-  if (pipeline.count === 0) notes.push("no final submissions: check-pipeline numbers are unproven");
-  notes.push("submit-to-verdict latency is informational; it depends on the project's check");
-
-  const targets: Targets = {
-    p99Ms,
-    p99Pass: (routes["POST /api/next probe"]?.count ?? 0) > 0 && p99Ms < 250,
-    errors5xx,
-    errors5xxPass: errors5xx === 0,
-    errors409,
-    errors410,
-    conflictPass: errors409 === 0 && errors410 === 0,
-    peakCpuPct,
-    cpuPass: samples.length > 0 && peakCpuPct < 85,
-    peakRssBytes,
-    rssPass: samples.length > 0 && peakRssBytes < 1.5 * 1024 * 1024 * 1024,
-    overall: true,
-    notes,
-  };
-  targets.overall = targets.p99Pass && targets.errors5xxPass && targets.conflictPass && targets.cpuPass && targets.rssPass;
 
   return {
     startedAt: new Date(startedAt).toISOString(),
@@ -468,5 +535,6 @@ export async function runSwarm(opts: Options, baseUrl: string): Promise<HarnessR
     sse,
     totals,
     targets,
+    serverLatency: {},
   };
 }

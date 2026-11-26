@@ -3,7 +3,7 @@
 import { mkdirSync } from "node:fs";
 import { join } from "node:path";
 import type { Options } from "./args.ts";
-import type { HarnessResult } from "./harness.ts";
+import { SERVER_TARGET_ROUTES, type HarnessResult, type ServerLatency } from "./harness.ts";
 import { ROUTES, type RouteSnapshot } from "./stats.ts";
 
 function pad(value: string, width: number): string {
@@ -22,12 +22,29 @@ function percentileLine(label: string, h: { p50: number; p95: number; p99: numbe
   return `  ${pad(label, 20)} n=${pad(String(h.count), 7)} p50=${pad(h.p50.toFixed(1), 8)} p95=${pad(h.p95.toFixed(1), 8)} p99=${pad(h.p99.toFixed(1), 8)}`;
 }
 
+function serverRouteOrder(latency: ServerLatency): string[] {
+  const names = Object.keys(latency);
+  const preferred = [
+    "POST /api/join",
+    ...SERVER_TARGET_ROUTES,
+    "GET /api/submission/:id",
+    "GET /api/view",
+    "GET /api/metrics",
+  ];
+  const ordered = preferred.filter((name) => names.includes(name));
+  for (const name of names.sort()) {
+    if (!ordered.includes(name)) ordered.push(name);
+  }
+  return ordered;
+}
+
 /** Human-readable summary for stdout. */
 export function renderReport(result: HarnessResult, opts: Options, baseUrl: string): string {
   const lines: string[] = [];
   lines.push("");
   lines.push(`Minga swarm load test: ${opts.agents} agents / ${opts.duration}s / ${opts.cores} cores / ${baseUrl}`);
   lines.push("");
+  lines.push("CLIENT-SIDE LATENCY (informational: includes long polls and local queueing)");
   lines.push(pad("route", 24) + pad("count", 9) + pad("p50", 9) + pad("p95", 9) + pad("p99", 9) + pad("max", 10) + "errors");
   lines.push("-".repeat(88));
   for (const name of ROUTES) {
@@ -42,6 +59,26 @@ export function renderReport(result: HarnessResult, opts: Options, baseUrl: stri
       pad(entry.p99.toFixed(1), 9) +
       pad(entry.max.toFixed(1), 10) +
       errors,
+    );
+  }
+
+  lines.push("");
+  lines.push("SERVER-SIDE HANDLING TIME (from GET /api/metrics; long polls excluded)");
+  lines.push(pad("route", 24) + pad("count", 9) + pad("p50", 9) + pad("p99", 9) + pad("max", 10));
+  lines.push("-".repeat(70));
+  const latency = result.serverLatency ?? {};
+  const serverNames = serverRouteOrder(latency);
+  if (serverNames.length === 0) {
+    lines.push("  (no latencyMs in /api/metrics from this server)");
+  }
+  for (const name of serverNames) {
+    const entry = latency[name]!;
+    lines.push(
+      pad(name, 24) +
+      pad(String(entry.count), 9) +
+      pad(entry.p50.toFixed(1), 9) +
+      pad(entry.p99.toFixed(1), 9) +
+      pad(entry.max.toFixed(1), 10),
     );
   }
   lines.push("");
@@ -68,9 +105,10 @@ export function renderReport(result: HarnessResult, opts: Options, baseUrl: stri
   lines.push(percentileLine("submit->verdict", p.verdict));
 
   lines.push("");
-  lines.push("TARGETS");
+  lines.push("TARGETS (latency verdict uses server-side handling time)");
   const t = result.targets;
-  lines.push(`  p99 next(probe)/beat/note/submit/release < 250 ms : ${pad(t.p99Ms.toFixed(1) + " ms", 12)} ${verdict(t.p99Pass)}`);
+  lines.push(`  server p99 next/beat/note/submit/release < 250 ms : ${pad(t.serverP99Ms.toFixed(1) + " ms", 12)} ${verdict(t.serverP99Pass)}`);
+  lines.push(`  client p99 next(probe)/beat/note/submit/release    : ${pad(t.clientP99Ms.toFixed(1) + " ms", 12)} informational`);
   lines.push(`  5xx responses == 0                      : ${pad(String(t.errors5xx), 12)} ${verdict(t.errors5xxPass)}`);
   lines.push(`  409/410 responses == 0 (409=${t.errors409}, 410=${t.errors410}) : ${pad(String(t.errors409 + t.errors410), 12)} ${verdict(t.conflictPass)}`);
   lines.push(`  server CPU < 85% of ${opts.cores} cores            : ${pad(t.peakCpuPct.toFixed(1) + "%", 12)} ${verdict(t.cpuPass)}`);
@@ -105,7 +143,7 @@ export async function writeResult(result: HarnessResult, opts: Options, baseUrl:
   const stamp = runId ?? new Date().toISOString().replace(/[:.]/g, "-");
   const file = join(dir, `${stamp}-${opts.agents}a.json`);
   const payload = {
-    schema: 2,
+    schema: 3,
     config: { ...opts, url: baseUrl },
     ...result,
   };

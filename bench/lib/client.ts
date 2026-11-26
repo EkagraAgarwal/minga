@@ -103,10 +103,14 @@ export async function apiRequest<T>(
         retries: attempt,
       };
     } catch (error) {
+      // Transport failures have no response body; keep the message so the
+      // report can tell a client-cap rejection from a timeout or a reset.
+      const message = error instanceof Error ? error.message : String(error);
       return {
         status: 0,
         ok: false,
-        error: error instanceof Error ? error.message : String(error),
+        error: message,
+        errorBody: message,
         latencyMs: performance.now() - started,
         retries: attempt,
       };

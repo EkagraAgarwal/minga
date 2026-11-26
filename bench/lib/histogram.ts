@@ -65,6 +65,12 @@ export interface HistogramSnapshot {
   sum: number;
   /** Number of buckets in the fixed lattice (for asserting bounded memory). */
   buckets: number;
+  /**
+   * The bucket counts themselves. They are plain numbers so a snapshot can
+   * cross a process boundary: a parent adds the counts from every worker to
+   * rebuild one histogram without keeping any raw latency samples.
+   */
+  counts: number[];
 }
 
 export class Histogram {
@@ -132,6 +138,18 @@ export class Histogram {
     this.maxValue = Math.max(this.maxValue, other.maxValue);
   }
 
+  /** Fold a JSON snapshot from a worker process into this histogram. */
+  mergeSnapshot(other: HistogramSnapshot): void {
+    if (!other.count) return;
+    for (let i = 0; i < this.counts.length; i++) {
+      this.counts[i] = (this.counts[i] ?? 0) + (other.counts[i] ?? 0);
+    }
+    this.total += other.count;
+    this.sumValues += other.sum;
+    this.minValue = Math.min(this.minValue, other.min);
+    this.maxValue = Math.max(this.maxValue, other.max);
+  }
+
   snapshot(): HistogramSnapshot {
     return {
       count: this.total,
@@ -143,6 +161,7 @@ export class Histogram {
       max: this.max,
       sum: this.sumValues,
       buckets: EDGES.length,
+      counts: Array.from(this.counts),
     };
   }
 }

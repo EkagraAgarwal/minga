@@ -8,10 +8,15 @@
  * result to bench/results/. Exits non-zero only when setup fails.
  */
 
+import { effectiveProcs, runWorkers } from "./lib/workers.ts";
 import { parseArgs, USAGE } from "./lib/args.ts";
 import { runSwarm } from "./lib/harness.ts";
 import { renderReport, writeResult } from "./lib/report.ts";
 import { createTempRepo, removeDir, startServer, type RunningServer } from "./lib/setup.ts";
+
+// The spawn env is the real fix (Bun reads this cap at startup); keep the same
+// value here so a direct run and the parent's own fetch share the budget.
+process.env.BUN_CONFIG_MAX_HTTP_REQUESTS ??= "4096";
 
 async function main(): Promise<void> {
   const argv = process.argv.slice(2);
@@ -27,6 +32,22 @@ async function main(): Promise<void> {
     console.error(`bench: ${error instanceof Error ? error.message : String(error)}`);
     console.error(USAGE);
     process.exit(1);
+    return;
+  }
+
+  // Worker children set up nothing: they only run agents against a URL the
+  // parent already prepared, and stream stats back as JSON lines.
+  if (opts.worker) {
+    try {
+      if (!opts.url) throw new Error("--worker requires --url");
+      const workerResult = await runSwarm(opts, opts.url);
+      console.log(JSON.stringify({
+        kind: "result", worker: opts.workerId ?? 0, result: workerResult,
+      }));
+    } catch (error) {
+      console.error(`bench worker: ${error instanceof Error ? error.message : String(error)}`);
+      process.exitCode = 1;
+    }
     return;
   }
 
@@ -48,10 +69,11 @@ async function main(): Promise<void> {
     }
 
     console.log(
-      `bench: starting ${opts.agents} agents, ramp ${opts.ramp}/s, duration ${opts.duration}s, ` +
+      `bench: starting ${opts.agents} agents across ${effectiveProcs(opts)} processes, ` +
+      `ramp ${opts.ramp}/s, duration ${opts.duration}s, ` +
       `think ${opts.thinkMin}-${opts.thinkMax}s, pass ${opts.pass}`,
     );
-    const result = await runSwarm(opts, baseUrl);
+    const result = await runWorkers(opts, baseUrl);
     console.log(renderReport(result, opts, baseUrl));
     const file = await writeResult(result, opts, baseUrl, runId);
     console.log(`bench: full result written to ${file}`);

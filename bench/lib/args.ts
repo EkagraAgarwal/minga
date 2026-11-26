@@ -20,8 +20,31 @@ export interface Options {
   checkConcurrency: number;
   /** Keep the generated temp repo after the run instead of deleting it. */
   keep: boolean;
+  /**
+   * Number of worker processes that share the agent load. Defaults to
+   * max(1, ceil(agents / 250)) so no single Bun process holds more than about
+   * 250 concurrent fetches (Bun's default HTTP connection cap is 256).
+   */
+  procs?: number;
+  /** Internal: run as a worker child and emit JSON lines on stdout. */
+  worker?: boolean;
+  /** Internal: zero-based worker index, used only in progress labels. */
+  workerId?: number;
+  /** Internal: global index of this worker's first agent, for a shared ramp. */
+  agentOffset?: number;
+  /** Internal: SSE viewers this worker opens (the parent distributes 20 total). */
+  viewerCount?: number;
+  /** Internal: wait=0 probes this worker opens (the parent distributes 5 total). */
+  probeCount?: number;
+  /** Internal: whether this worker samples /api/metrics (only one worker does). */
+  sampleMetrics?: boolean;
   /** If set, test this already-running server instead of starting one. */
   url?: string;
+}
+
+/** Default worker count for a given number of agents. */
+export function defaultProcs(agents: number): number {
+  return Math.max(1, Math.ceil(agents / 250));
 }
 
 export const DEFAULTS: Options = {
@@ -48,6 +71,8 @@ export const USAGE = `Usage: bun bench/swarm.ts [options]
   --ramp N        agents joined per second (default ${DEFAULTS.ramp})
   --think A-B     thinking time range in seconds (default ${DEFAULTS.thinkMin}-${DEFAULTS.thinkMax})
   --pass F        probability a submission passes, 0..1 (default ${DEFAULTS.pass})
+  --procs N       worker processes sharing the load
+                  (default: max(1, ceil(agents / 250)))
   --check-concurrency N
                   server check slots, passed as --check-concurrency N
                   (default: cores - 1, minimum 1)
@@ -82,12 +107,16 @@ function thinkRange(raw: string): { thinkMin: number; thinkMax: number } {
   return { thinkMin: min, thinkMax: max };
 }
 
-const BOOLEAN_FLAGS = new Set(["keep"]);
+const BOOLEAN_FLAGS = new Set(["keep", "worker", "sample-metrics"]);
 
 /** Parse CLI flags. Accepts both `--agents 300` and `--agents=300`. */
 export function parseArgs(argv: readonly string[]): Options {
   const options: Options = { ...DEFAULTS };
-  const known = new Set(["agents", "duration", "cores", "tasks", "port", "ramp", "think", "pass", "check-concurrency", "keep", "url"]);
+  const known = new Set([
+    "agents", "duration", "cores", "tasks", "port", "ramp", "think", "pass",
+    "procs", "check-concurrency", "keep", "worker", "worker-id",
+    "agent-offset", "viewer-count", "probe-count", "sample-metrics", "url",
+  ]);
   let checkConcurrencySet = false;
 
   for (let i = 0; i < argv.length; i++) {
@@ -101,7 +130,10 @@ export function parseArgs(argv: readonly string[]): Options {
       if (raw !== undefined && raw !== "true" && raw !== "false") {
         throw new Error(`--${name} must be true or false (got "${raw}")`);
       }
-      if (name === "keep") options.keep = raw === undefined || raw === "true";
+      const enabled = raw === undefined || raw === "true";
+      if (name === "keep") options.keep = enabled;
+      else if (name === "worker") options.worker = enabled;
+      else options.sampleMetrics = enabled;
       continue;
     }
     if (raw === undefined) {
@@ -127,6 +159,11 @@ export function parseArgs(argv: readonly string[]): Options {
         options.pass = value;
         break;
       }
+      case "procs": options.procs = integer(name, raw, 1); break;
+      case "worker-id": options.workerId = integer(name, raw, 0); break;
+      case "agent-offset": options.agentOffset = integer(name, raw, 0); break;
+      case "viewer-count": options.viewerCount = integer(name, raw, 0); break;
+      case "probe-count": options.probeCount = integer(name, raw, 0); break;
       case "check-concurrency": options.checkConcurrency = integer(name, raw, 1); checkConcurrencySet = true; break;
       case "url": {
         let parsed: URL;

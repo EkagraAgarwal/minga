@@ -1,5 +1,5 @@
 import { describe, expect, test } from "bun:test";
-import { DEFAULTS, parseArgs } from "./lib/args.ts";
+import { DEFAULTS, defaultProcs, parseArgs } from "./lib/args.ts";
 
 describe("parseArgs", () => {
   test("returns the documented defaults", () => {
@@ -39,6 +39,34 @@ describe("parseArgs", () => {
     expect(parseArgs(["--cores", "3", "--check-concurrency", "1"]).checkConcurrency).toBe(1);
     expect(parseArgs(["--check-concurrency=4", "--cores", "2"]).checkConcurrency).toBe(4);
     expect(() => parseArgs(["--check-concurrency", "0"])).toThrow(/check-concurrency/);
+  });
+
+  test("defaults worker count to one per 250 agents and parses --procs", () => {
+    expect(defaultProcs(1)).toBe(1);
+    expect(defaultProcs(250)).toBe(1);
+    expect(defaultProcs(251)).toBe(2);
+    expect(defaultProcs(1000)).toBe(4);
+    expect(defaultProcs(2500)).toBe(10);
+    expect(parseArgs([]).procs).toBeUndefined();
+    expect(parseArgs(["--agents", "1000", "--procs", "5"]).procs).toBe(5);
+    expect(parseArgs(["--procs=2"]).procs).toBe(2);
+    expect(() => parseArgs(["--procs", "0"])).toThrow(/procs/);
+  });
+
+  test("accepts the hidden worker flags", () => {
+    const options = parseArgs([
+      "--worker", "--worker-id", "3", "--agents", "250", "--agent-offset", "750",
+      "--viewer-count", "2", "--probe-count", "0", "--sample-metrics=false",
+      "--url", "http://127.0.0.1:1",
+    ]);
+    expect(options.worker).toBe(true);
+    expect(options.workerId).toBe(3);
+    expect(options.agents).toBe(250);
+    expect(options.agentOffset).toBe(750);
+    expect(options.viewerCount).toBe(2);
+    expect(options.probeCount).toBe(0);
+    expect(options.sampleMetrics).toBe(false);
+    expect(parseArgs(["--worker=false"]).worker).toBe(false);
   });
 
   test("parses the boolean --keep flag without consuming the next argument", () => {
