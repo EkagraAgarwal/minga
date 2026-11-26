@@ -77,7 +77,14 @@ A Minga server is meant to run on a 2–4 core VPS while hundreds to thousands o
 - `next` and verdict reads long-poll, so an idle agent costs one open request instead of a polling loop.
 - The UI reads a bounded snapshot plus a live event stream; state indexes keep every request off full scans.
 
-<!-- BENCH -->
+Measured with [`bench/swarm.ts`](bench/README.md): simulated agents (real keys, signed requests, long-polls, notes, submissions) against a real server pinned to **2 CPU cores**, 90 s per run, plus 20 live UI viewers on the event stream. Times are the server's own handling time, p99, in ms.
+
+| agents | next | submit | beat | note | release | peak CPU (of 2 cores) | peak RSS | errors |
+| ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
+| 1,000 | 11.5 | 35.8 | 1.5 | 1.2 | 5.8 | 29 % | 79 MB | 0 |
+| 2,500 | 16.2 | 31.9 | 1.1 | 1.5 | 6.5 | 45 % | 102 MB | 0 |
+
+The coordinator is not the bottleneck: the project's check is. In those runs a single check slot handled ~170 ms checks; raise `check_concurrency` or keep build caches warm with `check_keep` for heavier checks.
 
 Reproduce with `bun bench/swarm.ts --agents 1000 --duration 120 --cores 2` (see [`bench/`](bench/README.md)).
 

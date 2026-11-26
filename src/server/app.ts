@@ -66,6 +66,12 @@ const MAX_STREAM_BACKLOG = 2000;
 /** Event types that can free capacity for, or end, a waiting `next`. */
 const CAPACITY_EVENTS = new Set<MingaEvent["type"]>(["task.posted", "attempt.ended", "rule.changed", "task.closed"]);
 
+const KNOWN_ROUTES = new Set([
+  "/api/project", "/api/view", "/api/leaderboard", "/api/metrics", "/api/tasks", "/api/events", "/api/stream", "/api/submission/:id",
+  "/api/join", "/api/next", "/api/beat", "/api/note", "/api/submit", "/api/release", "/api/propose", "/api/vote",
+  "/api/head/post", "/api/head/decide", "/api/head/rule", "/api/head/ban", "/api/head/close", "/api/head/note",
+]);
+
 type Waiter = { agent: AgentId; model: string; approach: string; finish: (a: Assignment | null | "done") => void };
 
 export function createApp(deps: AppDeps) {
@@ -786,7 +792,9 @@ export function createApp(deps: AppDeps) {
   async function fetch(req: Request, ip?: string): Promise<Response> {
     const t0 = performance.now();
     const url = new URL(req.url);
-    const route = `${req.method} ${url.pathname.startsWith("/api/submission/") ? "/api/submission/:id" : url.pathname}`;
+    // Bounded keys: arbitrary paths must not grow the metrics maps.
+    const path = url.pathname.startsWith("/api/submission/") ? "/api/submission/:id" : url.pathname;
+    const route = KNOWN_ROUTES.has(path) ? `${req.method} ${path}` : "other";
     requests[route] = (requests[route] ?? 0) + 1;
     let res: Response;
     try {
