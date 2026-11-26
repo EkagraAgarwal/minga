@@ -488,6 +488,106 @@ describe("commitAccepted", () => {
       ? ["README.md", (await git(repo, ["log", "-1", "--format=%s", "HEAD"])) === "Commit A" ? "a.txt" : "b.txt"]
       : []);
   });
+
+  test("preserves spaces, unicode, CRLF and binary-ish bytes across multiple files", async () => {
+    const repo = await makeRepo();
+    const parent = await git(repo, ["rev-parse", "HEAD"]);
+    const indexBefore = await git(repo, ["ls-files", "-s"]);
+    const diffBefore = await git(repo, ["diff"]);
+    const files: Record<string, string> = {
+      "src/hello world.ts": "export const x = 1;\r\n",
+      "docs/ünïcode 文件/notes with spaces.txt": "café 你好\r\nsecond line\n",
+      "raw.bin": "A\u0000B\r\nC\u00ff\n",
+    };
+
+    const outcome = await commitAccepted({
+      repoDir: repo,
+      branch: "main",
+      parent,
+      files,
+      message: "Accept binary submission S-42",
+      trailers: { "Agent-Id": "abcdef0123456789", "Minga-Task": "T-42" },
+      author: "Ada Lovelace",
+    });
+    expect(outcome.ok).toBe(true);
+    const commit = outcome.ok ? outcome.commit : "";
+
+    // -z keeps git from C-quoting the unicode path in the listing.
+    const listed = (await raw(repo, ["ls-tree", "-r", "-z", "--name-only", commit])).stdout
+      .split("\0").filter(Boolean).sort();
+    expect(listed).toEqual(["README.md", ...Object.keys(files)].sort());
+
+    for (const [path, content] of Object.entries(files)) {
+      const blob = await raw(repo, ["cat-file", "-p", `${commit}:${path}`]);
+      expect(blob.code).toBe(0);
+      expect(blob.stdout).toBe(content);
+    }
+    const body = await git(repo, ["log", "-1", "--format=%B", commit]);
+    expect(body.split(/\r?\n/)).toContain("Accept binary submission S-42");
+    expect(body.split(/\r?\n/)).toContain("Agent-Id: abcdef0123456789");
+    expect(body.split(/\r?\n/)).toContain("Minga-Task: T-42");
+
+    expect(await git(repo, ["ls-files", "-s"])).toBe(indexBefore);
+    expect(await git(repo, ["diff"])).toBe(diffBefore);
+    expect(await readFile(join(repo, "README.md"), "utf8")).toBe("hello\n");
+    expect(existsSync(join(repo, "src"))).toBe(false);
+  });
+
+  test("leaves no refs/minga/tmp/* behind on success or stale", async () => {
+    const repo = await makeRepo();
+    const parent = await git(repo, ["rev-parse", "HEAD"]);
+    const tmpRefs = async (): Promise<string> =>
+      git(repo, ["for-each-ref", "--format=%(refname)", "refs/minga/tmp/"]);
+    expect(await tmpRefs()).toBe("");
+
+    const accepted = await commitAccepted({
+      repoDir: repo,
+      branch: "main",
+      parent,
+      files: { "ok.txt": "ok\n" },
+      message: "Clean up on success",
+      trailers: {},
+      author: "Ada Lovelace",
+    });
+    expect(accepted.ok).toBe(true);
+    expect(await tmpRefs()).toBe("");
+
+    await git(repo, ["commit", "--allow-empty", "-m", "external move"]);
+    const stale = await commitAccepted({
+      repoDir: repo,
+      branch: "main",
+      parent,
+      files: { "late.txt": "late\n" },
+      message: "Clean up on stale",
+      trailers: {},
+      author: "Ada Lovelace",
+    });
+    expect(stale.ok).toBe(false);
+    expect(await tmpRefs()).toBe("");
+  });
+
+  test("10 sequential commits average under 300 ms", async () => {
+    const repo = await makeRepo();
+    let parent = await git(repo, ["rev-parse", "HEAD"]);
+    const started = Date.now();
+    for (let i = 0; i < 10; i += 1) {
+      const outcome = await commitAccepted({
+        repoDir: repo,
+        branch: "main",
+        parent,
+        files: { [`step-${i}.txt`]: `step ${i}\n` },
+        message: `Step ${i}`,
+        trailers: {},
+        author: "Speed Tester",
+      });
+      expect(outcome.ok).toBe(true);
+      if (!outcome.ok) break;
+      parent = outcome.commit;
+    }
+    const avgMs = (Date.now() - started) / 10;
+    console.log(`commitAccepted: avg ${avgMs.toFixed(1)} ms over 10 sequential commits`);
+    expect(avgMs).toBeLessThan(300);
+  });
 });
 
 describe("read-only git helpers", () => {
