@@ -7,7 +7,7 @@
  * final report instead of working around it.
  */
 import type {
-  AgentId, AttemptId, Leaderboard, MurmurEvent, NewEvent, ProjectConfig, ProposalId,
+  AgentId, AttemptId, Leaderboard, MingaEvent, NewEvent, ProjectConfig, ProposalId,
   Role, Rules, State, TaskId,
 } from "./types.ts";
 
@@ -16,13 +16,13 @@ import type {
 // ======================================================================
 export interface EventStore {
   /** Stamps seq (last+1) and at (now, or `at` if given), persists, notifies subscribers, returns the stored event. */
-  append(event: NewEvent, at?: Date): MurmurEvent;
+  append(event: NewEvent, at?: Date): MingaEvent;
   /** Events with seq > `after`, ascending, at most `limit` (default: all). */
-  since(after: number, limit?: number): MurmurEvent[];
+  since(after: number, limit?: number): MingaEvent[];
   /** Seq of the newest event, 0 when empty. */
   head(): number;
   /** Called synchronously after each append. Returns an unsubscribe function. */
-  subscribe(listener: (event: MurmurEvent) => void): () => void;
+  subscribe(listener: (event: MingaEvent) => void): () => void;
   close(): void;
 }
 /** `path` may be ":memory:". Creates the schema if missing. WAL mode for files. */
@@ -33,9 +33,9 @@ export type OpenEventStore = (path: string) => EventStore;
 // ======================================================================
 export type InitialState = (rules: Rules) => State;
 /** Applies one event. Mutates `state` in place and returns it. Must tolerate events in seq order only; throws on seq gaps. */
-export type Reduce = (state: State, event: MurmurEvent) => State;
+export type Reduce = (state: State, event: MingaEvent) => State;
 /** initialState(rules) folded over all events. */
-export type Replay = (rules: Rules, events: Iterable<MurmurEvent>) => State;
+export type Replay = (rules: Rules, events: Iterable<MingaEvent>) => State;
 /** Next free id for a prefix, e.g. nextId(state, "task") -> "T-13". Does not mutate. */
 export type NextId = (state: State, kind: "task" | "attempt" | "note" | "submission" | "proposal") => string;
 /** An attempt is live when it has not ended and leaseUntil > now. */
@@ -120,7 +120,7 @@ export interface CommitInput {
   files: Record<string, string>;
   /** First line of the commit message. */
   message: string;
-  /** Appended as git trailers, e.g. { "Agent-Id": "...", "Agent-Model": "...", "Murmur-Task": "T-3" }. */
+  /** Appended as git trailers, e.g. { "Agent-Id": "...", "Agent-Model": "...", "Minga-Task": "T-3" }. */
   trailers: Record<string, string>;
   /** Commit author/committer name. */
   author: string;

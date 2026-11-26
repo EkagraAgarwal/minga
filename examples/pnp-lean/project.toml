@@ -1,0 +1,66 @@
+name = "P vs NP, formalized in Lean 4"
+goal = "Build a machine-checked Lean 4 development around P vs NP: state the problem precisely, prove the easy inclusions, and document the known barriers that block current proof techniques."
+scope = "Only files under proofs/ may change. Do not modify lakefile.toml, lean-toolchain, the Mathlib pin, or CI. No new axioms beyond Lean's standard classical axioms and no sorry left in accepted files."
+check = "lake build"
+paths = ["proofs/**/*.lean"]
+head = "ed25519:AJgMIqPSQxxNWI5lOpDWCwXWKvx-xETgGyFU4nVZBtI"
+
+check_timeout_seconds = 1200
+branch = "main"
+
+[rules]
+width = 3
+lease_minutes = 45
+max_attempts_per_agent = 1
+accept = "head-or-votes:3"
+default_points = 10
+
+[rules.roles]
+explore = 2
+build = 5
+attack = 2
+distill = 1
+plan = 0
+
+# A task with children is an area: agents work on its leaves, and the area
+# closes on its own once every leaf is closed.
+
+[[task]]
+key = "foundations"
+title = "Foundations: the statement and the easy inclusions"
+body = "Area. Formalize the question itself and the inclusions everyone agrees on."
+
+[[task]]
+under = "foundations"
+title = "Define decision problems, P, and NP"
+body = "Create proofs/PvsNP/Statement.lean: a decision problem, the class P via polynomial-time Turing machines, NP via polynomial certificates, and the target proposition P != NP."
+points = 15
+
+[[task]]
+under = "foundations"
+title = "Prove NP equals polynomial-time verifiers"
+body = "In proofs/PvsNP/NP.lean, prove both directions of the certificate/verifier equivalence for NP and show the witness length is polynomially bounded. Build on Statement.lean if it exists; otherwise state what you assume."
+points = 25
+
+[[task]]
+under = "foundations"
+title = "Prove P is a subset of NP"
+body = "Formalize P subset NP in proofs/PvsNP/PSubsetNP.lean by ignoring the certificate."
+points = 20
+
+[[task]]
+key = "barriers"
+title = "Barriers any proof must overcome"
+body = "Area. Map relativization, natural proofs and algebrization as precise Lean statements."
+
+[[task]]
+under = "barriers"
+title = "Formalize the relativization barrier"
+body = "State that some oracle separates P from NP relative to it, so a proof of P != NP must be non-relativizing. Put it in proofs/PvsNP/Relativization.lean."
+points = 30
+
+[[task]]
+under = "barriers"
+title = "Formalize the natural proofs barrier"
+body = "In proofs/PvsNP/NaturalProofs.lean, state the largeness and constructivity conditions of natural proofs and the circuit lower-bound obstruction they create."
+points = 30

@@ -3,7 +3,7 @@
  *
  * The whole system is five nouns (project, task, attempt, note, agent) plus the
  * submissions and proposals they produce. All state is derived by folding an
- * append-only log of `MurmurEvent`s (see log/reducer.ts). Nothing else is stored.
+ * append-only log of `MingaEvent`s (see log/reducer.ts). Nothing else is stored.
  *
  * Changing this file is a lead decision: workers must not edit it.
  */
@@ -204,7 +204,7 @@ export type ProposalDecided = Ev<"proposal.decided", {
 
 export type RuleChanged = Ev<"rule.changed", { rules: Partial<Rules> }>;
 
-export type MurmurEvent =
+export type MingaEvent =
   | AgentJoined
   | AgentBanned
   | TaskPosted
@@ -219,10 +219,10 @@ export type MurmurEvent =
   | ProposalDecided
   | RuleChanged;
 
-export type EventType = MurmurEvent["type"];
+export type EventType = MingaEvent["type"];
 
 /** An event before the store stamps `seq` and `at`. */
-export type NewEvent = MurmurEvent extends infer E ? (E extends MurmurEvent ? Omit<E, "seq" | "at"> : never) : never;
+export type NewEvent = MingaEvent extends infer E ? (E extends MingaEvent ? Omit<E, "seq" | "at"> : never) : never;
 
 // ---------------------------------------------------------------- derived state
 

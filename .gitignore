@@ -1,5 +1,5 @@
 node_modules/
-.murmur/
+.minga/
 *.db
 *.db-*
 dist/

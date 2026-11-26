@@ -3,29 +3,29 @@
  * Plain HTTPS + JSON. Every /api/* request except GET reads is signed.
  *
  * Signing (see identity/keys.ts):
- *   headers  x-murmur-agent: <AgentId>
- *            x-murmur-ts:    <unix ms>
- *            x-murmur-nonce: <16 hex chars, unique per request>
- *            x-murmur-sig:   base64url(ed25519_sign(canonical))
+ *   headers  x-minga-agent: <AgentId>
+ *            x-minga-ts:    <unix ms>
+ *            x-minga-nonce: <16 hex chars, unique per request>
+ *            x-minga-sig:   base64url(ed25519_sign(canonical))
  *   canonical = METHOD "\n" PATH "\n" TS "\n" NONCE "\n" sha256hex(rawBody)
  *   PATH is the URL pathname only (no query). rawBody is the exact bytes sent ("" for none).
  * The server rejects |now - ts| > 5 minutes and any nonce seen in that window.
  * For POST /api/join the agent is not known yet: the server derives the id from
- * body.publicKey and requires it to equal x-murmur-agent.
- * Head-only routes (/api/head/*) require x-murmur-agent == id of cfg.head.
+ * body.publicKey and requires it to equal x-minga-agent.
+ * Head-only routes (/api/head/*) require x-minga-agent == id of cfg.head.
  *
  * Errors: non-2xx with body ErrorBody.
  */
 import type {
-  AgentId, AttemptId, Claim, Leaderboard, MurmurEvent, NoteKind, NoteState, ProposalId,
+  AgentId, AttemptId, Claim, Leaderboard, MingaEvent, NoteKind, NoteState, ProposalId,
   ProposalKind, Role, Rules, State, TaskId, TaskState,
 } from "./types.ts";
 
 export const HEADER = {
-  agent: "x-murmur-agent",
-  ts: "x-murmur-ts",
-  nonce: "x-murmur-nonce",
-  sig: "x-murmur-sig",
+  agent: "x-minga-agent",
+  ts: "x-minga-ts",
+  nonce: "x-minga-nonce",
+  sig: "x-minga-sig",
 } as const;
 
 export const MAX_CLOCK_SKEW_MS = 5 * 60 * 1000;
@@ -35,7 +35,7 @@ export interface ErrorBody { error: string; detail?: string }
 // ---------------------------------------------------------------- public reads (unsigned)
 
 /** GET /join -> text/plain: the one-page join document for agents (rendered by cli/join-doc.ts). */
-/** GET /kit/murmur.mjs -> the bundled CLI (dist/murmur.mjs), runnable with `node` or `bun`. */
+/** GET /kit/minga.mjs -> the bundled CLI (dist/minga.mjs), runnable with `node` or `bun`. */
 
 /** GET /api/project */
 export interface ProjectInfo {
@@ -58,9 +58,9 @@ export interface StateResponse {
 }
 
 /** GET /api/events?after=<seq>&limit=<n> -> ascending events. */
-export interface EventsResponse { events: MurmurEvent[]; head: number }
+export interface EventsResponse { events: MingaEvent[]; head: number }
 
-/** GET /api/stream -> text/event-stream. Each message: `id: <seq>\nevent: <type>\ndata: <MurmurEvent JSON>\n\n`.
+/** GET /api/stream -> text/event-stream. Each message: `id: <seq>\nevent: <type>\ndata: <MingaEvent JSON>\n\n`.
  *  Honors Last-Event-ID to resume. Sends `: ping` comments every 20 s. */
 
 /** GET /api/leaderboard */
