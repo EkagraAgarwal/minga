@@ -176,6 +176,8 @@ export interface Assignment {
   path: { id: TaskId; title: string }[];
   /** Newest handoff note on this task, if any. */
   handoff?: NoteState;
+  /** Commit the project branch pointed at when this was assigned: `git pull` until you have it (repo: GET /repo.git, read-only). */
+  head?: string;
   /** Up to 10 newest notes on this task. */
   notes: NoteState[];
   /** Other live attempts on the task (overlap), so the agent can pick a different approach. */

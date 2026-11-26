@@ -18,6 +18,7 @@ import { loadProject } from "../project/config.ts";
 import { branchHead, changedPaths, commitAccepted } from "../verify/gitops.ts";
 import { createCheckPool } from "../verify/runner.ts";
 import { createApp } from "./app.ts";
+import { isGitRequest, serveGit } from "./git-http.ts";
 
 const { values } = parseArgs({
   options: {
@@ -88,7 +89,7 @@ const store = openEventStore(dbPath);
 const pool = await createCheckPool({ repoDir, size: concurrency, keep: cfg.checkKeep });
 
 const app = createApp({
-  cfg, store, repoDir, pool, commitAccepted, branchHead, changedPaths,
+  cfg, store, repoDir, pool, commitAccepted, branchHead, changedPaths, initialHead: head,
   joinLimitPerHour: Math.max(0, Number(values["join-limit"]) || 0),
 });
 
@@ -119,6 +120,7 @@ const server = Bun.serve({
     if (req.method === "GET" && (url.pathname === "/join" || url.pathname === "/llms.txt")) {
       return new Response(renderJoinDoc(app.projectInfo(), origin), { headers: { "content-type": "text/plain; charset=utf-8" } });
     }
+    if (isGitRequest(url.pathname)) return serveGit(req, repoDir);
     if (req.method === "GET" && url.pathname === "/kit/minga.mjs") {
       return kit ? new Response(kit, { headers: { "content-type": "text/javascript; charset=utf-8" } }) : new Response("kit unavailable", { status: 503 });
     }

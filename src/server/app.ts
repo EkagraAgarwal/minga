@@ -53,6 +53,8 @@ export interface AppDeps {
   joinLimitPerHour?: number;
   /** Re-runs of a passing check after the branch moved, before giving up as stale. Default 3. */
   recheckLimit?: number;
+  /** Branch head at startup; kept current as accepted work lands. Sent with assignments. */
+  initialHead?: string;
 }
 
 const MAX_BODY = 3 * 1024 * 1024;
@@ -75,6 +77,7 @@ export function createApp(deps: AppDeps) {
   const limiter = new RateLimiter(deps.rateLimitPerMinute ?? 120);
   const joinLimit = deps.joinLimitPerHour ?? 20;
   const recheckLimit = deps.recheckLimit ?? 3;
+  let branchTip = deps.initialHead;
   const submissionsDir = deps.submissionsDir ?? pathJoin(repoDir, ".minga", "submissions");
   mkdirSync(submissionsDir, { recursive: true });
   const startedAt = Date.now();
@@ -227,6 +230,7 @@ export function createApp(deps: AppDeps) {
     });
     return {
       attempt, role: pick.role, leaseUntil: until,
+      ...(branchTip ? { head: branchTip } : {}),
       task: { id: t.id, title: t.title, body: t.body, parent: t.parent, points: t.points },
       path, notes, others, ...(handoffId ? { handoff: state.notes[handoffId]! } : {}),
     };
@@ -440,7 +444,7 @@ export function createApp(deps: AppDeps) {
             "Minga-Task": s.task, "Minga-Attempt": s.attempt, "Minga-Claim": s.claim,
           },
         });
-        if (out.ok) return finalize(id, { base, result, commit: out.commit });
+        if (out.ok) { branchTip = out.commit; return finalize(id, { base, result, commit: out.commit }); }
         // The branch moved. With recheck = "on-overlap", land on the new head when nothing
         // committed since the check's base touched these paths.
         if (cfg.recheck === "on-overlap" && hops < 20) {
