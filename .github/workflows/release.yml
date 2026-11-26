@@ -1,46 +1,58 @@
 name: release
 # Push a tag like v0.1.0. Publishes to npm with provenance through npm trusted publishing
 # (configure the trusted publisher for this repo + workflow on npmjs.com once), then
-# creates a GitHub release with generated notes.
+# creates the GitHub release with generated notes if it does not exist yet.
+# To retry a tag: gh workflow run release.yml -f tag=v0.1.4
 on:
   push:
     tags: ["v*"]
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: "Existing tag to publish, e.g. v0.1.4"
+        required: true
 permissions:
   contents: write
   id-token: write
 jobs:
   publish:
     runs-on: ubuntu-latest
+    env:
+      TAG: ${{ inputs.tag || github.ref_name }}
     steps:
       - uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.tag || github.ref }}
       - uses: oven-sh/setup-bun@v2
         with:
           bun-version: 1.4.4
+      # No registry-url: setup-node would write an .npmrc with a placeholder NODE_AUTH_TOKEN,
+      # and npm must use the GitHub OIDC token for trusted publishing instead.
       - uses: actions/setup-node@v4
         with:
           node-version: 22
-          registry-url: https://registry.npmjs.org
-      - run: npm install -g npm@latest
+      - run: npm install -g npm@latest && npm --version
       - run: git config --global user.name ci && git config --global user.email ci@minga.invalid
       - run: bun install --frozen-lockfile
       - run: bunx tsc --noEmit -p .
       - run: bun test
       - name: Tag matches package.json
-        run: test "v$(node -p "require('./package.json').version")" = "$GITHUB_REF_NAME"
+        run: test "v$(node -p "require('./package.json').version")" = "$TAG"
       - name: Publish unless this version is already on npm
         run: |
-          # Ask the registry directly: setup-node writes a placeholder token that breaks anonymous npm view.
           name=$(node -p "require('./package.json').name")
           version=$(node -p "require('./package.json').version")
           if curl -fsS -o /dev/null "https://registry.npmjs.org/$name/$version"; then echo "$name@$version already published"; exit 0; fi
-          # Without a trusted publisher this fails; a maintainer may also have published by hand meanwhile.
-          npm publish --provenance --access public && exit 0
+          # Trusted publishing: npm exchanges the GitHub OIDC token (id-token: write) for a publish token.
+          npm publish --provenance --access public --loglevel verbose && exit 0
+          # A maintainer may have published by hand meanwhile.
           for i in $(seq 1 12); do
             if curl -fsS -o /dev/null "https://registry.npmjs.org/$name/$version"; then echo "$name@$version is on npm (published elsewhere)"; exit 0; fi
             sleep 10
           done
-          echo "::error::$name@$version is not on npm. Configure npm trusted publishing for this workflow, or run npm publish locally."
+          echo "::error::$name@$version is not on npm. Check the trusted publisher on npmjs.com (repo, workflow release.yml, Allow npm publish)."
           exit 1
-      - run: gh release create "$GITHUB_REF_NAME" --generate-notes --verify-tag
+      - name: GitHub release
+        run: gh release view "$TAG" >/dev/null 2>&1 || gh release create "$TAG" --generate-notes --verify-tag
         env:
           GH_TOKEN: ${{ github.token }}
