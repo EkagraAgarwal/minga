@@ -85,13 +85,14 @@ describe("MCP protocol", () => {
     expect(await handler(JSON.stringify({ jsonrpc: "2.0", id: 3, method: "notifications/initialized" }))).toBeNull();
   });
 
-  test("tools/list exposes all fifteen tools with JSON Schema inputs", async () => {
+  test("tools/list exposes all seventeen tools with JSON Schema inputs", async () => {
     const handler = createMcpHandler({ dir: process.cwd(), execute: canned() });
     const reply = decode(await handler(rpc(4, "tools/list")));
     expect(reply.result.tools.map((t: { name: string }) => t.name)).toEqual([
       "minga_join", "minga_next", "minga_beat", "minga_note", "minga_submit", "minga_result",
       "minga_release", "minga_propose_task", "minga_propose_impossible", "minga_vote",
       "minga_status", "minga_board", "minga_tasks", "minga_check", "minga_sync",
+      "minga_lead_post", "minga_lead_decide",
     ]);
     for (const tool of reply.result.tools) {
       expect(typeof tool.description).toBe("string");
@@ -99,7 +100,26 @@ describe("MCP protocol", () => {
       expect(tool.inputSchema.type).toBe("object");
       expect(typeof tool.inputSchema.properties).toBe("object");
     }
-    expect(MCP_TOOLS.length).toBe(15);
+    expect(MCP_TOOLS.length).toBe(17);
+
+    const beat = reply.result.tools.find((t: { name: string }) => t.name === "minga_beat");
+    expect(beat.inputSchema.properties.paths.type).toBe("array");
+    expect(beat.description).toContain("3 to 5 minutes");
+    const note = reply.result.tools.find((t: { name: string }) => t.name === "minga_note");
+    expect(note.inputSchema.properties.kind.enum).toEqual([
+      "idea", "result", "question", "handoff", "dead_end", "digest",
+    ]);
+    expect(note.inputSchema.properties.replyTo.type).toBe("string");
+    expect(note.inputSchema.properties.to.type).toBe("string");
+    const release = reply.result.tools.find((t: { name: string }) => t.name === "minga_release");
+    expect(release.inputSchema.properties.reason.enum).toEqual([
+      "dead_end", "too_hard", "out_of_time", "blocked", "duplicate", "other",
+    ]);
+    const leadPost = reply.result.tools.find((t: { name: string }) => t.name === "minga_lead_post");
+    expect(leadPost.inputSchema.properties.paths.type).toBe("array");
+    expect(leadPost.inputSchema.required).toEqual(["title", "body", "under"]);
+    const leadDecide = reply.result.tools.find((t: { name: string }) => t.name === "minga_lead_decide");
+    expect(leadDecide.inputSchema.properties.accept.type).toBe("boolean");
 
     const joined = reply.result.tools.find((t: { name: string }) => t.name === "minga_join");
     const next = reply.result.tools.find((t: { name: string }) => t.name === "minga_next");
@@ -142,6 +162,21 @@ describe("tool calls", () => {
     expect(reply.result.content).toEqual([{ type: "text", text: "joined Minga as agent abc" }]);
     expect(reply.result.structuredContent).toEqual({ agent: "abc" });
     expect(reply.result.isError).toBeUndefined();
+  });
+
+  test("notices are prepended to the tool result text", async () => {
+    const handler = createMcpHandler({
+      dir: process.cwd(),
+      execute: canned({
+        notices: ["notice: note N-12 from abc on T-3: [agent note] hi"],
+        result: { text: "lease until tomorrow", data: { leaseUntil: "tomorrow" } },
+      }),
+    });
+    const reply = decode(await handler(rpc(13, "tools/call", { name: "minga_beat", arguments: { attempt: "A-1" } })));
+    expect(reply.result.content[0].text).toBe(
+      "notice: note N-12 from abc on T-3: [agent note] hi\nlease until tomorrow",
+    );
+    expect(reply.result.structuredContent).toEqual({ leaseUntil: "tomorrow" });
   });
 
   test("minga_next done is spelled out in the text and structuredContent", async () => {
@@ -229,6 +264,27 @@ describe("tool calls", () => {
     expect(toolToCli("minga_beat", { attempt: "A-1" }).command).toBe("beat");
     expect(toolToCli("minga_sync", { discard: true })).toEqual({
       command: "sync", options: { discard: true }, positionals: [],
+    });
+    expect(toolToCli("minga_beat", { attempt: "A-1", approach: "pivot", paths: ["src/a.ts", "src/b/"] })).toEqual({
+      command: "beat", options: { approach: "pivot", paths: "src/a.ts,src/b/" }, positionals: ["A-1"],
+    });
+    expect(toolToCli("minga_note", {
+      task: "T-1", kind: "dead_end", text: "regex fails", replyTo: "N-9", to: "abc",
+    })).toEqual({
+      command: "note", options: { reply: "N-9", to: "abc" }, positionals: ["T-1", "dead_end", "regex fails"],
+    });
+    expect(toolToCli("minga_release", { attempt: "A-1", reason: "dead_end" })).toEqual({
+      command: "release", options: { reason: "dead_end" }, positionals: ["A-1"],
+    });
+    expect(toolToCli("minga_lead_post", {
+      title: "t", body: "b", under: "T-1", points: 3, paths: ["src/a.ts"],
+    })).toEqual({
+      command: "lead", action: "post",
+      options: { title: "t", body: "b", under: "T-1", points: "3", paths: "src/a.ts" },
+      positionals: [],
+    });
+    expect(toolToCli("minga_lead_decide", { proposal: "P-1", accept: false, reason: "bad" })).toEqual({
+      command: "lead", action: "decide", options: { reason: "bad" }, positionals: ["P-1", "reject"],
     });
   });
 

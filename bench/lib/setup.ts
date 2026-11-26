@@ -56,6 +56,7 @@ export function projectToml(headPublicKey: string, taskCount: number): string {
     'check = "bun check.ts"',
     'paths = ["work/**/*.txt"]',
     `head = "${formatHeadKey(headPublicKey)}"`,
+    'branch = "minga"',
     "",
     "[rules]",
     "width = 3",

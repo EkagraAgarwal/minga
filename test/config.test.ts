@@ -285,6 +285,35 @@ key = "b"
       parseProject(baseToml() + '[[task]]\ntitle = "a"\npoints = 1.5\n'),
     ).toThrow(/points must be an integer >= 0/);
   });
+
+  test("parses seed task paths (files and directory prefixes)", () => {
+    const cfg = parseProject(
+      baseToml() +
+        `[[task]]
+title = "root"
+key = "root"
+paths = ["src/", "lib/a.ts"]
+
+[[task]]
+title = "child"
+under = "root"
+`,
+    );
+    expect(cfg.seedTasks[0]!.paths).toEqual(["src/", "lib/a.ts"]);
+    expect(cfg.seedTasks[1]!.paths).toBeUndefined();
+  });
+
+  test("validates seed task paths", () => {
+    const task = (paths: string) => baseToml() + `[[task]]\ntitle = "a"\npaths = ${paths}\n`;
+    expect(() => parseProject(task('"src/**"'))).toThrow(/paths must be an array/);
+    expect(() => parseProject(task('["/abs.ts"]'))).toThrow(/task\[0\]\.paths\[0\] must not start with/);
+    expect(() => parseProject(task('["../secret"]'))).toThrow(/task\[0\]\.paths\[0\] must be a normalized/);
+    expect(() => parseProject(task('["a\\\\b"]'))).toThrow(/task\[0\]\.paths\[0\] must not contain a backslash/);
+    expect(() => parseProject(task('["src//x"]'))).toThrow(/task\[0\]\.paths\[0\] must be a normalized/);
+    expect(() => parseProject(task(`["${"x".repeat(301)}"]`))).toThrow(/longer than 300/);
+    expect(() => parseProject(task(`[${Array.from({ length: 51 }, () => '"x"').join(",")}]`))).toThrow(/at most 50/);
+    expect(parseProject(task('["src/a.ts", "lib/"]')).seedTasks[0]!.paths).toEqual(["src/a.ts", "lib/"]);
+  });
 });
 
 describe("parseAcceptPolicy", () => {

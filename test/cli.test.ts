@@ -6,14 +6,15 @@ import { join } from "node:path";
 import { pathToFileURL } from "node:url";
 
 import { HEADER } from "../src/core/protocol.ts";
-import type { ProjectInfo, SubmissionView, TasksResponse } from "../src/core/protocol.ts";
+import type { BeatNews, Notice, ProjectInfo, SubmissionView, TasksResponse } from "../src/core/protocol.ts";
 import { agentIdFromPublicKey, canonicalRequest, generateKeyPair, verifyMessage } from "../src/identity/keys.ts";
 import type { FetchLike } from "../src/cli/client.ts";
 import { createClient } from "../src/cli/client.ts";
 import {
-  fitSubmitMessage, formatRules, headKeygenCommand, headNoteCommand, joinCommand, nextCommand,
-  parseAcceptPolicy, parseCli, parseRuleArgs, readSubmissionFiles, renderSubmission, statusCommand,
-  submitCommand, tasksCommand,
+  beatCommand, fitSubmitMessage, formatNotice, formatRules, headKeygenCommand, headLeadCommand, headNoteCommand,
+  joinCommand, leadDecideCommand, leadPostCommand, nextCommand, noteCommand, noticeLines, parseAcceptPolicy, parseCli,
+  parsePaths, parseReleaseReason, parseRuleArgs, proposeCommand, readSubmissionFiles, releaseCommand, renderBeatNews,
+  renderSubmission, statusCommand, submitCommand, tasksCommand,
 } from "../src/cli/commands.ts";
 import { dispatch } from "../src/cli/dispatch.ts";
 import { doctorCommand } from "../src/cli/doctor.ts";
@@ -23,7 +24,7 @@ import { findPackageRoot, serveCommand, type RunResult } from "../src/cli/runtim
 import { parseProject } from "../src/project/config.ts";
 import type { GitRunner } from "../src/cli/sync.ts";
 import { syncCommand } from "../src/cli/sync.ts";
-import { checkCommand } from "../src/cli/check.ts";
+import { checkCommand, checkEnv } from "../src/cli/check.ts";
 import type { SessionIdentity } from "../src/cli/store.ts";
 import { agentPath, readAgent, readHead, resolveAgentDir, writeAgent, writeHead } from "../src/cli/store.ts";
 
@@ -102,6 +103,8 @@ interface FakeServerOptions {
   nextDelayMs?: number;
   outputTail?: string;
   stale?: boolean;
+  /** Notices attached to signed replies (next, beat, note, release, propose). */
+  notices?: unknown[];
 }
 
 /** In-process v2 server: async submit + GET /api/submission/<id>?wait + next wait. */
@@ -133,7 +136,11 @@ function startFakeServer(options: FakeServerOptions = {}) {
         if (options.done) return json({ assignment: null, done: true });
         const chosen = options.assignment === undefined ? null : options.assignment;
         if (chosen === null && (body.wait ?? 0) > 0) await sleep(Math.min(nextDelay, body.wait! * 1000));
-        return json(chosen === null ? { assignment: null, retryAfterSeconds: 5 } : { assignment: chosen });
+        const reply: Record<string, unknown> = chosen === null
+          ? { assignment: null, retryAfterSeconds: 5 }
+          : { assignment: chosen };
+        if (options.notices !== undefined) reply.notices = options.notices;
+        return json(reply);
       }
       if (req.method === "POST" && url.pathname === "/api/submit") {
         const body = await req.json() as { attempt: string; claim: string; message: string; files: Record<string, string> };
@@ -227,14 +234,45 @@ describe("argument parsing", () => {
       command: "beat", positionals: ["A-3"], options: { approach: "still on it" },
     },
     {
+      name: "beat with paths",
+      argv: ["beat", "A-3", "--approach", "still on it", "--paths", "src/a.ts,src/b/"],
+      command: "beat", positionals: ["A-3"], options: { approach: "still on it", paths: "src/a.ts,src/b/" },
+    },
+    {
       name: "note",
       argv: ["note", "T-2", "idea", "try", "the", "parser"],
       command: "note", positionals: ["T-2", "idea", "try", "the", "parser"], options: {},
     },
     {
+      name: "note thread",
+      argv: ["note", "T-2", "dead_end", "tried", "x", "--reply", "N-9", "--to", "abc"],
+      command: "note", positionals: ["T-2", "dead_end", "tried", "x"], options: { reply: "N-9", to: "abc" },
+    },
+    {
       name: "release",
       argv: ["release", "A-4", "--handoff", "half done"],
       command: "release", positionals: ["A-4"], options: { handoff: "half done" },
+    },
+    {
+      name: "release with reason",
+      argv: ["release", "A-4", "--reason", "dead_end"],
+      command: "release", positionals: ["A-4"], options: { reason: "dead_end" },
+    },
+    {
+      name: "head lead",
+      argv: ["head", "lead", "abc", "T-2", "--revoke"],
+      command: "head", action: "lead", positionals: ["abc", "T-2"], options: { revoke: true },
+    },
+    {
+      name: "lead post",
+      argv: ["lead", "post", "--title", "t", "--body", "b", "--under", "T-1", "--paths", "src/a.ts"],
+      command: "lead", action: "post", positionals: [],
+      options: { title: "t", body: "b", under: "T-1", paths: "src/a.ts" },
+    },
+    {
+      name: "lead decide",
+      argv: ["lead", "decide", "P-2", "accept", "--reason", "ok"],
+      command: "lead", action: "decide", positionals: ["P-2", "accept"], options: { reason: "ok" },
     },
     {
       name: "init",
@@ -290,6 +328,7 @@ describe("argument parsing", () => {
     expect(parseCli(["next", "-h"]).options.help).toBe(true);
     expect(() => parseCli(["frobnicate"])).toThrow(/unknown command/);
     expect(() => parseCli(["head", "frobnicate"])).toThrow(/unknown head action/);
+    expect(() => parseCli(["lead", "frobnicate"])).toThrow(/unknown lead action/);
   });
 });
 
@@ -1233,7 +1272,7 @@ describe("join document", () => {
     expect(doc).toContain("curl -fsSL https://minga.example/kit/minga.mjs -o minga.mjs && node minga.mjs <cmd>");
     expect(doc).toContain("GET THE CODE");
     expect(doc).toContain("git clone -b main https://minga.example/repo.git work && cd work");
-    expect(doc).toContain("git-ignores .minga/");
+    expect(doc).toContain(".minga/ is git-ignored");
     expect(doc.indexOf("GET THE CODE")).toBeLessThan(doc.indexOf("GET THE KIT"));
     expect(doc.indexOf("git clone")).toBeLessThan(doc.indexOf("minga join"));
     expect(doc).toContain("minga sync");
@@ -1257,6 +1296,319 @@ describe("join document", () => {
     expect(doc).toContain('head agent or 2 votes decides');
     expect(doc).not.toContain("minga.example//");
     expect(doc.split("\n").length).toBeLessThan(100);
+  });
+});
+
+// ---------------------------------------------------------------- notices and coordination
+
+describe("notices and coordination", () => {
+  test("formatNotice marks agent-written text and explains an ended attempt", () => {
+    const ended: Notice = {
+      kind: "attempt_ended", attempt: "A-8", task: "T-1", reason: "task_closed", taskStatus: "solved",
+      closedBy: { agent: "4bec7c19de4503f8", model: "hy4", submission: "S-6" },
+    };
+    expect(formatNotice(ended)).toBe(
+      "notice: A-8 ended: T-1 was solved by S-6 from 4bec7c19de4503f8 (hy4); run minga sync, then minga next --wait 600",
+    );
+    const addressed: Notice = {
+      kind: "note",
+      note: {
+        id: "N-12", task: "T-3", agent: "abc", kind: "question", text: "which parser?",
+        at: "2026-01-01T00:00:00.000Z", replyTo: "N-9",
+      },
+    };
+    expect(formatNotice(addressed)).toBe(
+      "notice: note N-12 from abc on T-3 (reply to N-9): [agent note] which parser?",
+    );
+    expect(noticeLines({ notices: [ended, addressed] })).toHaveLength(2);
+    expect(noticeLines({ assignment: null })).toEqual([]);
+  });
+
+  test("beat sends approach/paths and renders news", async () => {
+    const news: BeatNews = {
+      taskStatus: "open",
+      notes: [{ id: "N-12", task: "T-4", agent: "abc", kind: "result", text: "found it", at: "2026-01-01T00:00:00.000Z" }],
+      others: [{
+        attempt: "A-6", agent: "fed", model: "claude-y", role: "attack", approach: "fuzz it", paths: ["src/a.ts"],
+      }],
+      conflicts: [{ path: "src/x.ts", task: "T-7", attempt: "A-12", agent: "ddd" }],
+    };
+    const mock = mockFetch(() => json({ leaseUntil: "2026-01-01T00:10:00.000Z", news }));
+    const result = await beatCommand(createClient("https://minga.test", generateKeyPair(), mock.fn), {
+      attempt: "A-1", approach: "fuzz it", paths: ["src/a.ts", "src/b/"],
+    });
+    expect(JSON.parse(mock.calls[0]!.init.body as string)).toEqual({
+      attempt: "A-1", approach: "fuzz it", paths: ["src/a.ts", "src/b/"],
+    });
+    expect(result.text).toContain("lease until 2026-01-01T00:10:00.000Z");
+    expect(result.text).toContain("note N-12 (agent-written) result: found it");
+    expect(result.text).toContain("other A-6 fed attack — fuzz it [paths: src/a.ts]");
+    expect(result.text).toContain("conflict: src/x.ts also declared by A-12 on T-7");
+    expect(result.text).not.toContain("task status");
+
+    const closed = renderBeatNews({ ...news, taskStatus: "solved", notes: [], others: [], conflicts: [] });
+    expect(closed).toBe("task status: solved");
+    expect(parsePaths(" src/a.ts, src/b/ , ")).toEqual(["src/a.ts", "src/b/"]);
+  });
+
+  test("next renders paths, digests, questions, dead ends and conflicts", async () => {
+    const rich = {
+      ...assignment,
+      paths: ["src/a.ts", "src/b/"],
+      digests: [{
+        id: "N-20", task: "T-4", agent: "abc", kind: "digest", text: "pinned summary",
+        at: "2026-01-01T00:00:00.000Z",
+      }],
+      questions: [{
+        id: "N-21", task: "T-4", agent: "fed", kind: "question", text: "which lib?",
+        at: "2026-01-01T00:00:00.000Z",
+      }],
+      deadEnds: [{
+        id: "N-22", task: "T-4", agent: "aaa", kind: "dead_end", text: "regex fails",
+        at: "2026-01-01T00:00:00.000Z",
+      }],
+      conflicts: [{ path: "src/a.ts", task: "T-7", attempt: "A-12", agent: "ddd" }],
+      others: [...assignment.others, {
+        attempt: "A-7", agent: "bbb", model: "m", role: "explore", approach: "", paths: ["src/c.ts"],
+      }],
+    };
+    const mock = mockFetch((call) => call.url.endsWith("/api/project")
+      ? json(project)
+      : json({ assignment: rich }));
+    const result = await nextCommand(createClient("https://minga.test", generateKeyPair(), mock.fn));
+    expect(result.text).toContain("paths     src/a.ts, src/b/");
+    expect(result.text).toContain("digest (agent-written) N-20 by abc:");
+    expect(result.text).toContain("  pinned summary");
+    expect(result.text).toContain("questions:");
+    expect(result.text).toContain("  N-21 fed: which lib?");
+    expect(result.text).toContain("dead ends:");
+    expect(result.text).toContain("  N-22 aaa: regex fails");
+    expect(result.text).toContain("A-7 bbb m explore [paths: src/c.ts]");
+    expect(result.text).toContain("conflict: src/a.ts also declared by A-12 on T-7");
+  });
+
+  test("note sends replyTo and to in the signed body", async () => {
+    const mock = mockFetch(() => json({
+      note: {
+        id: "N-30", task: "T-3", agent: "abc", kind: "dead_end", text: "regex fails",
+        at: "2026-01-01T00:00:00.000Z", replyTo: "N-9", to: "fed",
+      },
+    }));
+    const result = await noteCommand(createClient("https://minga.test", generateKeyPair(), mock.fn), {
+      task: "T-3", kind: "dead_end", text: "regex fails", replyTo: "N-9", to: "fed",
+    });
+    expect(JSON.parse(mock.calls[0]!.init.body as string)).toEqual({
+      task: "T-3", kind: "dead_end", text: "regex fails", replyTo: "N-9", to: "fed",
+    });
+    expect(result.text).toContain("reply to N-9");
+    expect(result.text).toContain("to fed");
+  });
+
+  test("release validates --reason and sends it", async () => {
+    expect(parseReleaseReason("dead_end")).toBe("dead_end");
+    expect(() => parseReleaseReason("whatever")).toThrow(/release reason must be one of/);
+    const mock = mockFetch(() => json({ ok: true }));
+    const result = await releaseCommand(createClient("https://minga.test", generateKeyPair(), mock.fn), {
+      attempt: "A-1", reason: "dead_end", handoff: "regex fails",
+    });
+    expect(JSON.parse(mock.calls[0]!.init.body as string)).toEqual({
+      attempt: "A-1", handoff: "regex fails", reason: "dead_end",
+    });
+    expect(result.text).toContain("reason: dead_end");
+  });
+
+  test("propose reports duplicates", async () => {
+    const duplicateProposal = mockFetch(() => json({ proposal: "P-9", duplicateOf: { proposal: "P-2" } }));
+    const first = await proposeCommand(
+      createClient("https://minga.test", generateKeyPair(), duplicateProposal.fn),
+      { kind: "new_task", task: null, title: "t" },
+    );
+    expect(first.text).toContain("duplicate of P-2 (your vote was recorded)");
+    const duplicateTask = mockFetch(() => json({ proposal: "P-9", duplicateOf: { task: "T-3" } }));
+    const second = await proposeCommand(
+      createClient("https://minga.test", generateKeyPair(), duplicateTask.fn),
+      { kind: "new_task", task: null, title: "t" },
+    );
+    expect(second.text).toContain("duplicate of open task T-3");
+  });
+
+  test("head lead and lead verbs sign their bodies and carry paths", async () => {
+    const keys = generateKeyPair();
+    const mock = mockFetch(() => json({ ok: true, leads: [], task: "T-9" }));
+    const client = createClient("https://minga.test", keys, mock.fn);
+    await headLeadCommand(client, { agent: "abc", area: "T-1", grant: true });
+    await leadPostCommand(client, { title: "t", body: "b", parent: "T-1", points: 3, paths: ["src/a.ts", "src/b/"] });
+    await leadDecideCommand(client, { proposal: "P-1", accept: true, reason: "ok" });
+
+    const paths = ["/api/head/lead", "/api/lead/post", "/api/lead/decide"];
+    expect(mock.calls.map((call) => new URL(call.url).pathname)).toEqual(paths);
+    expect(JSON.parse(mock.calls[0]!.init.body as string)).toEqual({ agent: "abc", area: "T-1", grant: true });
+    expect(JSON.parse(mock.calls[1]!.init.body as string)).toEqual({
+      title: "t", body: "b", parent: "T-1", points: 3, paths: ["src/a.ts", "src/b/"],
+    });
+    expect(JSON.parse(mock.calls[2]!.init.body as string)).toEqual({ proposal: "P-1", accept: true, reason: "ok" });
+    for (const [index, path] of paths.entries()) {
+      const headers = mock.calls[index]!.init.headers as Record<string, string>;
+      const body = mock.calls[index]!.init.body as string;
+      expect(headers[HEADER.agent]).toBe(agentIdFromPublicKey(keys.publicKey));
+      expect(verifyMessage(keys.publicKey,
+        canonicalRequest("POST", path, headers[HEADER.ts]!, headers[HEADER.nonce]!, body), headers[HEADER.sig]!)).toBe(true);
+    }
+  });
+
+  test("head lead and lead commands pick the right identity through the dispatcher", async () => {
+    await withTempDir(async (dir) => {
+      const headKeys = generateKeyPair();
+      const agentKeys = generateKeyPair();
+      writeHead(dir, {
+        agent: agentIdFromPublicKey(headKeys.publicKey), publicKey: headKeys.publicKey,
+        privateKey: headKeys.privateKey, url: "https://minga.test",
+      });
+      writeAgent(dir, {
+        url: "https://minga.test", agent: agentIdFromPublicKey(agentKeys.publicKey),
+        publicKey: agentKeys.publicKey, privateKey: agentKeys.privateKey, model: "m", harness: "h",
+      });
+      const mock = mockFetch(() => json({ ok: true, leads: ["abc"], task: "T-9" }));
+      const deps = { dir, fetchImpl: mock.fn };
+
+      const grant = await dispatch(parseCli(["head", "lead", "abc", "T-1", "--dir", dir]), deps);
+      expect(grant.code).toBe(0);
+      expect((mock.calls[0]!.init.headers as Record<string, string>)[HEADER.agent]).toBe(
+        agentIdFromPublicKey(headKeys.publicKey),
+      );
+      expect(JSON.parse(mock.calls[0]!.init.body as string)).toEqual({ agent: "abc", area: "T-1", grant: true });
+
+      const posted = await dispatch(parseCli([
+        "lead", "post", "--title", "t", "--body", "b", "--under", "T-1", "--paths", "src/a.ts", "--dir", dir,
+      ]), deps);
+      expect(posted.code).toBe(0);
+      expect((mock.calls[1]!.init.headers as Record<string, string>)[HEADER.agent]).toBe(
+        agentIdFromPublicKey(agentKeys.publicKey),
+      );
+      expect(JSON.parse(mock.calls[1]!.init.body as string)).toEqual({
+        title: "t", body: "b", parent: "T-1", paths: ["src/a.ts"],
+      });
+
+      const decided = await dispatch(parseCli(["lead", "decide", "P-1", "reject", "--dir", dir]), deps);
+      expect(decided.code).toBe(0);
+      expect(JSON.parse(mock.calls[2]!.init.body as string)).toEqual({ proposal: "P-1", accept: false });
+      expect(decided.result.text).toBe("P-1 rejected\ntask: T-9");
+    });
+  });
+});
+
+// ---------------------------------------------------------------- check safety
+
+describe("check safety", () => {
+  test("join saves the check command in the identity file", async () => {
+    await withTempDir(async (dir) => {
+      const mock = mockFetch(() => json({
+        agent: "0123456789abcdef", rejoin: false, project, live: [],
+      }));
+      const outcome = await dispatch({
+        command: "join", options: { model: "m", harness: "h" }, positionals: ["https://minga.test"],
+      }, { dir, fetchImpl: mock.fn });
+      expect(outcome.code).toBe(0);
+      expect(readAgent(dir)!.check).toBe(project.check);
+      expect(JSON.parse(readFileSync(agentPath(dir), "utf8")).check).toBe(project.check);
+    });
+  });
+
+  test("refuses a check command changed since join", async () => {
+    await withTempDir(async (dir) => {
+      const keys = generateKeyPair();
+      writeAgent(dir, {
+        url: "https://minga.test", agent: agentIdFromPublicKey(keys.publicKey),
+        publicKey: keys.publicKey, privateKey: keys.privateKey, model: "m", harness: "h",
+        check: "bun test {files}",
+      });
+      writeFileSync(join(dir, "a.ts"), "x");
+      const mock = mockFetch((call) => call.url.endsWith("/api/project")
+        ? json({ ...project, check: "bun run other {files}" })
+        : json({}));
+      let message = "";
+      try {
+        await dispatch({ command: "check", options: {}, positionals: ["a.ts"] }, { dir, fetchImpl: mock.fn });
+      } catch (err) {
+        message = (err as Error).message;
+      }
+      expect(message).toContain('"bun test {files}"');
+      expect(message).toContain('"bun run other {files}"');
+      expect(message).toContain("re-read /join");
+      expect(message).toContain("re-run");
+      expect(mock.calls).toHaveLength(1); // the check itself never ran
+    });
+  });
+
+  test("passes only the allowlisted environment to the check", async () => {
+    await withTempDir(async (dir) => {
+      writeFileSync(join(dir, "a.ts"), "x");
+      const priorList = process.env.MINGA_CHECK_ENV;
+      const priorToken = process.env.MINGA_TEST_TOKEN;
+      const priorSecret = process.env.MINGA_TEST_SECRET;
+      process.env.MINGA_CHECK_ENV = " MINGA_TEST_TOKEN, ";
+      process.env.MINGA_TEST_TOKEN = "yes";
+      process.env.MINGA_TEST_SECRET = "no";
+      try {
+        const envs: NodeJS.ProcessEnv[] = [];
+        const result = checkCommand({
+          dir, command: "bun test {files}", files: ["a.ts"],
+          spawn: (_cmd, _args, opts) => { envs.push(opts.env); return { status: 0, output: "ok\n" }; },
+        });
+        expect(result.code).toBe(0);
+        const env = envs[0]!;
+        expect(env.MINGA_FILES).toBe("a.ts");
+        expect(env.MINGA_TEST_TOKEN).toBe("yes");
+        expect(env.MINGA_TEST_SECRET).toBeUndefined();
+        expect(env.MINGA_CHECK_ENV).toBeUndefined();
+        const allowed = new Set([
+          "PATH", "Path", "PATHEXT", "HOME", "USERPROFILE", "TEMP", "TMP", "TMPDIR",
+          "SystemRoot", "SYSTEMROOT", "ComSpec", "WINDIR", "APPDATA", "LOCALAPPDATA", "PROGRAMDATA",
+          "PROCESSOR_ARCHITECTURE", "NUMBER_OF_PROCESSORS", "OS", "USER", "USERNAME", "LOGNAME", "SHELL",
+          "LANG", "LC_ALL", "TERM", "XDG_CACHE_HOME", "XDG_CONFIG_HOME", "BUN_INSTALL", "CI",
+          "MINGA_TEST_TOKEN", "MINGA_FILES",
+        ]);
+        for (const key of Object.keys(env)) expect(allowed.has(key)).toBe(true);
+        expect(checkEnv(["b.ts"]).MINGA_FILES).toBe("b.ts");
+      } finally {
+        if (priorList === undefined) delete process.env.MINGA_CHECK_ENV; else process.env.MINGA_CHECK_ENV = priorList;
+        if (priorToken === undefined) delete process.env.MINGA_TEST_TOKEN; else process.env.MINGA_TEST_TOKEN = priorToken;
+        if (priorSecret === undefined) delete process.env.MINGA_TEST_SECRET; else process.env.MINGA_TEST_SECRET = priorSecret;
+      }
+    });
+  });
+
+  test("warns before the check when the last attempt is no longer live", async () => {
+    await withTempDir(async (dir) => {
+      const keys = generateKeyPair();
+      writeAgent(dir, {
+        url: "https://minga.test", agent: agentIdFromPublicKey(keys.publicKey),
+        publicKey: keys.publicKey, privateKey: keys.privateKey, model: "m", harness: "h",
+        check: "node --version",
+        lastAssignment: { attempt: "A-8", role: "build", leaseUntil: "2026-01-01T00:00:00.000Z", task: "T-1" },
+      });
+      writeFileSync(join(dir, "a.ts"), "x");
+      const mock = mockFetch((call) => {
+        if (call.url.endsWith("/api/project")) return json({ ...project, check: "node --version" });
+        if (call.url.endsWith("/api/attempt/A-8")) return json({
+          id: "A-8", task: "T-1", agent: agentIdFromPublicKey(keys.publicKey), role: "build",
+          state: "ended", endReason: "task_closed", leaseUntil: "2026-01-01T00:00:00.000Z",
+          taskStatus: "solved", closedBy: { agent: "4bec7c19de4503f8", model: "hy4", submission: "S-6" },
+        });
+        return json({});
+      });
+      const warnings: string[] = [];
+      const outcome = await dispatch(
+        { command: "check", options: {}, positionals: ["a.ts"] },
+        { dir, fetchImpl: mock.fn, onProgress: (line) => warnings.push(line) },
+      );
+      expect(outcome.code).toBe(0);
+      expect(warnings).toHaveLength(1);
+      expect(warnings[0]).toContain("warning: your last attempt A-8 is ended");
+      expect(warnings[0]).toContain("T-1 was solved by S-6 from 4bec7c19de4503f8 (hy4)");
+      expect(mock.calls.map((call) => new URL(call.url).pathname))
+        .toEqual(["/api/project", "/api/attempt/A-8"]);
+    });
   });
 });
 
@@ -1541,6 +1893,45 @@ describe("bundle on plain Node", () => {
         expect(result.stdout).not.toContain("verdict rejected");
         expect(result.stderr).toContain("queued S-1 (#1 in line)");
         expect(result.stderr).not.toContain("verdict rejected");
+      });
+    } finally {
+      server.server.stop();
+    }
+  });
+
+  test("notices print once on stderr and stay in --json", async () => {
+    const notices = [
+      {
+        kind: "attempt_ended", attempt: "A-8", task: "T-1", reason: "task_closed", taskStatus: "solved",
+        closedBy: { agent: "4bec7c19de4503f8", model: "hy4", submission: "S-6" },
+      },
+      {
+        kind: "note",
+        note: {
+          id: "N-12", task: "T-3", agent: "abc", kind: "question", text: "which parser?",
+          at: "2026-01-01T00:00:00.000Z", replyTo: "N-9",
+        },
+      },
+    ];
+    const server = startFakeServer({ notices });
+    try {
+      await withTempDir(async (dir) => {
+        withIdentity(dir, server.url);
+        const human = await runKit(["next", "--dir", dir, "--url", server.url], dir);
+        expect(human.status).toBe(3);
+        expect(human.stderr).toContain(
+          "notice: A-8 ended: T-1 was solved by S-6 from 4bec7c19de4503f8 (hy4); run minga sync, then minga next --wait 600",
+        );
+        expect(human.stderr).toContain(
+          "notice: note N-12 from abc on T-3 (reply to N-9): [agent note] which parser?",
+        );
+        expect(human.stderr.split("notice:").length - 1).toBe(2);
+        expect(human.stdout).not.toContain("notice:");
+
+        const raw = await runKit(["next", "--json", "--dir", dir, "--url", server.url], dir);
+        expect(raw.status).toBe(3);
+        expect(raw.stderr).not.toContain("notice:");
+        expect(JSON.parse(raw.stdout).notices).toEqual(notices);
       });
     } finally {
       server.server.stop();

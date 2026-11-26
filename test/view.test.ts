@@ -2,7 +2,7 @@ import { describe, expect, test } from "bun:test";
 import { buildView } from "../src/log/view.ts";
 import { replay } from "../src/log/reducer.ts";
 import type { ProjectInfo } from "../src/core/protocol.ts";
-import type { MingaEvent, NewEvent, Rules, State, SubmissionState } from "../src/core/types.ts";
+import type { CoordinationStats, MingaEvent, NewEvent, Rules, State, SubmissionState } from "../src/core/types.ts";
 
 const RULES: Rules = {
   width: 2,
@@ -74,6 +74,39 @@ const checked = (id: number, ok: boolean): NewEvent => ({
 });
 
 describe("buildView", () => {
+  test("copies coordination stats and non-empty leads, omits both otherwise", () => {
+    const ev = logger();
+    const state = replay(RULES, [
+      ev(post("T-1")),
+      ev({ type: "lead.granted", actor: "head", data: { agent: "a1", area: "T-1" } }),
+    ]);
+    const before = structuredClone(state);
+    const coordination: CoordinationStats = {
+      closes: 3,
+      closedUnder: 1,
+      closedUnderShare: 0.25,
+      notifyLagSeconds: { count: 1, p50: 2, p90: 2, max: 2 },
+      notesPerClosedTask: 1.5,
+      questions: { asked: 2, answered: 1, open: 1 },
+      handoffs: 1,
+      handoffsFollowedBySolve: 1,
+      deadEnds: 0,
+      digests: 1,
+      duplicateProposals: 0,
+    };
+
+    const out = buildView({ state, project: PROJECT, now: NOW, events: state.seq, coordination });
+
+    expect(out.coordination).toBe(coordination);
+    expect(out.leads).toEqual({ "T-1": ["a1"] });
+    expect(state).toEqual(before);
+
+    const evPlain = logger();
+    const plain = view(replay(RULES, [evPlain(post("T-1"))]));
+    expect(plain.coordination).toBeUndefined();
+    expect(plain.leads).toBeUndefined();
+  });
+
   test("builds totals, compact tasks and only live attempts", () => {
     const ev = logger();
     const state = replay(RULES, [

@@ -55,7 +55,7 @@ const RULE_KEYS = new Set([
   "roles",
 ]);
 
-const TASK_KEYS = new Set(["title", "body", "key", "under", "points"]);
+const TASK_KEYS = new Set(["title", "body", "key", "under", "points", "paths"]);
 
 function fail(message: string): never {
   throw new Error(`project.toml: ${message}`);
@@ -229,6 +229,24 @@ function parseHead(value: unknown): string {
   return head;
 }
 
+/** Repo-relative file paths or directory prefixes (trailing "/") a seed task expects to touch. */
+function parseTaskPaths(value: unknown, label: string): string[] {
+  if (!Array.isArray(value)) fail(`${label} must be an array of repo-relative paths`);
+  if (value.length > 50) fail(`${label} must have at most 50 entries`);
+  return value.map((entry, index) => {
+    const item = `${label}[${index}]`;
+    if (typeof entry !== "string" || entry.trim() === "") fail(`${item} must be a non-empty string`);
+    if (entry.length > 300) fail(`${item} is longer than 300 characters`);
+    if (entry.startsWith("/")) fail(`${item} must not start with "/"`);
+    if (entry.includes("\\")) fail(`${item} must not contain a backslash`);
+    const segments = (entry.endsWith("/") ? entry.slice(0, -1) : entry).split("/");
+    if (segments.some((seg) => seg === "" || seg === "." || seg === "..")) {
+      fail(`${item} must be a normalized repo-relative path`);
+    }
+    return entry;
+  });
+}
+
 function parseTasks(value: unknown): SeedTask[] {
   if (value === undefined) return [];
   if (!Array.isArray(value)) fail("task must be an array of tables ([[task]])");
@@ -274,10 +292,13 @@ function parseTasks(value: unknown): SeedTask[] {
       points = raw.points;
     }
 
+    const paths = raw.paths === undefined ? undefined : parseTaskPaths(raw.paths, `task[${index}].paths`);
+
     const task: SeedTask = { title, body };
     if (key !== undefined) task.key = key;
     if (under !== undefined) task.under = under;
     if (points !== undefined) task.points = points;
+    if (paths !== undefined) task.paths = paths;
     tasks.push(task);
     if (key !== undefined) keys.add(key);
   });

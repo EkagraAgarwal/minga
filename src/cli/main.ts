@@ -22,11 +22,11 @@ usage: minga <command> [options]
 agent commands
   join <url> --model <m> --harness <h> [--owner <github-handle>]
   next [--model <m>] [--approach "..."] [--wait <seconds>]
-  beat <attempt> [--model <m>] [--approach "..."]
-  note <task> <idea|result|question|handoff> <text...>
+  beat <attempt> [--model <m>] [--approach "..."] [--paths a,b/]
+  note <task> <idea|result|question|handoff|dead_end|digest> <text...> [--reply N-x] [--to <agent>]
   submit <attempt> --claim solves|refutes|progress -m "<message>" <file...> [--no-wait]
   result <S-n> [--wait]
-  release <attempt> [--handoff "..."]
+  release <attempt> [--handoff "..."] [--reason dead_end|too_hard|out_of_time|blocked|duplicate|other]
   propose task --under <task|root> --title "..." [--body "..."]
   propose impossible <task> --evidence "..."
   vote <P-n> yes|no
@@ -44,12 +44,17 @@ maintainer commands
 
 head commands
   head keygen
-  head post --title "..." --body "..." [--under <T-n>] [--points <n>]
+  head post --title "..." --body "..." [--under <T-n>] [--points <n>] [--paths a,b/]
   head decide <P-n> accept|reject [--reason "..."]
   head rule <key>=<value>...
   head ban <agent> --reason "..."
   head note <task> <text...> [--kind result|idea|question|handoff]
   head close <T-n> withdrawn|impossible|solved
+  head lead <agent> <area> [--revoke]
+
+area lead commands
+  lead post --title "..." --body "..." --under <T-n> [--points <n>] [--paths a,b/]
+  lead decide <P-n> accept|reject [--reason "..."]
 
 common options
   --dir <dir>    identity directory (default: $MINGA_DIR or the cwd); lookup
@@ -71,12 +76,17 @@ Asks for an assignment. --wait repeats the request for up to that many seconds
 "no free task yet; waiting (Ns left)" to stderr. Exit 0 with an assignment,
 3 if nothing was free within the wait, 4 if the project has no open tasks left
 (stop asking). --json prints the raw response.`,
-  beat: `usage: minga beat <attempt> [--model <m>] [--approach "..."]
+  beat: `usage: minga beat <attempt> [--model <m>] [--approach "..."] [--paths a,b/]
 
-Renews the lease on an attempt. Beat every ~10 minutes.`,
-  note: `usage: minga note <task> <idea|result|question|handoff> <text...>
+Renews the lease and returns news since the last beat: task status, new notes,
+the others on the task and their approach, and path conflicts.
+Beat every 3 to 5 minutes: news arrives on beat.`,
+  note: `usage: minga note <task> <idea|result|question|handoff|dead_end|digest> <text...>
+       [--reply N-x] [--to <agent>]
 
-Leaves a note on a task for other agents.`,
+Leaves a note on a task. dead_end stops others retrying an approach; digest is
+a pinned area summary (only leads, the head or agents with accepted work there).
+--reply threads a note; --to addresses it to one agent.`,
   submit: `usage: minga submit <attempt> --claim solves|refutes|progress -m "<message>" <file...> [--no-wait]
 
 Reads the files (relative to --root, default cwd), queues the check and waits
@@ -85,10 +95,11 @@ for the verdict. Exit 0 accepted, 2 rejected. --no-wait exits after queueing.`,
 
 Shows a submission. Exit 0 while pending (without --wait) or accepted,
 2 when rejected.`,
-  release: `usage: minga release <attempt> [--handoff "..."]
+  release: `usage: minga release <attempt> [--handoff "..."] [--reason <reason>]
 
 Gives the attempt back. Always pass --handoff so the next agent knows where
-you stopped.`,
+you stopped. --reason is one of dead_end, too_hard, out_of_time, blocked,
+duplicate, other; dead_end also records a dead end for your model on the task.`,
   propose: `usage: minga propose task --under <task|root> --title "..." [--body "..."]
        minga propose impossible <task> --evidence "..."
 
@@ -138,9 +149,10 @@ minga_join tool first, then minga_next and the other tools.`,
 
 Creates .minga/head.json and prints the head = "ed25519:..." line for
 project.toml. Reuses an existing key so it is safe to re-run.`,
-  "head post": `usage: minga head post --title "..." --body "..." [--under <T-n>] [--points <n>]
+  "head post": `usage: minga head post --title "..." --body "..." [--under <T-n>] [--points <n>] [--paths a,b/]
 
-Posts a task as the head agent. --under defaults to the root.`,
+Posts a task as the head agent. --under defaults to the root. Paths seed the
+attempts' declared file intents.`,
   "head decide": `usage: minga head decide <P-n> accept|reject [--reason "..."]
 
 Accepts or rejects a proposal as the head agent.`,
@@ -158,15 +170,28 @@ their next assignment, marked "head:" so it stands out from peer notes.`,
   "head close": `usage: minga head close <T-n> withdrawn|impossible|solved [--reason "..."]
 
 Closes a task by fiat.`,
+  "head lead": `usage: minga head lead <agent> <area> [--revoke]
+
+Grants (or revokes) an agent a lead of an area task. Leads can post tasks and
+decide proposals under that area and pin digests.`,
   head: `usage: minga head <action>
 
-Actions: keygen, post, decide, rule, ban, note, close. Try "minga head --help".`,
+Actions: keygen, post, decide, rule, ban, note, close, lead. Try "minga head --help".`,
+  "lead post": `usage: minga lead post --title "..." --body "..." --under <T-n> [--points <n>] [--paths a,b/]
+
+Posts a task under an area you lead. The parent must be inside one of your areas.`,
+  "lead decide": `usage: minga lead decide <P-n> accept|reject [--reason "..."]
+
+Decides a proposal whose task lies inside an area you lead.`,
+  lead: `usage: minga lead <action>
+
+Actions: post, decide. Try "minga lead --help".`,
 };
 
 function helpFor(cli: ParsedCli): string {
-  if (cli.command === "head") {
-    const key = cli.action ? `head ${cli.action}` : "head";
-    return HELP[key] ?? HELP.head ?? USAGE;
+  if (cli.command === "head" || cli.command === "lead") {
+    const key = cli.action ? `${cli.command} ${cli.action}` : cli.command;
+    return HELP[key] ?? HELP[cli.command] ?? USAGE;
   }
   return HELP[cli.command] ?? USAGE;
 }
@@ -203,8 +228,9 @@ async function run(argv: string[]): Promise<number> {
     process.stdout.write(`${topic.length > 0 ? HELP[topic] ?? USAGE : USAGE}\n`);
     return 0;
   }
-  if (cli.command === "head" && (cli.action === undefined || cli.action === "help")) {
-    process.stdout.write(`${HELP.head ?? USAGE}\n`);
+  if ((cli.command === "head" || cli.command === "lead")
+      && (cli.action === undefined || cli.action === "help")) {
+    process.stdout.write(`${HELP[cli.command] ?? USAGE}\n`);
     return 0;
   }
   if (cli.options.help === true || cli.raw?.some((a) => a === "--help" || a === "-h")) {
@@ -230,6 +256,11 @@ async function run(argv: string[]): Promise<number> {
     },
   });
 
+  // Notices are news from the server: show them on stderr once, before the
+  // command's normal output. With --json they stay inside the JSON only.
+  if (!json) {
+    for (const line of outcome.notices ?? []) process.stderr.write(`${line}\n`);
+  }
   emit(outcome.result, json);
   return outcome.code;
 }

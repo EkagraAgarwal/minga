@@ -8,7 +8,7 @@ import { formatHeadKey, generateKeyPair, signRequest, type KeyPair } from "../sr
 import { openEventStore } from "../src/log/store.ts";
 import { createApp } from "../src/server/app.ts";
 
-function setup(over: Partial<ProjectConfig["rules"]> = {}, opts: { poolSize?: number; recheck?: ProjectConfig["recheck"]; joinLimitPerHour?: number } = {}) {
+function setup(over: Partial<ProjectConfig["rules"]> = {}, opts: { poolSize?: number; recheck?: ProjectConfig["recheck"]; joinLimitPerHour?: number; leafPaths?: string[] } = {}) {
   const head = generateKeyPair();
   const cfg: ProjectConfig = {
     name: "demo", goal: "Prove things", scope: "Edit only proofs/.", check: "check {files}", checkTimeoutSeconds: 30,
@@ -21,7 +21,7 @@ function setup(over: Partial<ProjectConfig["rules"]> = {}, opts: { poolSize?: nu
     },
     seedTasks: [
       { key: "a", title: "Area A", body: "" },
-      { title: "Lemma one", body: "prove it", under: "a", points: 40 },
+      { title: "Lemma one", body: "prove it", under: "a", points: 40, ...(opts.leafPaths ? { paths: opts.leafPaths } : {}) },
       { title: "Lemma two", body: "prove it too", under: "a" },
     ],
   };
@@ -478,5 +478,246 @@ describe("server", () => {
     expect(m.latencyMs["POST /api/join"].count).toBe(2);
     expect(m.latencyMs["POST /api/next"].count).toBe(1);
     expect(m.latencyMs["POST /api/next"].p99).toBeLessThan(200);
+  });
+
+  // ---------------------------------------------------------------- coordination (0.2)
+
+  async function twoOnOneTask(s: S) {
+    await s.call(s.head, "/api/head/close", { task: "T-3", status: "withdrawn" });
+    const a = generateKeyPair(), b = generateKeyPair();
+    const ja = await join(s, a, "winner-model");
+    const jb = await join(s, b, "loser-model");
+    const ta = (await s.call(a, "/api/next", {})).body.assignment;
+    const tb = (await s.call(b, "/api/next", {})).body.assignment;
+    return { a, b, aid: ja.body.agent, bid: jb.body.agent, ta, tb };
+  }
+
+  test("a loser gets one attempt_ended notice on next, naming the winning submission", async () => {
+    const s = setup({}, { poolSize: 4 });
+    const { a, b, aid, bid, ta, tb } = await twoOnOneTask(s);
+    expect(ta.task.id).toBe("T-2");
+    expect(tb.task.id).toBe("T-2");
+    const won = await submitAndWait(s, a, ta.attempt, "QED");
+    expect(won.body.status).toBe("accepted");
+    expect(s.app.state.attempts[tb.attempt]!.endReason).toBe("task_closed");
+    expect(s.app.state.index.unnotified?.[bid]).toEqual([tb.attempt]);
+
+    const n1 = await s.call(b, "/api/next", {});
+    expect(n1.status).toBe(200);
+    expect(n1.body.notices).toEqual([{
+      kind: "attempt_ended", attempt: tb.attempt, task: "T-2", reason: "task_closed",
+      taskStatus: "solved", closedBy: { agent: aid, model: "winner-model", submission: won.body.id },
+    }]);
+    expect(s.app.state.index.unnotified?.[bid]).toBeUndefined();
+    expect((await s.call(b, "/api/next", {})).body.notices).toBeUndefined();
+    const notified = s.store.since(0).filter((e) => e.type === "attempt.notified");
+    expect(notified).toHaveLength(1);
+    expect(notified[0]!.data).toMatchObject({ attempt: tb.attempt, agent: bid, via: "next" });
+  });
+
+  test("a 410 on the closed attempt tells the loser and clears the notice", async () => {
+    const s = setup({}, { poolSize: 4 });
+    const { a, b, bid, ta, tb } = await twoOnOneTask(s);
+    const won = await submitAndWait(s, a, ta.attempt, "QED");
+    const late = await s.call(b, "/api/beat", { attempt: tb.attempt });
+    expect(late.status).toBe(410);
+    expect(late.body.error).toContain(`ended: T-2 was solved by ${won.body.id} from`);
+    expect(s.app.state.index.unnotified?.[bid]).toBeUndefined();
+    expect((await s.call(b, "/api/next", {})).body.notices).toBeUndefined();
+    const notified = s.store.since(0).filter((e) => e.type === "attempt.notified");
+    expect(notified).toHaveLength(1);
+    expect(notified[0]!.data).toMatchObject({ attempt: tb.attempt, agent: bid, via: "beat" });
+  });
+
+  test("a note with to arrives once as a notice; unknown addressee is refused", async () => {
+    const s = setup();
+    const a = generateKeyPair(), b = generateKeyPair();
+    const ja = await join(s, a, "m1");
+    const jb = await join(s, b, "m2");
+    const r = await s.call(a, "/api/note", { task: "T-2", kind: "idea", text: "look here", to: jb.body.agent });
+    expect(r.status).toBe(200);
+    expect(r.body.note.to).toBe(jb.body.agent);
+    expect(ja.body.agent).not.toBe(jb.body.agent);
+    const n1 = await s.call(b, "/api/next", {});
+    expect(n1.body.notices).toEqual([{ kind: "note", note: r.body.note }]);
+    expect((await s.call(b, "/api/next", {})).body.notices).toBeUndefined();
+    expect((await s.call(a, "/api/note", { task: "T-2", kind: "idea", text: "x", to: "0000000000000000" })).status).toBe(404);
+  });
+
+  test("beat approach and paths show up in another agent's others list", async () => {
+    const s = setup({}, { poolSize: 4 });
+    const { a, b, aid, ta, tb } = await twoOnOneTask(s);
+    expect((await s.call(a, "/api/beat", { attempt: ta.attempt, paths: ["../x"] })).status).toBe(400);
+    expect((await s.call(a, "/api/beat", { attempt: ta.attempt, paths: ["/abs.ts"] })).status).toBe(400);
+    const beat = await s.call(a, "/api/beat", { attempt: ta.attempt, approach: "induction", paths: ["proofs/a.lean", "lib/"] });
+    expect(beat.status).toBe(200);
+    expect(beat.body.leaseUntil).toBeDefined();
+    expect(s.app.state.index.openByPath?.["proofs/a.lean"]).toContain(ta.attempt);
+    expect(s.app.state.index.openByPath?.["lib/"]).toContain(ta.attempt);
+    const bbeat = await s.call(b, "/api/beat", { attempt: tb.attempt });
+    expect(bbeat.body.news.others).toEqual([{
+      attempt: ta.attempt, agent: aid, model: "winner-model", role: "build",
+      approach: "induction", paths: ["proofs/a.lean", "lib/"],
+    }]);
+  });
+
+  test("beat news lists only notes added since the previous beat", async () => {
+    const s = setup();
+    await s.call(s.head, "/api/head/close", { task: "T-3", status: "withdrawn" });
+    const a = generateKeyPair(), b = generateKeyPair();
+    await join(s, a, "m1");
+    await join(s, b, "m2");
+    const ta = (await s.call(a, "/api/next", {})).body.assignment;
+    await s.call(b, "/api/next", {});
+    expect((await s.call(a, "/api/beat", { attempt: ta.attempt })).body.news.notes).toHaveLength(0);
+    s.tick(1000);
+    const note = await s.call(b, "/api/note", { task: ta.task.id, kind: "idea", text: "new news" });
+    const second = await s.call(a, "/api/beat", { attempt: ta.attempt });
+    expect(second.body.news.notes.map((n: any) => n.id)).toEqual([note.body.note.id]);
+    const third = await s.call(a, "/api/beat", { attempt: ta.attempt });
+    expect(third.body.news.notes).toHaveLength(0);
+  });
+
+  test("beat conflicts cover exact and directory-prefix overlaps, but not the same task", async () => {
+    const s = setup();
+    const a = generateKeyPair(), b = generateKeyPair(), c = generateKeyPair();
+    const ja = await join(s, a, "m1"), jb = await join(s, b, "m2"), jc = await join(s, c, "m3");
+    const start = (n: number, agent: string, task: string, paths: string[]) =>
+      s.app.emit({ type: "attempt.started", actor: agent, data: {
+        attempt: `A-${n}`, task, agent, role: "build", approach: "", model: "m",
+        leaseUntil: "2099-01-01T00:00:00.000Z", paths,
+      } });
+    start(1, ja.body.agent, "T-2", ["shared/x.ts", "lib/"]);
+    start(2, jb.body.agent, "T-3", ["shared/x.ts", "lib/util.lean"]);
+    start(3, jc.body.agent, "T-2", ["shared/x.ts"]);
+
+    const bbeat = await s.call(b, "/api/beat", { attempt: "A-2" });
+    expect(bbeat.body.news.conflicts).toEqual([
+      { path: "shared/x.ts", task: "T-2", attempt: "A-1", agent: ja.body.agent },
+      { path: "shared/x.ts", task: "T-2", attempt: "A-3", agent: jc.body.agent },
+      { path: "lib/util.lean", task: "T-2", attempt: "A-1", agent: ja.body.agent },
+    ]);
+    const abeat = await s.call(a, "/api/beat", { attempt: "A-1" });
+    expect(abeat.body.news.conflicts.map((x: any) => x.attempt)).not.toContain("A-3");
+    expect(abeat.body.news.conflicts.some((x: any) => x.path === "lib/")).toBe(true);
+  });
+
+  test("assignment carries digests nearest first, open sibling questions and dead ends", async () => {
+    const s = setup();
+    await s.call(s.head, "/api/head/note", { task: "T-1", kind: "digest", text: "area digest" });
+    await s.call(s.head, "/api/head/note", { task: "T-2", kind: "digest", text: "task digest" });
+    const a = generateKeyPair();
+    await join(s, a, "m1");
+    const q1 = await s.call(a, "/api/note", { task: "T-2", kind: "question", text: "q on task" });
+    await s.call(a, "/api/note", { task: "T-3", kind: "question", text: "q on sibling" });
+    expect((await s.call(a, "/api/note", { task: "T-2", kind: "idea", text: "answer", replyTo: q1.body.note.id })).status).toBe(200);
+    await s.call(a, "/api/note", { task: "T-2", kind: "dead_end", text: "tried brute force" });
+    s.tick(1000);
+    await s.call(a, "/api/note", { task: "T-2", kind: "dead_end", text: "tried induction" });
+    await s.call(s.head, "/api/head/close", { task: "T-3", status: "withdrawn" });
+
+    const c = generateKeyPair();
+    await join(s, c, "m2");
+    const asg = (await s.call(c, "/api/next", {})).body.assignment;
+    expect(asg.task.id).toBe("T-2");
+    expect(asg.digests.map((n: any) => n.text)).toEqual(["task digest", "area digest"]);
+    expect(asg.questions.map((n: any) => n.text)).toEqual(["q on sibling"]);
+    expect(asg.deadEnds.map((n: any) => n.text)).toEqual(["tried induction", "tried brute force"]);
+  });
+
+  test("digest permission: head, lead and accepted work allowed; random agent 403; over 1500 chars 400", async () => {
+    const s = setup({}, { poolSize: 4 });
+    const over = "x".repeat(1501);
+    expect((await s.call(s.head, "/api/head/note", { task: "T-2", kind: "digest", text: over })).status).toBe(400);
+    expect((await s.call(s.head, "/api/head/note", { task: "T-2", kind: "digest", text: "head digest" })).status).toBe(200);
+
+    const a = generateKeyPair(), b = generateKeyPair(), c = generateKeyPair();
+    const ja = await join(s, a, "m1");
+    const jb = await join(s, b, "m2");
+    await join(s, c, "m3");
+    s.app.emit({ type: "lead.granted", actor: s.app.headId, data: { agent: ja.body.agent, area: "T-1" } });
+    expect((await s.call(a, "/api/note", { task: "T-2", kind: "digest", text: over })).status).toBe(400);
+    expect((await s.call(a, "/api/note", { task: "T-2", kind: "digest", text: "lead digest" })).status).toBe(200);
+    expect((await s.call(c, "/api/note", { task: "T-2", kind: "digest", text: "random digest" })).status).toBe(403);
+
+    await s.call(s.head, "/api/head/close", { task: "T-3", status: "withdrawn" });
+    const asg = (await s.call(b, "/api/next", {})).body.assignment;
+    expect(asg.task.id).toBe("T-2");
+    expect((await submitAndWait(s, b, asg.attempt, "QED")).body.status).toBe("accepted");
+    expect(jb.body.agent).not.toBe(ja.body.agent);
+    expect((await s.call(b, "/api/note", { task: "T-2", kind: "digest", text: "accepted-work digest" })).status).toBe(200);
+    expect((await s.call(c, "/api/note", { task: "T-2", kind: "digest", text: "still random" })).status).toBe(403);
+  });
+
+  test("release reason validates and records a dead end", async () => {
+    const s = setup();
+    const a = generateKeyPair();
+    await join(s, a, "dead-end-model");
+    const asg = (await s.call(a, "/api/next", {})).body.assignment;
+    expect((await s.call(a, "/api/release", { attempt: asg.attempt, reason: "nonsense" as any })).status).toBe(400);
+    expect((await s.call(a, "/api/release", { attempt: asg.attempt, reason: "dead_end" })).status).toBe(200);
+    expect(s.app.state.attempts[asg.attempt]!.releaseReason).toBe("dead_end");
+    expect(s.app.state.index.deadEnds?.[asg.task.id]).toContain("dead-end-model");
+    const ended = s.store.since(0).find((e) => e.type === "attempt.ended" && e.data.attempt === asg.attempt);
+    expect(ended!.data).toMatchObject({ reason: "released", why: "dead_end" });
+  });
+
+  test("head post and seeded tasks carry declared paths into attempts", async () => {
+    const s = setup({}, { leafPaths: ["proofs/seed.ts", "lib/"] });
+    expect(s.app.state.tasks["T-2"]!.paths).toEqual(["proofs/seed.ts", "lib/"]);
+    const a = generateKeyPair();
+    await join(s, a, "m1");
+    await s.call(s.head, "/api/head/close", { task: "T-3", status: "withdrawn" });
+    const asg = (await s.call(a, "/api/next", {})).body.assignment;
+    expect(asg.paths).toEqual(["proofs/seed.ts", "lib/"]);
+    expect(s.app.state.attempts[asg.attempt]!.paths).toEqual(["proofs/seed.ts", "lib/"]);
+    const started = s.store.since(0).find((e) => e.type === "attempt.started" && e.data.attempt === asg.attempt);
+    expect(started!.data).toMatchObject({ paths: ["proofs/seed.ts", "lib/"] });
+
+    const posted = await s.call(s.head, "/api/head/post", { title: "New", body: "", parent: null, paths: ["src/a.ts", "lib/"] });
+    expect(posted.status).toBe(200);
+    expect(s.app.state.tasks[posted.body.task]!.paths).toEqual(["src/a.ts", "lib/"]);
+    expect((await s.call(s.head, "/api/head/post", { title: "Bad", body: "", parent: null, paths: ["/abs.ts"] })).status).toBe(400);
+  });
+
+  test("5000 beats over 1000 live attempts with two paths each stay under 0.5 ms", async () => {
+    const s = setup();
+    const TS = Date.parse("2026-11-26T12:00:00Z");
+    const agents: { keys: KeyPair; id: string }[] = [];
+    for (let i = 0; i < 100; i++) {
+      const keys = generateKeyPair();
+      const j = await join(s, keys, `model-${i}`);
+      agents.push({ keys, id: j.body.agent });
+    }
+    for (let t = 0; t < 100; t++) {
+      s.app.emit({ type: "task.posted", actor: "server", data: {
+        task: `T-${100 + t}`, title: "t", body: "", parent: "T-1", points: 1, by: "config",
+      } });
+    }
+    for (let n = 0; n < 1000; n++) {
+      const owner = agents[Math.floor(n / 10)]!;
+      s.app.emit({ type: "attempt.started", actor: owner.id, data: {
+        attempt: `A-${n + 1}`, task: `T-${100 + (n % 100)}`, agent: owner.id, role: "build",
+        approach: "", model: "m", leaseUntil: "2099-01-01T00:00:00.000Z",
+        paths: [`proofs/f${n}.lean`, "lib/"],
+      } });
+    }
+    expect(s.app.state.index.openAttempts).toHaveLength(1000);
+
+    const reqs: { headers: Record<string, string>; body: string }[] = [];
+    for (let k = 0; k < 5000; k++) {
+      const i = k % 100;
+      const attempt = `A-${i * 10 + (Math.floor(k / 100) % 10) + 1}`;
+      const body = JSON.stringify({ attempt });
+      reqs.push({ headers: signRequest(agents[i]!.keys, "POST", "/api/beat", body, TS), body });
+    }
+    const t0 = performance.now();
+    for (const r of reqs) {
+      const res = await s.app.fetch(new Request("http://minga.test/api/beat", { method: "POST", headers: r.headers, body: r.body }));
+      if (res.status !== 200) throw new Error(`beat ${res.status}: ${await res.text()}`);
+      await res.arrayBuffer();
+    }
+    const avg = (performance.now() - t0) / reqs.length;
+    expect(avg).toBeLessThan(0.5);
   });
 });

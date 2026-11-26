@@ -41,6 +41,33 @@ function shellQuote(path: string): string {
   return `'${path.replaceAll("'", "'\\''")}'`;
 }
 
+/**
+ * The check runs submitted code on the volunteer's machine, so it gets a small
+ * allowlisted environment rather than the full process env (which may hold
+ * tokens, cloud credentials, SSH agent sockets, ...). A project can ask for
+ * extra variables by listing their names in MINGA_CHECK_ENV (comma separated).
+ */
+const BASE_ENV_NAMES = [
+  "PATH", "Path", "PATHEXT", "HOME", "USERPROFILE", "TEMP", "TMP", "TMPDIR",
+  "SystemRoot", "SYSTEMROOT", "ComSpec", "WINDIR", "APPDATA", "LOCALAPPDATA", "PROGRAMDATA",
+  "PROCESSOR_ARCHITECTURE", "NUMBER_OF_PROCESSORS", "OS", "USER", "USERNAME", "LOGNAME", "SHELL",
+  "LANG", "LC_ALL", "TERM", "XDG_CACHE_HOME", "XDG_CONFIG_HOME", "BUN_INSTALL", "CI",
+] as const;
+
+export function checkEnv(files: string[]): NodeJS.ProcessEnv {
+  const names = [
+    ...BASE_ENV_NAMES,
+    ...(process.env.MINGA_CHECK_ENV ?? "").split(",").map((name) => name.trim()).filter((name) => name.length > 0),
+  ];
+  const env: NodeJS.ProcessEnv = {};
+  for (const name of names) {
+    const value = process.env[name];
+    if (value !== undefined) env[name] = value;
+  }
+  env.MINGA_FILES = files.join(" ");
+  return env;
+}
+
 const defaultSpawn: CheckSpawn = (cmd, args, opts) => {
   const r = spawnSync(cmd, args, {
     ...opts, encoding: "utf8", stdio: ["ignore", "pipe", "pipe"], maxBuffer: 64 * 1024 * 1024,
@@ -54,7 +81,7 @@ export function checkCommand(input: CheckInput): CommandResult<CheckData> & { co
   const files = input.files.map((f) => f.replaceAll("\\", "/").replace(/^\.\//, ""));
   for (const f of files) if (!existsSync(resolve(cwd, f))) throw new Error(`no such file: ${f}`);
   const command = input.command.replaceAll("{files}", () => files.map(shellQuote).join(" "));
-  const env = { ...process.env, MINGA_FILES: files.join(" ") };
+  const env = checkEnv(files);
   const spawn = input.spawn ?? defaultSpawn;
 
   let runner: CheckData["runner"] = "bun exec";

@@ -125,6 +125,14 @@ function addAttempt(
   return attempt;
 }
 
+/** Declare file intents on an attempt and index them in openByPath. */
+function declarePaths(state: State, attemptId: string, paths: string[]): void {
+  const attempt = state.attempts[attemptId]!;
+  attempt.paths = paths;
+  const byPath = (state.index.openByPath ??= {});
+  for (const path of paths) (byPath[path] ??= []).push(attemptId);
+}
+
 function addSubmission(
   state: State,
   id: string,
@@ -439,6 +447,144 @@ describe("pickTask", () => {
     expect(picked).not.toBe("T-1");
     expect(["T-2", "T-3"]).toContain(picked!);
   });
+
+  test("a candidate path overlapping a live attempt on another task loses points", () => {
+    const state = makeState();
+    state.rules.maxAttemptsPerAgent = 5;
+    addAgent(state, "me", "claude-3");
+    addAgent(state, "other", "gpt-4");
+    addTask(state, "T-1", { paths: ["src/scheduler.ts"] });
+    addTask(state, "T-2", { paths: ["src/reducer.ts"] });
+    // Closed task holds the colliding live attempt so it is not a candidate.
+    addTask(state, "T-3", { status: "solved" });
+    addAttempt(state, "A-1", "T-3", "other", { model: "gpt-4" });
+    declarePaths(state, "A-1", ["src/scheduler.ts"]);
+
+    // Equal base scores; only the -3 cross-task penalty steers away from T-1.
+    expect(pickTask({ state, agent: "me", now: NOW, rng: () => 0 })?.task).toBe("T-2");
+  });
+
+  test("directory and file path overlaps are detected in both directions", () => {
+    const build = (taskPath: string, livePath: string): State => {
+      const state = makeState();
+      state.rules.maxAttemptsPerAgent = 5;
+      addAgent(state, "me", "claude-3");
+      addAgent(state, "other", "gpt-4");
+      addTask(state, "T-1", { paths: [taskPath] });
+      addTask(state, "T-2", { paths: ["src/unrelated.ts"] });
+      addTask(state, "T-3", { status: "solved" });
+      addAttempt(state, "A-1", "T-3", "other", { model: "gpt-4" });
+      declarePaths(state, "A-1", [livePath]);
+      return state;
+    };
+
+    // The candidate is a directory prefix of the live path.
+    expect(pickTask({
+      state: build("src/sched/", "src/sched/scheduler.ts"),
+      agent: "me", now: NOW, rng: () => 0,
+    })?.task).toBe("T-2");
+
+    // The live attempt is a directory prefix of the candidate's path.
+    expect(pickTask({
+      state: build("src/sched/scheduler.ts", "src/sched/"),
+      agent: "me", now: NOW, rng: () => 0,
+    })?.task).toBe("T-2");
+  });
+
+  test("an expired attempt's paths do not penalise a candidate", () => {
+    const state = makeState();
+    state.rules.maxAttemptsPerAgent = 5;
+    addAgent(state, "me", "claude-3");
+    addAgent(state, "other", "gpt-4");
+    addTask(state, "T-1", { paths: ["src/scheduler.ts"] });
+    addTask(state, "T-2", { paths: ["src/reducer.ts"] });
+    addTask(state, "T-3", { status: "solved" });
+    addAttempt(state, "A-1", "T-3", "other", { model: "gpt-4", leaseUntil: iso(10) });
+    declarePaths(state, "A-1", ["src/scheduler.ts"]);
+
+    // A-1 is not live, so both candidates tie and the first-seen one wins.
+    expect(pickTask({ state, agent: "me", now: NOW, rng: () => 0 })?.task).toBe("T-1");
+  });
+
+  test("overlap with a live attempt on the same task is not penalised", () => {
+    const state = makeState();
+    state.rules.maxAttemptsPerAgent = 5;
+    addAgent(state, "me", "claude-3");
+    addAgent(state, "other", "gpt-4");
+    addTask(state, "T-1", { paths: ["src/a.ts"] });
+    addTask(state, "T-2", { paths: ["src/b.ts"] });
+    addAttempt(state, "A-1", "T-1", "other", { model: "gpt-4" });
+    declarePaths(state, "A-1", ["src/a.ts"]);
+    addAttempt(state, "A-2", "T-2", "other", { model: "gpt-4" });
+    declarePaths(state, "A-2", ["src/c.ts"]);
+
+    // Both tasks have one gpt-4 attempt; only T-1 has a same-task path overlap.
+    expect(pickTask({ state, agent: "me", now: NOW, rng: () => 0 })?.task).toBe("T-1");
+  });
+
+  test("a dead end by the same model family demotes a task to the fallback tier", () => {
+    const state = makeState();
+    addAgent(state, "me", "claude-opus-5.5");
+    addTask(state, "T-1");
+    addTask(state, "T-2");
+    state.index.deadEnds = { "T-1": ["claude-sonnet-5.5"] };
+
+    expect(pickTask({ state, agent: "me", now: NOW, rng: () => 0 })?.task).toBe("T-2");
+
+    // With nothing else free, the demoted task is offered.
+    state.tasks["T-2"]!.status = "solved";
+    expect(pickTask({ state, agent: "me", now: NOW, rng: () => 0 })?.task).toBe("T-1");
+  });
+
+  test("a dead end by another model family does not demote a task", () => {
+    const state = makeState();
+    addAgent(state, "me", "claude-opus-5.5");
+    addTask(state, "T-1");
+    addTask(state, "T-2");
+    state.index.deadEnds = { "T-1": ["gpt-6"] };
+
+    expect(pickTask({ state, agent: "me", now: NOW, rng: () => 0 })?.task).toBe("T-1");
+  });
+
+  test("old states without openByPath or deadEnds still work", () => {
+    const state = makeState();
+    addAgent(state, "me", "claude-3");
+    addAgent(state, "other", "gpt-4");
+    addTask(state, "T-1", { paths: ["src/a.ts"] });
+    addTask(state, "T-2", { paths: ["src/b.ts"] });
+    // Attempts carry paths but the new index fields were never populated.
+    addAttempt(state, "A-1", "T-1", "other", { model: "gpt-4", paths: ["src/a.ts"] });
+    addAttempt(state, "A-2", "T-2", "other", { model: "gpt-4", paths: ["src/b.ts"] });
+
+    expect(state.index.openByPath).toBeUndefined();
+    expect(state.index.deadEnds).toBeUndefined();
+    expect(pickTask({ state, agent: "me", now: NOW, rng: () => 0 })?.task).toBe("T-1");
+  });
+
+  test("5,000 tasks and 2,000 two-path attempts pick under 50 ms average", () => {
+    const state = makeState();
+    state.rules.width = 5;
+    state.rules.maxAttemptsPerAgent = 5;
+    for (let i = 0; i < 2000; i += 1) addAgent(state, `a${i}`, `model-${i % 20}`);
+    for (let i = 1; i <= 5000; i += 1) {
+      addTask(state, `T-${i}`, { paths: [`src/t${i}/a.ts`, `src/t${i}/b.ts`] });
+    }
+    for (let i = 0; i < 2000; i += 1) {
+      const id = `A-${i + 1}`;
+      addAttempt(state, id, `T-${i + 1}`, `a${i}`, { leaseUntil: LEASE });
+      declarePaths(state, id, [`src/t${i + 1}/a.ts`, `src/t${i + 1}/b.ts`]);
+    }
+
+    const rng = mulberry32(123);
+    const startedAt = performance.now();
+    for (let i = 0; i < 1000; i += 1) {
+      expect(pickTask({ state, agent: `a${i % 2000}`, now: NOW, rng })).not.toBeNull();
+    }
+    const avg = (performance.now() - startedAt) / 1000;
+    // eslint-disable-next-line no-console
+    console.log(`1,000 picks over 5,000 tasks / 2,000 attempts: ${avg.toFixed(3)} ms avg`);
+    expect(avg).toBeLessThan(50);
+  }, 30_000);
 
   test("1,000 picks over 5,000 tasks and 2,000 agents average under 2 ms", () => {
     const state = makeState();

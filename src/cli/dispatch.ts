@@ -7,10 +7,11 @@ import type { FetchLike } from "./client.ts";
 import { createClient } from "./client.ts";
 import type { Client } from "./client.ts";
 import {
-  beatCommand, boardCommand, fitSubmitMessage, headBanCommand, headCloseCommand, headDecideCommand,
-  headKeygenCommand, headNoteCommand, headPostCommand, headRuleCommand, joinCommand, nextCommand, noteCommand, parseClaim,
-  parseNoteKind, parseRuleArgs, proposeCommand, releaseCommand, resultCommand, statusCommand,
-  submitCommand, submissionExitCode, tasksCommand, voteCommand,
+  attemptText, beatCommand, boardCommand, fitSubmitMessage, headBanCommand, headCloseCommand, headDecideCommand,
+  headKeygenCommand, headLeadCommand, headNoteCommand, headPostCommand, headRuleCommand, joinCommand, leadDecideCommand,
+  leadPostCommand, nextCommand, noteCommand, noticeLines, parseClaim, parseNoteKind, parsePaths, parseReleaseReason,
+  parseRuleArgs, proposeCommand, releaseCommand, resultCommand, statusCommand, submitCommand, submissionExitCode,
+  tasksCommand, voteCommand,
 } from "./commands.ts";
 import type { CommandResult, ParsedCli, ParsedValue, SubmitView } from "./commands.ts";
 import { doctorCommand } from "./doctor.ts";
@@ -38,6 +39,8 @@ export interface DispatchOutcome<T = unknown> {
   /** 0 ok or assignment, 1 error (thrown), 2 rejected submission,
    * 3 no task free within the wait, 4 project finished (no open tasks left). */
   code: number;
+  /** Formatted notices from the response, printed once before normal output. */
+  notices?: string[];
 }
 
 function str(value: ParsedValue | undefined): string | undefined {
@@ -114,7 +117,7 @@ function modelOf(cli: ParsedCli, identity: SessionIdentity): string | undefined 
 }
 
 /** Execute a parsed command. Throws on failure; returns text, data and exit code on success. */
-export async function dispatch(cli: ParsedCli, deps: DispatchDeps): Promise<DispatchOutcome> {
+async function dispatchCore(cli: ParsedCli, deps: DispatchDeps): Promise<DispatchOutcome> {
   const dir = deps.dir;
   switch (cli.command) {
     case "join": {
@@ -172,6 +175,7 @@ export async function dispatch(cli: ParsedCli, deps: DispatchDeps): Promise<Disp
           attempt,
           model: modelOf(cli, identity),
           approach: str(cli.options.approach),
+          paths: str(cli.options.paths) !== undefined ? parsePaths(str(cli.options.paths)!) : undefined,
         }),
         code: 0,
       };
@@ -179,11 +183,18 @@ export async function dispatch(cli: ParsedCli, deps: DispatchDeps): Promise<Disp
 
     case "note": {
       const task = requirePositional(cli, 0, "note needs a task id");
-      const kind = parseNoteKind(requirePositional(cli, 1, "note needs a kind (idea, result, question, handoff)"));
+      const kind = parseNoteKind(requirePositional(cli, 1, "note needs a kind (idea, result, question, handoff, dead_end, digest)"));
       const text = cli.positionals.slice(2).join(" ");
       if (text.length === 0) throw new Error("note needs some text");
       const { client: c } = requireAgent(deps);
-      return { result: await noteCommand(c, { task, kind, text }), code: 0 };
+      return {
+        result: await noteCommand(c, {
+          task, kind, text,
+          replyTo: str(cli.options.reply),
+          to: str(cli.options.to),
+        }),
+        code: 0,
+      };
     }
 
     case "submit": {
@@ -230,9 +241,14 @@ export async function dispatch(cli: ParsedCli, deps: DispatchDeps): Promise<Disp
 
     case "release": {
       const attempt = requirePositional(cli, 0, "release needs an attempt id");
+      const reasonText = str(cli.options.reason);
       const { client: c } = requireAgent(deps);
       return {
-        result: await releaseCommand(c, { attempt, handoff: str(cli.options.handoff) }),
+        result: await releaseCommand(c, {
+          attempt,
+          handoff: str(cli.options.handoff),
+          reason: reasonText !== undefined ? parseReleaseReason(reasonText) : undefined,
+        }),
         code: 0,
       };
     }
@@ -290,7 +306,27 @@ export async function dispatch(cli: ParsedCli, deps: DispatchDeps): Promise<Disp
     }
 
     case "check": {
-      const project = await readClient(deps).project();
+      const identity = readAgent(resolveAgentDir(deps.dir));
+      const c = readClient(deps);
+      const project = await c.project();
+      // The check runs submitted code on this machine. Never run a command the
+      // agent did not accept at join time.
+      if (identity?.check !== undefined && identity.check !== project.check) {
+        throw new Error(
+          `the project's check command changed on the server: saved "${identity.check}" vs current "${project.check}"; ` +
+          're-read /join and re-run "minga join <url> --model <m> --harness <h>" to accept it',
+        );
+      }
+      if (identity?.lastAssignment) {
+        try {
+          const view = await c.attempt(identity.lastAssignment.attempt);
+          if (view.state !== "live") {
+            deps.onProgress?.(`warning: your last attempt ${view.id} is ${view.state}; ${attemptText(view)}`);
+          }
+        } catch {
+          // A server that cannot answer must not block the local check.
+        }
+      }
       const out = checkCommand({ dir: deps.dir, command: project.check, files: cli.positionals });
       return { result: out, code: out.code };
     }
@@ -363,7 +399,17 @@ export async function dispatch(cli: ParsedCli, deps: DispatchDeps): Promise<Disp
             body,
             parent: str(cli.options.under) ?? null,
             points: intOption(cli.options.points, "points"),
+            paths: str(cli.options.paths) !== undefined ? parsePaths(str(cli.options.paths)!) : undefined,
           }),
+          code: 0,
+        };
+      }
+
+      if (action === "lead") {
+        const agent = requirePositional(cli, 0, "head lead needs an agent id");
+        const area = requirePositional(cli, 1, "head lead needs an area task id");
+        return {
+          result: await headLeadCommand(c, { agent, area, grant: cli.options.revoke !== true }),
           code: 0,
         };
       }
@@ -429,9 +475,55 @@ export async function dispatch(cli: ParsedCli, deps: DispatchDeps): Promise<Disp
       throw new Error(`unknown head action: ${action ?? ""} (try "minga head --help")`);
     }
 
+    case "lead": {
+      if (cli.action !== "post" && cli.action !== "decide") {
+        throw new Error(`unknown lead action: ${cli.action ?? ""} (try "minga lead --help")`);
+      }
+      const identity = requireAgent(deps);
+      const c = identity.client;
+      if (cli.action === "post") {
+        const title = str(cli.options.title);
+        const body = raw(cli.options.body);
+        const under = str(cli.options.under);
+        if (!title) throw new Error("lead post needs --title");
+        if (body === undefined) throw new Error("lead post needs --body");
+        if (!under) throw new Error("lead post needs --under <T-n>");
+        return {
+          result: await leadPostCommand(c, {
+            title,
+            body,
+            parent: under,
+            points: intOption(cli.options.points, "points"),
+            paths: str(cli.options.paths) !== undefined ? parsePaths(str(cli.options.paths)!) : undefined,
+          }),
+          code: 0,
+        };
+      }
+      const proposal = requirePositional(cli, 0, "lead decide needs a proposal id");
+      const verdict = requirePositional(cli, 1, "lead decide needs accept or reject");
+      if (verdict !== "accept" && verdict !== "reject") {
+        throw new Error(`lead decide must be accept or reject, got "${verdict}"`);
+      }
+      return {
+        result: await leadDecideCommand(c, {
+          proposal,
+          accept: verdict === "accept",
+          reason: str(cli.options.reason),
+        }),
+        code: 0,
+      };
+    }
+
     default:
       throw new Error(`unknown command: ${cli.command} (try "minga help")`);
   }
+}
+
+/** Extract notices once, so every caller (CLI, MCP) renders the same lines. */
+export async function dispatch(cli: ParsedCli, deps: DispatchDeps): Promise<DispatchOutcome> {
+  const outcome = await dispatchCore(cli, deps);
+  const notices = noticeLines(outcome.result.data);
+  return notices.length > 0 ? { ...outcome, notices } : outcome;
 }
 
 /** `resolveDir` is re-exported for callers that want the same default. */

@@ -60,25 +60,31 @@ export const MCP_TOOLS: McpTool[] = [
   },
   {
     name: "minga_beat",
-    description: "Step 2 of the loop: renew the lease on your current attempt roughly every 10 minutes while working on it.",
+    description: "Step 2 of the loop: renew the lease on your current attempt every 3 to 5 minutes while working on it. The result carries news since the last beat: task status, new notes, others' approaches and path conflicts.",
     inputSchema: {
       type: "object",
       properties: {
         attempt: stringProp("Your attempt id (A-n)."),
         approach: stringProp("Optional one-line description of your current approach."),
+        paths: { type: "array", items: { type: "string" }, description: "Replace your declared file intents (a pivot)." },
       },
       required: ["attempt"],
     },
   },
   {
     name: "minga_note",
-    description: "Leave a note on a task for other agents: idea, result, question or handoff.",
+    description: "Leave a note on a task for other agents: idea, result, question, handoff, dead_end (an approach that failed) or digest (a pinned area summary, restricted to leads, the head and agents with accepted work there).",
     inputSchema: {
       type: "object",
       properties: {
         task: stringProp("Task id (T-n)."),
-        kind: { type: "string", enum: ["idea", "result", "question", "handoff"], description: "Note kind." },
+        kind: {
+          type: "string", enum: ["idea", "result", "question", "handoff", "dead_end", "digest"],
+          description: "Note kind.",
+        },
         text: stringProp("The note itself."),
+        replyTo: stringProp("Optional note id this replies to (N-n)."),
+        to: stringProp("Optional agent id this note is addressed to."),
       },
       required: ["task", "kind", "text"],
     },
@@ -113,12 +119,16 @@ export const MCP_TOOLS: McpTool[] = [
   },
   {
     name: "minga_release",
-    description: "Step 4 of the loop (instead of submitting): give up an attempt. Always leave a handoff note so the next agent can continue.",
+    description: "Step 4 of the loop (instead of submitting): give up an attempt. Always leave a handoff note so the next agent can continue. Use reason dead_end so others do not retry the same approach.",
     inputSchema: {
       type: "object",
       properties: {
         attempt: stringProp("Your attempt id (A-n)."),
         handoff: stringProp("What you tried and what is left to do."),
+        reason: {
+          type: "string", enum: ["dead_end", "too_hard", "out_of_time", "blocked", "duplicate", "other"],
+          description: "Why you released the attempt.",
+        },
       },
       required: ["attempt"],
     },
@@ -199,6 +209,34 @@ export const MCP_TOOLS: McpTool[] = [
       },
     },
   },
+  {
+    name: "minga_lead_post",
+    description: "For agents holding an area lead: post a task under a task inside an area you lead. Paths seed the attempts' declared file intents.",
+    inputSchema: {
+      type: "object",
+      properties: {
+        title: stringProp("Short task title."),
+        body: stringProp("What the agent should do."),
+        under: stringProp("Parent task id (T-n) inside an area you lead."),
+        points: { type: "integer", minimum: 0, description: "Points for the task." },
+        paths: { type: "array", items: { type: "string" }, description: "Repo-relative paths or directory prefixes this task expects." },
+      },
+      required: ["title", "body", "under"],
+    },
+  },
+  {
+    name: "minga_lead_decide",
+    description: "For agents holding an area lead: accept or reject a proposal whose task lies inside an area you lead.",
+    inputSchema: {
+      type: "object",
+      properties: {
+        proposal: stringProp("Proposal id (P-n)."),
+        accept: boolProp("true to accept, false to reject."),
+        reason: stringProp("Optional reason for the decision."),
+      },
+      required: ["proposal", "accept"],
+    },
+  },
 ];
 
 export interface McpContext {
@@ -248,6 +286,12 @@ function optNumber(args: Record<string, unknown>, key: string): number | undefin
   return typeof value === "number" && Number.isFinite(value) ? value : undefined;
 }
 
+function stringArray(args: Record<string, unknown>, key: string): string[] | undefined {
+  const value = args[key];
+  if (!Array.isArray(value) || value.some((item) => typeof item !== "string")) return undefined;
+  return value as string[];
+}
+
 function setOpt(options: Record<string, ParsedValue>, key: string, value: string | undefined): void {
   if (value !== undefined) options[key] = value;
 }
@@ -260,6 +304,7 @@ export function toolToCli(
 ): ParsedCli {
   const options: Record<string, ParsedValue> = {};
   let command = "status";
+  let action: string | undefined;
   let positionals: string[] = [];
   switch (name) {
     case "minga_join":
@@ -282,10 +327,13 @@ export function toolToCli(
       command = "beat";
       positionals = [reqString(args, "attempt")];
       setOpt(options, "approach", optString(args, "approach"));
+      setOpt(options, "paths", stringArray(args, "paths")?.join(","));
       break;
     case "minga_note":
       command = "note";
       positionals = [reqString(args, "task"), reqString(args, "kind"), reqString(args, "text")];
+      setOpt(options, "reply", optString(args, "replyTo"));
+      setOpt(options, "to", optString(args, "to"));
       break;
     case "minga_submit": {
       command = "submit";
@@ -311,6 +359,7 @@ export function toolToCli(
       command = "release";
       positionals = [reqString(args, "attempt")];
       setOpt(options, "handoff", optString(args, "handoff"));
+      setOpt(options, "reason", optString(args, "reason"));
       break;
     case "minga_propose_task":
       command = "propose";
@@ -349,10 +398,32 @@ export function toolToCli(
       command = "sync";
       if (args.discard === true) options.discard = true;
       break;
+    case "minga_lead_post":
+      command = "lead";
+      action = "post";
+      options.title = reqString(args, "title");
+      options.body = reqString(args, "body");
+      options.under = reqString(args, "under");
+      {
+        const points = optNumber(args, "points");
+        if (points !== undefined) options.points = String(Math.max(0, Math.floor(points)));
+      }
+      setOpt(options, "paths", stringArray(args, "paths")?.join(","));
+      break;
+    case "minga_lead_decide":
+      command = "lead";
+      action = "decide";
+      {
+        const approve = args.accept;
+        if (typeof approve !== "boolean") throw new Error("accept must be true or false");
+        positionals = [reqString(args, "proposal"), approve ? "accept" : "reject"];
+      }
+      setOpt(options, "reason", optString(args, "reason"));
+      break;
     default:
       throw new Error(`unknown tool: ${name}`);
   }
-  return { command, options, positionals };
+  return { command, ...(action !== undefined ? { action } : {}), options, positionals };
 }
 
 /** Create a line-oriented JSON-RPC handler. Returns null for notifications. */
@@ -412,7 +483,7 @@ export function createMcpHandler(ctx: McpContext): McpHandler {
           const cli = toolToCli(name, (params.arguments !== null && typeof params.arguments === "object"
             && !Array.isArray(params.arguments)) ? params.arguments as Record<string, unknown> : {}, ctx.onProgress);
           const outcome: DispatchOutcome = await execute(cli);
-          const text: string = (outcome.result as CommandResult).text;
+          const text: string = [...(outcome.notices ?? []), (outcome.result as CommandResult).text].join("\n");
           const body: Record<string, unknown> = {
             content: [{ type: "text", text }],
             structuredContent: (outcome.result as CommandResult).data ?? null,

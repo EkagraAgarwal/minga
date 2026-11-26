@@ -31,6 +31,8 @@ export interface SessionIdentity {
   model: string;
   harness: string;
   owner?: string;
+  /** The project's check command accepted at join; `minga check` refuses a changed one. */
+  check?: string;
   /** Last assignment from `next`. */
   lastAssignment?: LastAssignment;
   /** Last submission id from `submit`. */
@@ -142,6 +144,8 @@ export function readAgent(dir: string): SessionIdentity | null {
   };
   const owner = optionalString(obj, "owner");
   if (owner !== undefined) identity.owner = owner;
+  const check = optionalString(obj, "check");
+  if (check !== undefined) identity.check = check;
   const raw = obj.lastAssignment;
   if (raw && typeof raw === "object" && !Array.isArray(raw)) {
     const a = raw as Record<string, unknown>;
@@ -177,6 +181,7 @@ export function writeAgent(dir: string, identity: SessionIdentity): string {
     harness: identity.harness,
   };
   if (identity.owner !== undefined) value.owner = identity.owner;
+  if (identity.check !== undefined) value.check = identity.check;
   if (identity.lastAssignment !== undefined) value.lastAssignment = identity.lastAssignment;
   if (identity.lastSubmission !== undefined) value.lastSubmission = identity.lastSubmission;
   if (identity.lastAccepted !== undefined) value.lastAccepted = identity.lastAccepted;

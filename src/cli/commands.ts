@@ -9,14 +9,15 @@ import { readFileSync } from "node:fs";
 import { isAbsolute, relative, resolve, sep } from "node:path";
 import { parseArgs } from "node:util";
 import type {
-  Assignment, AttemptView, BeatResponse, JoinResponse, LeaderboardResponse, NextResponse, NoteResponse,
-  ProposeResponse, ProjectInfo, ReleaseResponse, SubmitResponse, SubmissionView, VoteResponse,
-  HeadDecideResponse, HeadNoteResponse, HeadRuleResponse, TasksResponse,
+  Assignment, AttemptView, BeatNews, BeatResponse, HeadLeadRequest, HeadLeadResponse, JoinResponse,
+  LeaderboardResponse, NextResponse, NoteResponse, Notice, ProposeResponse, ProjectInfo, ReleaseResponse,
+  SubmitResponse, SubmissionView, VoteResponse, HeadDecideResponse, HeadNoteResponse, HeadRuleResponse,
+  HeadPostResponse, TasksResponse,
 } from "../core/protocol.ts";
 import type {
-  AcceptPolicy, AgentId, Claim, NoteKind, ProposalId, ProposalKind, Rules, TaskId,
+  AcceptPolicy, AgentId, Claim, NoteKind, ProposalId, ProposalKind, ReleaseReason, Rules, TaskId,
 } from "../core/types.ts";
-import { NOTE_KINDS } from "../core/types.ts";
+import { NOTE_KINDS, RELEASE_REASONS } from "../core/types.ts";
 import type { Role } from "../core/types.ts";
 
 /** What each role asks of an agent. Any role may submit --claim solves. */
@@ -42,9 +43,9 @@ type OptionSet = Record<string, OptionSpec>;
 export type ParsedValue = string | boolean;
 
 export interface ParsedCli {
-  /** Agent command, "head", "help", or "" when nothing was given. */
+  /** Agent command, "head", "lead", "help", or "" when nothing was given. */
   command: string;
-  /** head subcommand: keygen | post | decide | rule | ban | close | help. */
+  /** head/lead subcommand: keygen | post | decide | rule | ban | close | note | lead | help. */
   action?: string;
   options: Record<string, ParsedValue>;
   positionals: string[];
@@ -73,8 +74,12 @@ const COMMAND_OPTIONS: Record<string, OptionSet> = {
   beat: {
     model: { type: "string" },
     approach: { type: "string" },
+    paths: { type: "string" },
   },
-  note: {},
+  note: {
+    reply: { type: "string" },
+    to: { type: "string" },
+  },
   submit: {
     claim: { type: "string" },
     message: { type: "string", short: "m" },
@@ -88,6 +93,7 @@ const COMMAND_OPTIONS: Record<string, OptionSet> = {
   },
   release: {
     handoff: { type: "string" },
+    reason: { type: "string" },
   },
   propose: {
     under: { type: "string" },
@@ -127,9 +133,13 @@ const HEAD_OPTIONS: Record<string, OptionSet> = {
     body: { type: "string" },
     under: { type: "string" },
     points: { type: "string" },
+    paths: { type: "string" },
   },
   decide: {
     reason: { type: "string" },
+  },
+  lead: {
+    revoke: { type: "boolean" },
   },
   rule: {},
   ban: {
@@ -139,6 +149,20 @@ const HEAD_OPTIONS: Record<string, OptionSet> = {
     kind: { type: "string" },
   },
   close: {
+    reason: { type: "string" },
+  },
+};
+
+/** Area leads post tasks and decide proposals inside the areas they lead. */
+const LEAD_OPTIONS: Record<string, OptionSet> = {
+  post: {
+    title: { type: "string" },
+    body: { type: "string" },
+    under: { type: "string" },
+    points: { type: "string" },
+    paths: { type: "string" },
+  },
+  decide: {
     reason: { type: "string" },
   },
 };
@@ -193,16 +217,17 @@ export function parseCli(argv: string[]): ParsedCli {
     return { command: "serve", options: {}, positionals: [], raw: argv.slice(1) };
   }
 
-  if (first === "head") {
+  if (first === "head" || first === "lead") {
+    const table = first === "head" ? HEAD_OPTIONS : LEAD_OPTIONS;
     const action = argv[1];
-    if (action === undefined) return { command: "head", options: {}, positionals: [] };
+    if (action === undefined) return { command: first, options: {}, positionals: [] };
     if (action === "help" || action === "--help" || action === "-h") {
-      return { command: "head", action: "help", options: {}, positionals: argv.slice(2) };
+      return { command: first, action: "help", options: {}, positionals: argv.slice(2) };
     }
-    const spec = HEAD_OPTIONS[action];
-    if (!spec) throw new Error(`unknown head action: ${action} (try "minga head --help")`);
+    const spec = table[action];
+    if (!spec) throw new Error(`unknown ${first} action: ${action} (try "minga ${first} --help")`);
     const { options, positionals } = parseTail(argv.slice(2), spec);
-    return { command: "head", action, options, positionals };
+    return { command: first, action, options, positionals };
   }
 
   const spec = COMMAND_OPTIONS[first];
@@ -315,6 +340,44 @@ export function parseNoteKind(text: string): NoteKind {
   throw new Error(`note kind must be one of ${NOTE_KINDS.join(", ")}, got "${text}"`);
 }
 
+export function parseReleaseReason(text: string): ReleaseReason {
+  if ((RELEASE_REASONS as readonly string[]).includes(text)) return text as ReleaseReason;
+  throw new Error(`release reason must be one of ${RELEASE_REASONS.join(", ")}, got "${text}"`);
+}
+
+/** "a.ts,b/, c.ts" -> ["a.ts", "b/", "c.ts"]; an absent option stays absent. */
+export function parsePaths(text: string): string[] {
+  return text.split(",").map((part) => part.trim()).filter((part) => part.length > 0);
+}
+
+/**
+ * Notices are news the server attaches once to a signed response. They are
+ * always agent-written, hence the explicit label.
+ */
+export function formatNotice(notice: Notice): string {
+  if (notice.kind === "attempt_ended") {
+    const by = notice.closedBy;
+    const who = by
+      ? ` by ${by.submission ?? "a decision"} from ${by.agent}${by.model ? ` (${by.model})` : ""}`
+      : "";
+    const what = notice.reason === "task_closed"
+      ? `${notice.task} was ${notice.taskStatus}${who}`
+      : `ended (${notice.reason})`;
+    return `notice: ${notice.attempt} ended: ${what}; run minga sync, then minga next --wait 600`;
+  }
+  const note = notice.note;
+  const reply = note.replyTo ? ` (reply to ${note.replyTo})` : "";
+  return `notice: note ${note.id} from ${note.agent} on ${note.task}${reply}: [agent note] ${note.text}`;
+}
+
+/** Safe extraction for commands whose data is not guaranteed to carry notices. */
+export function noticeLines(data: unknown): string[] {
+  if (!data || typeof data !== "object") return [];
+  const notices = (data as { notices?: unknown }).notices;
+  if (!Array.isArray(notices)) return [];
+  return notices.filter((n): n is Notice => !!n && typeof n === "object").map(formatNotice);
+}
+
 // ---------------------------------------------------------------- join
 
 export interface JoinInput {
@@ -346,6 +409,7 @@ export async function joinCommand(client: Client, input: JoinInput): Promise<Joi
     harness: input.harness,
   };
   if (input.owner !== undefined) identity.owner = input.owner;
+  if (typeof response.project.check === "string") identity.check = response.project.check;
 
   const lines = [
     `${response.rejoin ? "rejoined" : "joined"} ${response.project.name} as agent ${response.agent}`,
@@ -384,9 +448,14 @@ function formatAssignment(a: Assignment, headAgent?: AgentId): string {
   if (a.path.length > 0) {
     lines.push(`path      ${a.path.map((p) => `${p.id} ${p.title}`).join(" > ")}`);
   }
+  if (a.paths && a.paths.length > 0) lines.push(`paths     ${a.paths.join(", ")}`);
   lines.push("body:", indent(a.task.body.length > 0 ? a.task.body : "(empty)"));
   if (a.handoff) {
     lines.push(`handoff   ${a.handoff.id} ${headMark(a.handoff.agent)}(${a.handoff.kind}) ${a.handoff.text}`);
+  }
+  for (const digest of a.digests ?? []) {
+    lines.push(`digest (agent-written) ${digest.id} by ${headMark(digest.agent)}${digest.agent}:`);
+    lines.push(indent(digest.text));
   }
   if (a.notes.length > 0) {
     lines.push("notes:");
@@ -394,12 +463,24 @@ function formatAssignment(a: Assignment, headAgent?: AgentId): string {
       lines.push(`  ${note.id} ${headMark(note.agent)}${note.agent} ${note.kind}: ${note.text}`);
     }
   }
+  if (a.questions && a.questions.length > 0) {
+    lines.push("questions:");
+    for (const q of a.questions) lines.push(`  ${q.id} ${headMark(q.agent)}${q.agent}: ${q.text}`);
+  }
+  if (a.deadEnds && a.deadEnds.length > 0) {
+    lines.push("dead ends:");
+    for (const d of a.deadEnds) lines.push(`  ${d.id} ${headMark(d.agent)}${d.agent}: ${d.text}`);
+  }
   if (a.others.length > 0) {
     lines.push(`others on this task (the first accepted solve closes it for everyone; submit as soon as minga check passes):`);
     for (const other of a.others) {
       const approach = other.approach.length > 0 ? ` — ${other.approach}` : "";
-      lines.push(`  ${other.attempt} ${other.agent} ${other.model} ${other.role}${approach}`);
+      const paths = other.paths && other.paths.length > 0 ? ` [paths: ${other.paths.join(", ")}]` : "";
+      lines.push(`  ${other.attempt} ${other.agent} ${other.model} ${other.role}${approach}${paths}`);
     }
+  }
+  for (const conflict of a.conflicts ?? []) {
+    lines.push(`conflict: ${conflict.path} also declared by ${conflict.attempt} on ${conflict.task}`);
   }
   return lines.join("\n");
 }
@@ -430,7 +511,10 @@ export async function nextCommand(client: Client, input: NextInput = {}): Promis
     }
     if (response.assignment) {
       let headAgent: AgentId | undefined;
-      if (response.assignment.notes.length > 0 || response.assignment.handoff) {
+      if (response.assignment.notes.length > 0 || response.assignment.handoff
+        || (response.assignment.digests?.length ?? 0) > 0
+        || (response.assignment.questions?.length ?? 0) > 0
+        || (response.assignment.deadEnds?.length ?? 0) > 0) {
         try {
           headAgent = (await client.project()).headAgent;
         } catch {
@@ -631,6 +715,26 @@ export interface BeatInput {
   attempt: string;
   model?: string;
   approach?: string;
+  /** Replace the attempt's declared paths (a pivot) when non-empty. */
+  paths?: string[];
+}
+
+/** News since the previous beat, kept compact so it fits in a terminal. */
+export function renderBeatNews(news: BeatNews): string {
+  const lines: string[] = [];
+  if (news.taskStatus !== "open") lines.push(`task status: ${news.taskStatus}`);
+  for (const note of news.notes) {
+    lines.push(`note ${note.id} (agent-written) ${note.kind}: ${note.text}`);
+  }
+  for (const other of news.others) {
+    const approach = other.approach.length > 0 ? ` — ${other.approach}` : "";
+    const paths = other.paths && other.paths.length > 0 ? ` [paths: ${other.paths.join(", ")}]` : "";
+    lines.push(`other ${other.attempt} ${other.agent} ${other.role}${approach}${paths}`);
+  }
+  for (const c of news.conflicts) {
+    lines.push(`conflict: ${c.path} also declared by ${c.attempt} on ${c.task}`);
+  }
+  return lines.join("\n");
 }
 
 export async function beatCommand(client: Client, input: BeatInput): Promise<CommandResult<BeatResponse>> {
@@ -638,21 +742,37 @@ export async function beatCommand(client: Client, input: BeatInput): Promise<Com
     attempt: input.attempt,
     ...(input.model !== undefined ? { model: input.model } : {}),
     ...(input.approach !== undefined ? { approach: input.approach } : {}),
+    ...(input.paths !== undefined && input.paths.length > 0 ? { paths: input.paths } : {}),
   });
-  return { text: `lease until ${response.leaseUntil}`, data: response };
+  const lines = [`lease until ${response.leaseUntil}`];
+  if (response.news) lines.push(renderBeatNews(response.news));
+  return { text: lines.join("\n"), data: response };
 }
 
 export interface NoteInput {
   task: string;
   kind: NoteKind;
   text: string;
+  replyTo?: string;
+  to?: string;
 }
 
 export async function noteCommand(client: Client, input: NoteInput): Promise<CommandResult<NoteResponse>> {
   if (input.text.trim().length === 0) throw new Error("note needs some text");
-  const response = await client.note({ task: input.task, kind: input.kind, text: input.text });
+  const response = await client.note({
+    task: input.task,
+    kind: input.kind,
+    text: input.text,
+    ...(input.replyTo !== undefined ? { replyTo: input.replyTo } : {}),
+    ...(input.to !== undefined ? { to: input.to } : {}),
+  });
+  const where = [
+    `on ${response.note.task}`,
+    ...(response.note.replyTo !== undefined ? [`reply to ${response.note.replyTo}`] : []),
+    ...(response.note.to !== undefined ? [`to ${response.note.to}`] : []),
+  ].join(", ");
   return {
-    text: `note ${response.note.id} added on ${response.note.task} (${response.note.kind})`,
+    text: `note ${response.note.id} added ${where} (${response.note.kind})`,
     data: response,
   };
 }
@@ -660,16 +780,19 @@ export async function noteCommand(client: Client, input: NoteInput): Promise<Com
 export interface ReleaseInput {
   attempt: string;
   handoff?: string;
+  reason?: ReleaseReason;
 }
 
 export async function releaseCommand(client: Client, input: ReleaseInput): Promise<CommandResult<ReleaseResponse>> {
   const response = await client.release({
     attempt: input.attempt,
     ...(input.handoff !== undefined ? { handoff: input.handoff } : {}),
+    ...(input.reason !== undefined ? { reason: input.reason } : {}),
   });
-  const text = input.handoff !== undefined
-    ? `released ${input.attempt} with a hand-off note`
-    : `released ${input.attempt}`;
+  const text = [
+    input.handoff !== undefined ? `released ${input.attempt} with a hand-off note` : `released ${input.attempt}`,
+    ...(input.reason !== undefined ? [`reason: ${input.reason}`] : []),
+  ].join("\n");
   return { text, data: response };
 }
 
@@ -702,6 +825,14 @@ export async function proposeCommand(client: Client, input: ProposeInput): Promi
     ? `new task under ${input.task ?? "root"}`
     : `impossible ${input.task ?? ""}`.trimEnd();
   const lines = [`proposal ${response.proposal} (${where})`];
+  if (response.duplicateOf) {
+    const duplicate = response.duplicateOf.proposal
+      ? `duplicate of ${response.duplicateOf.proposal} (your vote was recorded)`
+      : response.duplicateOf.task
+        ? `duplicate of open task ${response.duplicateOf.task}`
+        : "duplicate";
+    lines.push(duplicate);
+  }
   if (response.decided) {
     lines.push(`decided: ${response.decided.accepted ? "accepted" : "rejected"} by ${response.decided.by}`);
   }
@@ -915,17 +1046,19 @@ export interface HeadPostInput {
   body: string;
   parent: TaskId | null;
   points?: number;
+  paths?: string[];
 }
 
 export async function headPostCommand(
   client: Client,
   input: HeadPostInput,
-): Promise<CommandResult<{ task: TaskId }>> {
+): Promise<CommandResult<HeadPostResponse>> {
   const response = await client.headPost({
     title: input.title,
     body: input.body,
     parent: input.parent,
     ...(input.points !== undefined ? { points: input.points } : {}),
+    ...(input.paths !== undefined && input.paths.length > 0 ? { paths: input.paths } : {}),
   });
   return { text: `posted task ${response.task}`, data: response };
 }
@@ -1010,4 +1143,55 @@ export async function headCloseCommand(
     ...(input.reason !== undefined ? { reason: input.reason } : {}),
   });
   return { text: `closed ${input.task} as ${input.status}`, data: response };
+}
+
+export interface HeadLeadInput extends HeadLeadRequest {}
+
+/** Grant or revoke an area lead (head only). */
+export async function headLeadCommand(
+  client: Client,
+  input: HeadLeadInput,
+): Promise<CommandResult<HeadLeadResponse>> {
+  const response = await client.headLead(input);
+  return {
+    text: `${input.grant ? "granted" : "revoked"} lead of ${input.area} to ${input.agent}`,
+    data: response,
+  };
+}
+
+/** Area leads post tasks under an area they lead (same body shape as head post). */
+export interface LeadPostInput extends HeadPostInput {}
+
+export async function leadPostCommand(
+  client: Client,
+  input: LeadPostInput,
+): Promise<CommandResult<HeadPostResponse>> {
+  const response = await client.leadPost({
+    title: input.title,
+    body: input.body,
+    parent: input.parent,
+    ...(input.points !== undefined ? { points: input.points } : {}),
+    ...(input.paths !== undefined && input.paths.length > 0 ? { paths: input.paths } : {}),
+  });
+  return { text: `posted task ${response.task}`, data: response };
+}
+
+export interface LeadDecideInput {
+  proposal: ProposalId;
+  accept: boolean;
+  reason?: string;
+}
+
+export async function leadDecideCommand(
+  client: Client,
+  input: LeadDecideInput,
+): Promise<CommandResult<HeadDecideResponse>> {
+  const response = await client.leadDecide({
+    proposal: input.proposal,
+    accept: input.accept,
+    ...(input.reason !== undefined ? { reason: input.reason } : {}),
+  });
+  const lines = [`${input.proposal} ${input.accept ? "accepted" : "rejected"}`];
+  if (response.task !== undefined) lines.push(`task: ${response.task}`);
+  return { text: lines.join("\n"), data: response };
 }

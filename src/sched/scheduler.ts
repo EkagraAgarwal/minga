@@ -32,6 +32,50 @@ function isLive(attempt: AttemptState, nowMs: number, pending: ReadonlySet<Attem
     (Date.parse(attempt.leaseUntil) > nowMs || pending.has(attempt.id));
 }
 
+/** Directory prefixes of a path, each ending in "/"; includes the path itself when it is a directory. */
+function dirPrefixes(path: string): string[] {
+  const prefixes: string[] = [];
+  let slash = path.indexOf("/");
+  while (slash !== -1) {
+    prefixes.push(path.slice(0, slash + 1));
+    slash = path.indexOf("/", slash + 1);
+  }
+  return prefixes;
+}
+
+/** True when a set of task ids holds a task other than `taskId`. */
+function hasForeign(tasks: ReadonlySet<TaskId> | undefined, taskId: TaskId): boolean {
+  if (!tasks) return false;
+  for (const id of tasks) {
+    if (id !== taskId) return true;
+  }
+  return false;
+}
+
+/** True when one of a task's declared paths overlaps a live intent on a different task. */
+function collides(
+  paths: readonly string[], taskId: TaskId,
+  byPath: Map<string, Set<TaskId>>, underDir: Map<string, Set<TaskId>>,
+): boolean {
+  for (const path of paths) {
+    if (hasForeign(byPath.get(path), taskId)) return true;
+    if (path.endsWith("/")) {
+      if (hasForeign(underDir.get(path), taskId)) return true;
+      continue;
+    }
+    for (const prefix of dirPrefixes(path)) {
+      if (hasForeign(byPath.get(prefix), taskId)) return true;
+    }
+  }
+  return false;
+}
+
+/** True when a model of this family recorded a dead end. */
+function familyDeadEnded(models: readonly string[], family: string): boolean {
+  for (const model of models) if (modelFamily(model) === family) return true;
+  return false;
+}
+
 /** Lowercased model name up to its first "-", "/" or ":"; "" maps to "unknown". */
 export const modelFamily: ModelFamily = (model) => {
   const normalized = model.trim().toLowerCase();
@@ -86,10 +130,13 @@ function pickRole(roles: Record<Role, number>, rng: () => number): Role {
  *
  * Candidates: open leaf tasks with room under `rules.width`, excluding tasks
  * the agent already holds live, when the agent is under `maxAttemptsPerAgent`
- * and not banned. Tasks with no prior failure from the agent form the first
- * tier; failed tasks are a fallback only when that tier is empty. Within a
- * tier candidates are scored (same-family avoidance, zero live attempts, age)
- * with a small rng tiebreak.
+ * and not banned. Tasks the agent failed, or for which a model in the agent's
+ * family recorded a dead end, form the fallback tier: they are only offered
+ * when the first tier is empty. Within a tier candidates are scored
+ * (same-family avoidance, zero live attempts, age) with a small rng tiebreak.
+ * A candidate whose declared `paths` overlap a path declared by a live attempt
+ * on a different task loses 3 points, spreading agents working the same files
+ * across tasks; overlap within the same task is deliberate and not penalized.
  */
 export const pickTask: PickTask = (input) => {
   const { state, agent, now } = input;
@@ -125,6 +172,39 @@ export const pickTask: PickTask = (input) => {
     families.add(modelFamily(attempt.model));
   }
 
+  // Live path intents, built once from the index. `liveTasksByPath` holds the
+  // tasks of attempts that declared an exact path; `liveTasksUnderDir` expands
+  // each declared path to its directory prefixes so a directory candidate can
+  // find the file paths living under it. Only live attempts count. Old states
+  // without openByPath skip this entirely.
+  const openByPath = state.index?.openByPath;
+  let liveTasksByPath: Map<string, Set<TaskId>> | undefined;
+  let liveTasksUnderDir: Map<string, Set<TaskId>> | undefined;
+  if (openByPath !== undefined) {
+    liveTasksByPath = new Map<string, Set<TaskId>>();
+    liveTasksUnderDir = new Map<string, Set<TaskId>>();
+    for (const [path, ids] of Object.entries(openByPath)) {
+      for (const id of ids) {
+        const attempt = state.attempts[id];
+        if (!attempt || !isLive(attempt, nowMs, pending)) continue;
+        let exact = liveTasksByPath.get(path);
+        if (!exact) {
+          exact = new Set<TaskId>();
+          liveTasksByPath.set(path, exact);
+        }
+        exact.add(attempt.task);
+        for (const prefix of dirPrefixes(path)) {
+          let under = liveTasksUnderDir.get(prefix);
+          if (!under) {
+            under = new Set<TaskId>();
+            liveTasksUnderDir.set(prefix, under);
+          }
+          under.add(attempt.task);
+        }
+      }
+    }
+  }
+
   const heldTasks = new Set<TaskId>(heldAttempts.map((attempt) => attempt.task));
   const failures = state.index?.failures?.[agent] ?? {};
   const failedTasks = new Set<TaskId>();
@@ -147,8 +227,11 @@ export const pickTask: PickTask = (input) => {
   // agent elsewhere while other open work is available.
   const preferred: TaskState[] = [];
   const fallback: TaskState[] = [];
+  const deadEnds = state.index?.deadEnds;
   for (const task of candidates) {
-    if (failedTasks.has(task.id)) fallback.push(task);
+    const models = deadEnds?.[task.id];
+    const deadEnded = models !== undefined && familyDeadEnded(models, agentFamily);
+    if (failedTasks.has(task.id) || deadEnded) fallback.push(task);
     else preferred.push(task);
   }
   const tier = preferred.length > 0 ? preferred : fallback;
@@ -176,6 +259,10 @@ export const pickTask: PickTask = (input) => {
     if (Number.isFinite(postedAt) && Number.isFinite(oldest) && Number.isFinite(newest)) {
       score += ageSpan > 0 ? (newest - postedAt) / ageSpan : 1;
     }
+
+    // Cross-task file-intent collisions cost 3 points; same-task overlap is fine.
+    if (liveTasksByPath && liveTasksUnderDir && task.paths !== undefined
+      && collides(task.paths, task.id, liveTasksByPath, liveTasksUnderDir)) score -= 3;
 
     score += rng() * 0.5;
 

@@ -16,18 +16,19 @@ import { mkdirSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { join as pathJoin } from "node:path";
 import type { BranchHead, ChangedPaths, CheckPool, CheckResult, CommitAccepted, EventStore } from "../core/contracts.ts";
 import type {
-  Assignment, AttemptView, BeatRequest, ErrorBody, EventsResponse, HeadBanRequest, HeadCloseRequest, HeadDecideRequest, HeadNoteRequest,
+  Assignment, AttemptView, BeatNews, BeatRequest, ErrorBody, EventsResponse, HeadBanRequest, HeadCloseRequest, HeadDecideRequest, HeadNoteRequest,
   HeadPostRequest, HeadRuleRequest, JoinRequest, JoinResponse, MetricsResponse, NextRequest, NextResponse,
-  NoteRequest, ProjectInfo, ProposeRequest, ReleaseRequest, SubmissionView, SubmitRequest, SubmitResponse, TasksResponse,
+  NoteRequest, PathConflict, ProjectInfo, ProposeRequest, ReleaseRequest, SubmissionView, SubmitRequest, SubmitResponse, TasksResponse,
   VoteRequest,
 } from "../core/protocol.ts";
 import {
-  CLOSED_STATUSES, NOTE_KINDS, ROLES,
+  CLOSED_STATUSES, NOTE_KINDS, RELEASE_REASONS, ROLES,
   type AgentId, type AttemptEndReason, type AttemptId, type Claim, type MingaEvent, type NewEvent,
-  type ProjectConfig, type ProposalId, type Rules, type State, type SubmissionId, type SubmissionState, type TaskId,
+  type NoteId, type NoteState, type ProjectConfig, type ProposalId, type ReleaseReason, type Rules, type State, type SubmissionId, type SubmissionState, type TaskId,
 } from "../core/types.ts";
 import { agentIdFromPublicKey, parseHeadKey } from "../identity/keys.ts";
 import { agentLiveAttempts, computeLeaderboard, initialState, isLive, liveAttempts, nextId, reduce } from "../log/reducer.ts";
+import { closedByOf, Notices } from "./notices.ts";
 import { buildView } from "../log/view.ts";
 import { pathAllowed, parseAcceptPolicy } from "../project/config.ts";
 import { decideByVotes, expiredAttempts, pickTask } from "../sched/scheduler.ts";
@@ -60,6 +61,10 @@ export interface AppDeps {
 const MAX_BODY = 3 * 1024 * 1024;
 const MAX_FILES_BYTES = 2 * 1024 * 1024;
 const NOTE_MAX = 4000;
+const DIGEST_MAX = 1500;
+/** Declared path intents on a task/attempt/beat. */
+const INTENT_MAX = 300;
+const MAX_INTENTS = 50;
 const MAX_WAIT_SECONDS = 30;
 /** SSE frames a slow viewer may fall behind before it is disconnected (it reconnects with Last-Event-ID). */
 const MAX_STREAM_BACKLOG = 2000;
@@ -117,6 +122,9 @@ export function createApp(deps: AppDeps) {
     return stored;
   }
 
+  /** Pending notices and accepted-work knowledge live in memory, not in state. */
+  const notices = new Notices(state, emit);
+
   // Seed tasks from project.toml the first time this project starts.
   if (!Object.keys(state.tasks).length && cfg.seedTasks.length) {
     const byKey = new Map<string, TaskId>();
@@ -125,6 +133,7 @@ export function createApp(deps: AppDeps) {
       emit({ type: "task.posted", actor: "server", data: {
         task: id, title: s.title, body: s.body, parent: s.under ? byKey.get(s.under) ?? null : null,
         points: s.points ?? state.rules.defaultPoints, by: "config",
+        ...(s.paths ? { paths: [...s.paths] } : {}),
       } });
       if (s.key) byKey.set(s.key, id);
     }
@@ -156,6 +165,91 @@ export function createApp(deps: AppDeps) {
     return Math.min(MAX_WAIT_SECONDS, n);
   }
 
+  /** A repo-relative file path or directory prefix (trailing "/") an attempt expects to touch. */
+  function intentPath(v: unknown, label: string): string {
+    const s = str(v, label, INTENT_MAX);
+    if (s.startsWith("/")) throw new HttpError(400, `${label} must be repo-relative (no leading "/")`);
+    if (s.includes("\\")) throw new HttpError(400, `${label} must not contain a backslash`);
+    const segments = (s.endsWith("/") ? s.slice(0, -1) : s).split("/");
+    if (segments.some((seg) => seg === "" || seg === "." || seg === "..")) {
+      throw new HttpError(400, `${label} must be a normalized repo-relative path`);
+    }
+    return s;
+  }
+
+  function intentPaths(v: unknown): string[] | undefined {
+    if (v === undefined) return undefined;
+    if (!Array.isArray(v)) throw new HttpError(400, "paths must be an array");
+    if (v.length > MAX_INTENTS) throw new HttpError(400, `paths must have at most ${MAX_INTENTS} entries`);
+    return v.map((p, i) => intentPath(p, `paths[${i}]`));
+  }
+
+
+  /**
+   * Live attempts on other tasks whose declared paths overlap this attempt's. File intents are
+   * index lookups (the exact path and each of its directory prefixes); only a directory intent
+   * scans the path index for keys under it. Beat is the hottest route, so this stays cheap.
+   */
+  function pathConflicts(attempt: AttemptId): PathConflict[] {
+    const at = state.attempts[attempt];
+    const mine = at?.paths ?? [];
+    const out: PathConflict[] = [];
+    if (!at || !mine.length) return out;
+    const open = state.index.openByPath ?? {};
+    const seen = new Set<string>();
+    const t = now();
+    const consider = (p: string, key: string): boolean => {
+      for (const id of open[key] ?? []) {
+        const pair = `${p}|${id}`;
+        if (id === attempt || seen.has(pair)) continue;
+        const other = state.attempts[id];
+        if (!other || other.task === at.task || !isLive(state, id, t)) continue;
+        seen.add(pair);
+        out.push({ path: p, task: other.task, attempt: id, agent: other.agent });
+        if (out.length >= 20) return true;
+      }
+      return false;
+    };
+    for (const p of mine) {
+      if (consider(p, p)) return out;
+      for (let i = p.indexOf("/"); i !== -1 && i < p.length - 1; i = p.indexOf("/", i + 1)) {
+        if (consider(p, p.slice(0, i + 1))) return out;
+      }
+      if (p.endsWith("/")) {
+        for (const key in open) {
+          if (key !== p && key.startsWith(p) && consider(p, key)) return out;
+        }
+      }
+    }
+    return out;
+  }
+
+  /** Current live attempts on a task, except one, with their live approach and paths. */
+  function othersFor(task: TaskId, except: AttemptId) {
+    return liveAttempts(state, task, now()).filter((x) => x !== except).map((x) => {
+      const o = state.attempts[x]!;
+      return {
+        attempt: o.id, agent: o.agent, model: o.model, role: o.role, approach: o.approach,
+        ...(o.paths ? { paths: o.paths } : {}),
+      };
+    });
+  }
+
+  /** Only the head, a lead of this task or an ancestor, or accepted work here may pin a digest. */
+  function canDigest(agent: AgentId, task: TaskId): boolean {
+    if (agent === headId) return true;
+    const areas = state.index.leadAreas?.[agent] ?? [];
+    for (let id: TaskId | undefined = task; id; id = state.tasks[id]?.parent ?? undefined) {
+      if (areas.includes(id)) return true;
+    }
+    return notices.hasAcceptedWork(task, agent);
+  }
+
+  function withNotices(agent: AgentId, path: string, out: unknown): unknown {
+    const pending = notices.pending(agent, path.slice("/api/".length));
+    return pending ? { ...(out as object), notices: pending } : out;
+  }
+
   function agentOrThrow(id: AgentId) {
     const a = state.agents[id];
     if (!a) throw new HttpError(401, "unknown agent", "run join first");
@@ -167,13 +261,14 @@ export function createApp(deps: AppDeps) {
     return state.index.pendingSubmissions.find((s) => state.submissions[s]?.attempt === attempt);
   }
 
-  function ownLiveAttempt(agent: AgentId, attempt: unknown): AttemptId {
+  function ownLiveAttempt(agent: AgentId, attempt: unknown, via: string): AttemptId {
     const id = str(attempt, "attempt", 32);
     const at = state.attempts[id];
     if (!at || at.agent !== agent) throw new HttpError(404, `no attempt ${id} for this agent`);
     if (at.endedAt) {
       if (at.endReason === "task_closed") {
-        const by = closedByOf(at.task);
+        notices.markNotified(id, agent, via); // the 410 error already tells the agent
+        const by = closedByOf(state, at.task);
         const who = by ? ` by ${by.submission ?? "a decision"} from ${by.agent}${by.model ? ` (${by.model})` : ""}` : "";
         throw new HttpError(410, `attempt ${id} ended: ${at.task} was ${state.tasks[at.task]?.status ?? "closed"}${who} while you worked`,
           "keep your files aside with: minga sync --discard (moves them to .minga/stash/), then: minga next --wait 600");
@@ -182,19 +277,6 @@ export function createApp(deps: AppDeps) {
     }
     if (!isLive(state, id, now())) throw new HttpError(410, `attempt ${id} lease expired`, "run next to get a new assignment");
     return id;
-  }
-
-  /** Who closed a task: the accepted submission when there is one, else the closing agent. */
-  function closedByOf(task: TaskId): AttemptView["closedBy"] {
-    const t = state.tasks[task];
-    if (!t || t.status === "open") return undefined;
-    for (let i = t.attempts.length - 1; i >= 0; i--) {
-      const at = state.attempts[t.attempts[i]!];
-      if (!at) continue;
-      const sub = Object.values(state.submissions).find((s) => s.attempt === at.id && s.status === "accepted");
-      if (sub) return { agent: sub.agent, model: sub.model, submission: sub.id };
-    }
-    return t.closedBy ? { agent: t.closedBy } : undefined;
   }
 
   function attemptView(id: string): AttemptView {
@@ -207,7 +289,7 @@ export function createApp(deps: AppDeps) {
       leaseUntil: at.leaseUntil, taskStatus: task?.status ?? "open",
     };
     if (at.endedAt) { view.endedAt = at.endedAt; if (at.endReason) view.endReason = at.endReason; }
-    const by = closedByOf(at.task);
+    const by = closedByOf(state, at.task);
     if (by) view.closedBy = by;
     return view;
   }
@@ -256,8 +338,11 @@ export function createApp(deps: AppDeps) {
     if (!pick) return null;
     const attempt = nextId(state, "attempt");
     const until = leaseUntil();
-    emit({ type: "attempt.started", actor: agent, data: { attempt, task: pick.task, agent, role: pick.role, approach, model, leaseUntil: until } });
     const t = state.tasks[pick.task]!;
+    emit({ type: "attempt.started", actor: agent, data: {
+      attempt, task: pick.task, agent, role: pick.role, approach, model, leaseUntil: until,
+      ...(t.paths ? { paths: [...t.paths] } : {}),
+    } });
     const path: { id: TaskId; title: string }[] = [];
     for (let p = t.parent; p; p = state.tasks[p]?.parent ?? null) {
       const pt = state.tasks[p];
@@ -266,15 +351,53 @@ export function createApp(deps: AppDeps) {
     }
     const notes = t.notes.slice(0, 10).map((n) => state.notes[n]!).filter(Boolean);
     const handoffId = t.notes.find((n) => state.notes[n]?.kind === "handoff");
-    const others = liveAttempts(state, t.id, now()).filter((x) => x !== attempt).map((x) => {
-      const o = state.attempts[x]!;
-      return { attempt: o.id, agent: o.agent, model: o.model, role: o.role, approach: o.approach };
-    });
+    const others = othersFor(t.id, attempt);
+    const conflicts = pathConflicts(attempt);
+
+    // Newest digest of the task, then of each ancestor area (nearest first).
+    const digests: NoteState[] = [];
+    for (let id: TaskId | undefined = t.id; id; id = state.tasks[id]?.parent ?? undefined) {
+      const n = state.index.digests?.[id];
+      const note = n ? state.notes[n] : undefined;
+      if (note) digests.push(note);
+    }
+
+    // Open questions on this task and its siblings, oldest first.
+    const questionIds: NoteId[] = [];
+    const addQuestions = (id: TaskId) => {
+      for (const n of state.index.openQuestions?.[id] ?? []) {
+        if (!questionIds.includes(n)) questionIds.push(n);
+      }
+    };
+    addQuestions(t.id);
+    if (t.parent) {
+      for (const sib of state.tasks[t.parent]?.children ?? []) {
+        if (sib !== t.id) addQuestions(sib);
+      }
+    }
+    const questions = questionIds
+      .map((n) => state.notes[n])
+      .filter((n): n is NoteState => !!n)
+      .sort((a, b) => Date.parse(a.at) - Date.parse(b.at))
+      .slice(0, 5);
+
+    // Newest dead_end notes on the task, looking at no more than 50 notes.
+    const deadEnds: NoteState[] = [];
+    for (let i = 0; i < t.notes.length && i < 50 && deadEnds.length < 5; i++) {
+      const n = state.notes[t.notes[i]!];
+      if (n?.kind === "dead_end") deadEnds.push(n);
+    }
+
     return {
       attempt, role: pick.role, leaseUntil: until,
       ...(branchTip ? { head: branchTip } : {}),
       task: { id: t.id, title: t.title, body: t.body, parent: t.parent, points: t.points },
       path, notes, others, ...(handoffId ? { handoff: state.notes[handoffId]! } : {}),
+      ...(t.paths?.length ? { paths: [...t.paths] } : {}),
+      ...(conflicts.length ? { conflicts } : {}),
+      ...(digests.length ? { digests } : {}),
+      ...(questions.length ? { questions } : {}),
+      ...(deadEnds.length ? { deadEnds } : {}),
     };
   }
 
@@ -363,11 +486,36 @@ export function createApp(deps: AppDeps) {
 
   function beat(agent: AgentId, b: BeatRequest) {
     agentOrThrow(agent);
-    const attempt = ownLiveAttempt(agent, b.attempt);
+    const attempt = ownLiveAttempt(agent, b.attempt, "beat");
     const model = b.model === undefined ? undefined : str(b.model, "model", 80);
+    const approach = b.approach === undefined ? undefined : str(b.approach, "approach", 300, { optional: true });
+    const paths = intentPaths(b.paths);
+    // Snapshot the previous beat before the event moves it.
+    const since = state.attempts[attempt]!.lastBeatAt;
     const until = leaseUntil();
-    emit({ type: "attempt.beat", actor: agent, data: { attempt, leaseUntil: until, ...(model ? { model } : {}) } });
-    return { leaseUntil: until };
+    emit({ type: "attempt.beat", actor: agent, data: {
+      attempt, leaseUntil: until,
+      ...(model ? { model } : {}),
+      ...(approach !== undefined ? { approach } : {}),
+      ...(paths !== undefined ? { paths } : {}),
+    } });
+    const at = state.attempts[attempt]!;
+    const t = state.tasks[at.task]!;
+    const notes: NoteState[] = [];
+    for (const id of t.notes) {
+      const n = state.notes[id];
+      if (!n) continue;
+      if (Date.parse(n.at) <= Date.parse(since)) break;
+      notes.push(n);
+      if (notes.length >= 20) break;
+    }
+    const news: BeatNews = {
+      taskStatus: t.status,
+      notes,
+      others: othersFor(t.id, attempt),
+      conflicts: pathConflicts(attempt),
+    };
+    return { leaseUntil: until, news };
   }
 
   function note(agent: AgentId, b: NoteRequest) {
@@ -375,9 +523,27 @@ export function createApp(deps: AppDeps) {
     const task = str(b.task, "task", 32);
     if (!state.tasks[task]) throw new HttpError(404, `no task ${task}`);
     if (!NOTE_KINDS.includes(b.kind)) throw new HttpError(400, `kind must be one of ${NOTE_KINDS.join(", ")}`);
-    const text = str(b.text, "text", NOTE_MAX);
+    const kind = b.kind;
+    const text = str(b.text, "text", kind === "digest" ? DIGEST_MAX : NOTE_MAX);
+    let replyTo: NoteId | undefined;
+    if (b.replyTo !== undefined) {
+      replyTo = str(b.replyTo, "replyTo", 32);
+      if (!state.notes[replyTo]) throw new HttpError(400, `replyTo ${replyTo} is not an existing note`);
+    }
+    let to: AgentId | undefined;
+    if (b.to !== undefined) {
+      to = str(b.to, "to", 16);
+      if (!state.agents[to]) throw new HttpError(404, `no agent ${to}`);
+    }
+    if (kind === "digest" && !canDigest(agent, task)) {
+      throw new HttpError(403, "only the head, a lead of this area, or an agent with accepted work here may post a digest");
+    }
     const id = nextId(state, "note");
-    emit({ type: "note.added", actor: agent, data: { note: id, task, agent, kind: b.kind, text } });
+    emit({ type: "note.added", actor: agent, data: {
+      note: id, task, agent, kind, text,
+      ...(replyTo ? { replyTo } : {}),
+      ...(to ? { to } : {}),
+    } });
     return { note: state.notes[id]! };
   }
 
@@ -386,7 +552,7 @@ export function createApp(deps: AppDeps) {
 
   function submit(agent: AgentId, b: SubmitRequest): SubmitResponse {
     agentOrThrow(agent);
-    const attempt = ownLiveAttempt(agent, b.attempt);
+    const attempt = ownLiveAttempt(agent, b.attempt, "submit");
     const waiting = pendingFor(attempt);
     if (waiting) throw new HttpError(409, `attempt ${attempt} already has ${waiting} in the queue`, `wait for it: GET /api/submission/${waiting}?wait=30`);
     const at = state.attempts[attempt]!;
@@ -512,6 +678,7 @@ export function createApp(deps: AppDeps) {
     } });
     rmSync(fileOf(id), { force: true });
     if (ok) {
+      notices.recordAccepted(s.task, s.agent);
       endAttempts([s.attempt], "submitted");
       if (s.claim !== "progress" && state.tasks[s.task]!.status === "open") {
         closeTask(s.task, s.claim === "solves" ? "solved" : "refuted", { agent: s.agent, submission: id }, s.agent);
@@ -553,15 +720,20 @@ export function createApp(deps: AppDeps) {
 
   function release(agent: AgentId, b: ReleaseRequest) {
     agentOrThrow(agent);
-    const attempt = ownLiveAttempt(agent, b.attempt);
+    const attempt = ownLiveAttempt(agent, b.attempt, "release");
     const waiting = pendingFor(attempt);
     if (waiting) throw new HttpError(409, `attempt ${attempt} has ${waiting} in the queue`, "wait for the verdict first");
     const handoff = str(b.handoff, "handoff", NOTE_MAX, { optional: true });
+    let why: ReleaseReason | undefined;
+    if (b.reason !== undefined) {
+      if (!RELEASE_REASONS.includes(b.reason)) throw new HttpError(400, `reason must be one of ${RELEASE_REASONS.join(", ")}`);
+      why = b.reason;
+    }
     if (handoff.trim()) {
       const id = nextId(state, "note");
       emit({ type: "note.added", actor: agent, data: { note: id, task: state.attempts[attempt]!.task, agent, kind: "handoff", text: handoff } });
     }
-    emit({ type: "attempt.ended", actor: agent, data: { attempt, reason: "released" } });
+    emit({ type: "attempt.ended", actor: agent, data: { attempt, reason: "released", ...(why ? { why } : {}) } });
     return { ok: true as const };
   }
 
@@ -613,8 +785,12 @@ export function createApp(deps: AppDeps) {
     if (parent && !state.tasks[parent]) throw new HttpError(404, `no task ${parent}`);
     const points = b.points ?? state.rules.defaultPoints;
     if (!Number.isInteger(points) || points < 0) throw new HttpError(400, "points must be an integer >= 0");
+    const paths = intentPaths(b.paths);
     const id = nextId(state, "task");
-    emit({ type: "task.posted", actor: headId, data: { task: id, title, body, parent, points, by: "head" } });
+    emit({ type: "task.posted", actor: headId, data: {
+      task: id, title, body, parent, points, by: "head",
+      ...(paths !== undefined ? { paths } : {}),
+    } });
     return { task: id };
   }
 
@@ -671,7 +847,10 @@ export function createApp(deps: AppDeps) {
     const kind = b.kind ?? "result";
     if (!NOTE_KINDS.includes(kind)) throw new HttpError(400, `kind must be one of ${NOTE_KINDS.join(", ")}`);
     const id = nextId(state, "note");
-    emit({ type: "note.added", actor: headId, data: { note: id, task, agent: headId, kind, text: str(b.text, "text", NOTE_MAX) } });
+    emit({ type: "note.added", actor: headId, data: {
+      note: id, task, agent: headId, kind,
+      text: str(b.text, "text", kind === "digest" ? DIGEST_MAX : NOTE_MAX),
+    } });
     return { note: state.notes[id]! };
   }
 
@@ -822,7 +1001,7 @@ export function createApp(deps: AppDeps) {
     const s = signed[path];
     if (!s) return fail(404, "not found");
     const out = await s(agent, body, req.signal);
-    return json(out, path === "/api/submit" ? 202 : 200);
+    return json(withNotices(agent, path, out), path === "/api/submit" ? 202 : 200);
   }
 
   /** `ip` is the client address (Bun: server.requestIP(req)?.address); used for the join limit. */

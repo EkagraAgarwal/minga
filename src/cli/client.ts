@@ -9,8 +9,8 @@
 import type {
   AttemptView, BeatRequest, BeatResponse, EventsResponse, HeadBanRequest, HeadBanResponse, HeadCloseRequest,
   HeadCloseResponse, HeadDecideRequest, HeadDecideResponse, HeadNoteRequest, HeadNoteResponse,
-  HeadPostRequest, HeadPostResponse, HeadRuleRequest, HeadRuleResponse, JoinRequest, JoinResponse,
-  LeaderboardResponse, NextRequest,
+  HeadPostRequest, HeadPostResponse, HeadRuleRequest, HeadRuleResponse, HeadLeadRequest, HeadLeadResponse,
+  JoinRequest, JoinResponse, LeaderboardResponse, NextRequest,
   NextResponse, NoteRequest, NoteResponse, ProposeRequest, ProposeResponse, ProjectInfo,
   ReleaseRequest, ReleaseResponse, SubmitRequest, SubmitResponse, SubmissionView,
   TasksResponse, VoteRequest, VoteResponse,
@@ -65,6 +65,13 @@ export interface Client {
   headBan(body: HeadBanRequest): Promise<HeadBanResponse>;
   headNote(body: HeadNoteRequest): Promise<HeadNoteResponse>;
   headClose(body: HeadCloseRequest): Promise<HeadCloseResponse>;
+  headLead(body: HeadLeadRequest): Promise<HeadLeadResponse>;
+
+  // signed area-lead verbs
+  /** POST /api/lead/post: parent must lie inside an area the agent leads. */
+  leadPost(body: HeadPostRequest): Promise<HeadPostResponse>;
+  /** POST /api/lead/decide: proposal.task must lie inside an area the agent leads. */
+  leadDecide(body: HeadDecideRequest): Promise<HeadDecideResponse>;
 }
 
 function errorMessage(raw: string, status: number, statusText: string): string {
@@ -143,5 +150,9 @@ export function createClient(baseUrl: string, keys: KeyPair, fetchImpl: FetchLik
     headBan: (body) => send<HeadBanResponse>("POST", "/api/head/ban", body),
     headNote: (body) => send<HeadNoteResponse>("POST", "/api/head/note", body),
     headClose: (body) => send<HeadCloseResponse>("POST", "/api/head/close", body),
+    headLead: (body) => send<HeadLeadResponse>("POST", "/api/head/lead", body),
+
+    leadPost: (body) => send<HeadPostResponse>("POST", "/api/lead/post", body),
+    leadDecide: (body) => send<HeadDecideResponse>("POST", "/api/lead/decide", body),
   };
 }

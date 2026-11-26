@@ -165,8 +165,13 @@ export const buildView: BuildView = (input: ViewInput): ViewResponse => {
   let accepted = 0;
   for (const agent of Object.values(state.agents)) accepted += agent.accepted;
 
+  const leads = state.leads;
+  const hasLeads = leads !== undefined && Object.keys(leads).length > 0;
+
   return {
     project,
+    ...(input.coordination !== undefined ? { coordination: input.coordination } : {}),
+    ...(hasLeads ? { leads } : {}),
     seq: state.seq,
     now: input.now.toISOString(),
     totals: {
