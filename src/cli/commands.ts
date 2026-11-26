@@ -11,7 +11,7 @@ import { parseArgs } from "node:util";
 import type {
   Assignment, BeatResponse, JoinResponse, LeaderboardResponse, NextResponse, NoteResponse,
   ProposeResponse, ProjectInfo, ReleaseResponse, SubmitResponse, SubmissionView, VoteResponse,
-  HeadDecideResponse, HeadRuleResponse, TasksResponse,
+  HeadDecideResponse, HeadNoteResponse, HeadRuleResponse, TasksResponse,
 } from "../core/protocol.ts";
 import type {
   AcceptPolicy, AgentId, Claim, NoteKind, ProposalId, ProposalKind, Rules, TaskId,
@@ -103,6 +103,9 @@ const COMMAND_OPTIONS: Record<string, OptionSet> = {
   doctor: {
     repo: { type: "string" },
   },
+  sync: {
+    discard: { type: "boolean" },
+  },
   mcp: {},
 };
 
@@ -120,6 +123,9 @@ const HEAD_OPTIONS: Record<string, OptionSet> = {
   rule: {},
   ban: {
     reason: { type: "string" },
+  },
+  note: {
+    kind: { type: "string" },
   },
   close: {
     reason: { type: "string" },
@@ -353,12 +359,15 @@ export interface NextInput {
   onProgress?: (line: string) => void;
 }
 
-function formatAssignment(a: Assignment): string {
+/** `headAgent` marks maintainer notes so agents can tell them from peer notes. */
+function formatAssignment(a: Assignment, headAgent?: AgentId): string {
+  const headMark = (agent: AgentId): string =>
+    headAgent !== undefined && agent === headAgent ? "head: " : "";
   const lines = [
     `attempt   ${a.attempt}`,
     `role      ${a.role}`,
     `lease     ${a.leaseUntil}`,
-    ...(a.head ? [`head ${a.head.slice(0, 7)} (git pull if your checkout is older)`] : []),
+    ...(a.head ? [`head ${a.head.slice(0, 7)} (minga sync if your checkout is older)`] : []),
     `task      ${a.task.id}  ${a.task.title}  (${a.task.points} points)`,
   ];
   if (a.path.length > 0) {
@@ -366,11 +375,13 @@ function formatAssignment(a: Assignment): string {
   }
   lines.push("body:", indent(a.task.body.length > 0 ? a.task.body : "(empty)"));
   if (a.handoff) {
-    lines.push(`handoff   ${a.handoff.id} (${a.handoff.kind}) ${a.handoff.text}`);
+    lines.push(`handoff   ${a.handoff.id} ${headMark(a.handoff.agent)}(${a.handoff.kind}) ${a.handoff.text}`);
   }
   if (a.notes.length > 0) {
     lines.push("notes:");
-    for (const note of a.notes) lines.push(`  ${note.id} ${note.agent} ${note.kind}: ${note.text}`);
+    for (const note of a.notes) {
+      lines.push(`  ${note.id} ${headMark(note.agent)}${note.agent} ${note.kind}: ${note.text}`);
+    }
   }
   if (a.others.length > 0) {
     lines.push("others on this task:");
@@ -406,7 +417,17 @@ export async function nextCommand(client: Client, input: NextInput = {}): Promis
     if (response.done === true) {
       return { text: "the project has no open tasks left. Stop here.", data: response };
     }
-    if (response.assignment) return { text: formatAssignment(response.assignment), data: response };
+    if (response.assignment) {
+      let headAgent: AgentId | undefined;
+      if (response.assignment.notes.length > 0 || response.assignment.handoff) {
+        try {
+          headAgent = (await client.project()).headAgent;
+        } catch {
+          // An unavailable project endpoint must not hide the assignment.
+        }
+      }
+      return { text: formatAssignment(response.assignment, headAgent), data: response };
+    }
     last = response;
     if (chunk > 0) {
       const left = Math.max(0, Math.ceil(total - (Date.now() - started) / 1000));
@@ -433,6 +454,18 @@ export async function nextCommand(client: Client, input: NextInput = {}): Promis
 }
 
 // ---------------------------------------------------------------- submit / result
+
+/** The server keeps only the first line, max 200 chars; fit it before sending. */
+export const SUBMIT_MESSAGE_MAX = 200;
+
+export function fitSubmitMessage(message: string): { message: string; notice?: string } {
+  if (message.length <= SUBMIT_MESSAGE_MAX) return { message };
+  const first = message.split("\n")[0] ?? "";
+  const fitted = first.length > SUBMIT_MESSAGE_MAX
+    ? `${first.slice(0, SUBMIT_MESSAGE_MAX - 3)}...`
+    : first;
+  return { message: fitted, notice: `submit message over ${SUBMIT_MESSAGE_MAX} chars; using "${fitted}"` };
+}
 
 export interface SubmitInput {
   attempt: string;
@@ -532,7 +565,7 @@ export function renderSubmission(view: SubmitView): string {
   if (view.commit !== undefined) lines.push(`commit: ${view.commit}`);
   lines.push(`points: ${view.points}`);
   if (view.status === "accepted") {
-    lines.push("next: minga next --wait 600");
+    lines.push("next: minga sync && minga next --wait 600");
   } else if (view.status === "rejected") {
     lines.push(`next: fix and run "minga submit ${attempt} ..." again, or ` +
       `"minga release ${attempt} --handoff \\"...\\""`);
@@ -763,6 +796,19 @@ export function tasksCommand(client: Client, input: TasksInput = {}): Promise<Co
   return client.tasks().then((overview) => ({ text: renderTasks(overview, input), data: overview }));
 }
 
+/** One task line: status first, `N live` only when the task is actually open. */
+export function renderTaskLine(
+  task: TasksResponse["tasks"][number],
+  depth = 0,
+  area = false,
+): string {
+  const status = task.status === "open" && task.live > 0
+    ? `open · ${task.live} live`
+    : task.status;
+  const line = `${task.id}  ${status.padEnd(10)}  ${task.points} pts  ${task.title}${area ? " [area]" : ""}`;
+  return `${"  ".repeat(depth)}${line}`;
+}
+
 export function renderTasks(overview: TasksResponse, input: TasksInput = {}): string {
   const byId = new Map(overview.tasks.map((t) => [t.id, t]));
   const children = new Map<string | null, typeof overview.tasks>();
@@ -780,9 +826,7 @@ export function renderTasks(overview: TasksResponse, input: TasksInput = {}): st
       if (seen.has(t.id)) continue;
       seen.add(t.id);
       if (!input.openOnly || t.status === "open") {
-        const area = byId.get(t.id)?.leaf === false ? " [area]" : "";
-        const line = `${t.id}  ${t.status.padEnd(6)} ${t.live} live  ${t.points} pts  ${t.title}${area}`;
-        lines.push(`${"  ".repeat(depth)}${line}`);
+        lines.push(renderTaskLine(t, depth, byId.get(t.id)?.leaf === false));
       }
       visit(t.id, depth + 1);
     }
@@ -793,8 +837,7 @@ export function renderTasks(overview: TasksResponse, input: TasksInput = {}): st
     if (!seen.has(t.id)) {
       seen.add(t.id);
       if (!input.openOnly || t.status === "open") {
-        const area = t.leaf ? "" : " [area]";
-        lines.push(`${t.id}  ${t.status.padEnd(6)} ${t.live} live  ${t.points} pts  ${t.title}${area}`);
+        lines.push(renderTaskLine(t, 0, !t.leaf));
       }
     }
   }
@@ -893,6 +936,28 @@ export async function headBanCommand(
   if (input.reason.trim().length === 0) throw new Error("head ban needs --reason");
   const response = await client.headBan({ agent: input.agent, reason: input.reason });
   return { text: `banned ${input.agent}`, data: response };
+}
+
+export interface HeadNoteInput {
+  task: TaskId;
+  text: string;
+  kind?: NoteKind;
+}
+
+/** Leaves a note as the head; defaults to the server's `result` kind. */
+export async function headNoteCommand(
+  client: Client,
+  input: HeadNoteInput,
+): Promise<CommandResult<HeadNoteResponse>> {
+  const response = await client.headNote({
+    task: input.task,
+    text: input.text,
+    ...(input.kind !== undefined ? { kind: input.kind } : {}),
+  });
+  return {
+    text: `note ${response.note.id} on ${input.task} (${response.note.kind})`,
+    data: response,
+  };
 }
 
 export interface HeadCloseInput {

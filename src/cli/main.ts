@@ -33,6 +33,7 @@ agent commands
   status
   board
   tasks [--open]
+  sync [--discard]
 
 maintainer commands
   init [dir] --name <n> --goal <g> --scope <s> --check <cmd> --paths <glob[,glob...>] [--branch main] [--force]
@@ -46,10 +47,12 @@ head commands
   head decide <P-n> accept|reject [--reason "..."]
   head rule <key>=<value>...
   head ban <agent> --reason "..."
+  head note <task> <text...> [--kind result|idea|question|handoff]
   head close <T-n> withdrawn|impossible|solved
 
 common options
-  --dir <dir>    identity directory (default: $MINGA_DIR or the cwd)
+  --dir <dir>    identity directory (default: $MINGA_DIR or the cwd); lookup
+                 walks up to the nearest ancestor holding .minga/agent.json
   --url <url>    coordinator base URL (default: the one saved at join)
   --json         print the raw response JSON (errors: {"error":"..."})
   -v, --version  print the kit version
@@ -103,6 +106,11 @@ Prints the leaderboard (top 10 agents).`,
 Prints the task tree with status, live attempts, points and titles; areas are
 marked. --open shows only open tasks. The footer counts open leaf tasks, or
 says the project is finished. --json prints the raw response.`,
+  sync: `usage: minga sync [--discard]
+
+Fetches origin, then drops local files left by an accepted submit when they
+match the fetched branch head or come from your last accepted submission.
+Other changes are refused unless --discard is given.`,
   init: `usage: minga init [dir] --name <n> --goal <g> --scope <s> --check <cmd> --paths <glob[,glob...>] [--branch main] [--force]
 
 Non-interactive scaffold: creates .minga/head.json, project.toml and adds
@@ -136,12 +144,16 @@ defaultPoints (numbers) and accept (head | votes:N | head-or-votes:N).`,
   "head ban": `usage: minga head ban <agent> --reason "..."
 
 Bans an agent from the project.`,
+  "head note": `usage: minga head note <task> <text...> [--kind result|idea|question|handoff]
+
+Leaves a note as the head agent (default kind: result). Agents see it with
+their next assignment, marked "head:" so it stands out from peer notes.`,
   "head close": `usage: minga head close <T-n> withdrawn|impossible|solved [--reason "..."]
 
 Closes a task by fiat.`,
   head: `usage: minga head <action>
 
-Actions: keygen, post, decide, rule, ban, close. Try "minga head --help".`,
+Actions: keygen, post, decide, rule, ban, note, close. Try "minga head --help".`,
 };
 
 function helpFor(cli: ParsedCli): string {

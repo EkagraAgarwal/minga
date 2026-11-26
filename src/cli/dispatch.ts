@@ -7,17 +7,20 @@ import type { FetchLike } from "./client.ts";
 import { createClient } from "./client.ts";
 import type { Client } from "./client.ts";
 import {
-  beatCommand, boardCommand, headBanCommand, headCloseCommand, headDecideCommand, headKeygenCommand,
-  headPostCommand, headRuleCommand, joinCommand, nextCommand, noteCommand, parseClaim,
+  beatCommand, boardCommand, fitSubmitMessage, headBanCommand, headCloseCommand, headDecideCommand,
+  headKeygenCommand, headNoteCommand, headPostCommand, headRuleCommand, joinCommand, nextCommand, noteCommand, parseClaim,
   parseNoteKind, parseRuleArgs, proposeCommand, releaseCommand, resultCommand, statusCommand,
   submitCommand, submissionExitCode, tasksCommand, voteCommand,
 } from "./commands.ts";
-import type { CommandResult, ParsedCli, ParsedValue } from "./commands.ts";
+import type { CommandResult, ParsedCli, ParsedValue, SubmitView } from "./commands.ts";
 import { doctorCommand } from "./doctor.ts";
 import { initCommand } from "./init.ts";
 import type { RuntimeDeps } from "./runtime.ts";
 import { serveCommand } from "./runtime.ts";
-import { agentPath, headPath, readAgent, readHead, resolveDir, writeAgent, writeHead } from "./store.ts";
+import { syncCommand } from "./sync.ts";
+import {
+  agentPath, headPath, readAgent, readHead, resolveAgentDir, resolveDir, writeAgent, writeHead,
+} from "./store.ts";
 import type { SessionIdentity } from "./store.ts";
 
 export interface DispatchDeps {
@@ -63,15 +66,23 @@ function client(url: string, keys: { publicKey: string; privateKey: string }, de
 
 function requireAgent(
   deps: DispatchDeps,
-): { identity: SessionIdentity; client: Client } {
-  const identity = readAgent(deps.dir);
+): { identity: SessionIdentity; identityDir: string; client: Client } {
+  const identityDir = resolveAgentDir(deps.dir);
+  const identity = readAgent(identityDir);
   if (!identity) {
-    throw new Error(`no agent identity at ${agentPath(deps.dir)}; run "minga join <url>" first`);
+    throw new Error(`no agent identity at ${agentPath(identityDir)}; run "minga join <url>" first`);
   }
   return {
     identity,
+    identityDir,
     client: client(deps.urlOverride ?? identity.url, identity, deps),
   };
+}
+
+/** Remember accepted files so `minga sync` can clean up after the submit. */
+function acceptedFiles(view: SubmitView): { submission: string; files: string[] } | undefined {
+  if (!("id" in view) || view.status !== "accepted") return undefined;
+  return { submission: view.id, files: view.files };
 }
 
 function requireHeadClient(deps: DispatchDeps): Client {
@@ -99,7 +110,12 @@ export async function dispatch(cli: ParsedCli, deps: DispatchDeps): Promise<Disp
       const harness = str(cli.options.harness);
       if (!model || !harness) throw new Error("join needs --model and --harness");
       const existing = readAgent(dir);
-      const keys = existing ? { publicKey: existing.publicKey, privateKey: existing.privateKey } : generateKeyPair();
+      // An ancestor identity is reused only for the same project; otherwise
+      // join still writes to cwd (or --dir), as documented.
+      const reuse = existing !== null && existing.url === url;
+      const keys = existing && reuse
+        ? { publicKey: existing.publicKey, privateKey: existing.privateKey }
+        : generateKeyPair();
       const { identity, result } = await joinCommand(client(url, keys, deps), {
         url,
         keys,
@@ -107,12 +123,12 @@ export async function dispatch(cli: ParsedCli, deps: DispatchDeps): Promise<Disp
         harness,
         owner: str(cli.options.owner),
       });
-      writeAgent(dir, identity);
+      writeAgent(reuse ? resolveAgentDir(dir) : resolveDir(dir), identity);
       return { result, code: 0 };
     }
 
     case "next": {
-      const { identity, client: c } = requireAgent(deps);
+      const { identity, identityDir, client: c } = requireAgent(deps);
       const result = await nextCommand(c, {
         model: modelOf(cli, identity),
         approach: str(cli.options.approach),
@@ -121,7 +137,7 @@ export async function dispatch(cli: ParsedCli, deps: DispatchDeps): Promise<Disp
       });
       const a = result.data.assignment;
       if (a) {
-        writeAgent(dir, {
+        writeAgent(identityDir, {
           ...identity,
           lastAssignment: {
             attempt: a.attempt,
@@ -160,13 +176,15 @@ export async function dispatch(cli: ParsedCli, deps: DispatchDeps): Promise<Disp
       const attempt = requirePositional(cli, 0, "submit needs an attempt id");
       const claimText = str(cli.options.claim);
       if (!claimText) throw new Error("submit needs --claim solves|refutes|progress");
-      const message = str(cli.options.message);
-      if (!message) throw new Error('submit needs -m "<message>"');
-      const { identity, client: c } = requireAgent(deps);
+      const rawMessage = str(cli.options.message);
+      if (!rawMessage) throw new Error('submit needs -m "<message>"');
+      const fitted = fitSubmitMessage(rawMessage);
+      if (fitted.notice !== undefined) deps.onProgress?.(fitted.notice);
+      const { identity, identityDir, client: c } = requireAgent(deps);
       const result = await submitCommand(c, {
         attempt,
         claim: parseClaim(claimText),
-        message,
+        message: fitted.message,
         files: cli.positionals.slice(1),
         root: str(cli.options.root),
         model: modelOf(cli, identity),
@@ -174,18 +192,25 @@ export async function dispatch(cli: ParsedCli, deps: DispatchDeps): Promise<Disp
         onProgress: deps.onProgress,
       });
       const submission = "submission" in result.data ? result.data.submission : result.data.id;
-      writeAgent(dir, { ...identity, lastSubmission: submission });
+      const accepted = acceptedFiles(result.data);
+      writeAgent(identityDir, {
+        ...identity,
+        lastSubmission: submission,
+        ...(accepted !== undefined ? { lastAccepted: accepted } : {}),
+      });
       return { result, code: submissionExitCode(result.data) };
     }
 
     case "result": {
       const submission = requirePositional(cli, 0, "result needs a submission id (S-n)");
-      const { client: c } = requireAgent(deps);
+      const { identity, identityDir, client: c } = requireAgent(deps);
       const result = await resultCommand(c, {
         submission,
         wait: cli.options.wait === true,
         onProgress: deps.onProgress,
       });
+      const accepted = acceptedFiles(result.data);
+      if (accepted !== undefined) writeAgent(identityDir, { ...identity, lastAccepted: accepted });
       return { result, code: submissionExitCode(result.data) };
     }
 
@@ -248,6 +273,11 @@ export async function dispatch(cli: ParsedCli, deps: DispatchDeps): Promise<Disp
     case "tasks": {
       const { client: c } = requireAgent(deps);
       return { result: await tasksCommand(c, { openOnly: cli.options.open === true }), code: 0 };
+    }
+
+    case "sync": {
+      const result = syncCommand({ dir, discard: cli.options.discard === true });
+      return { result, code: result.data.refused ? 1 : 0 };
     }
 
     case "init": {
@@ -343,6 +373,21 @@ export async function dispatch(cli: ParsedCli, deps: DispatchDeps): Promise<Disp
         const reason = str(cli.options.reason);
         if (!reason) throw new Error("head ban needs --reason");
         return { result: await headBanCommand(c, { agent, reason }), code: 0 };
+      }
+
+      if (action === "note") {
+        const task = requirePositional(cli, 0, "head note needs a task id");
+        const text = cli.positionals.slice(1).join(" ");
+        if (text.length === 0) throw new Error("head note needs some text");
+        const kindText = str(cli.options.kind);
+        return {
+          result: await headNoteCommand(c, {
+            task,
+            text,
+            ...(kindText !== undefined ? { kind: parseNoteKind(kindText) } : {}),
+          }),
+          code: 0,
+        };
       }
 
       if (action === "close") {

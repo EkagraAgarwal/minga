@@ -5,6 +5,7 @@
  */
 import { createInterface } from "node:readline";
 import type { FetchLike } from "./client.ts";
+import { fitSubmitMessage } from "./commands.ts";
 import type { CommandResult, ParsedCli, ParsedValue } from "./commands.ts";
 import type { DispatchOutcome } from "./dispatch.ts";
 import { dispatch } from "./dispatch.ts";
@@ -46,7 +47,7 @@ export const MCP_TOOLS: McpTool[] = [
   },
   {
     name: "minga_next",
-    description: "Step 1 of the loop: ask for a task. wait defaults to 30 seconds (one long-poll); call again if assignment is null. if done is true, stop: the project has no open tasks left. The result includes the assigned branch head: git pull until you have it, then work, minga_beat every ~10 min, minga_submit, and read the verdict (or minga_release).",
+    description: "Step 1 of the loop: ask for a task. wait defaults to 30 seconds (one long-poll); call again if assignment is null. if done is true, stop: the project has no open tasks left. The result includes the assigned branch head: run minga sync until you have it, then work, minga_beat every ~10 min, minga_submit, and read the verdict (or minga_release).",
     inputSchema: {
       type: "object",
       properties: {
@@ -171,11 +172,21 @@ export const MCP_TOOLS: McpTool[] = [
   },
   {
     name: "minga_tasks",
-    description: "Show the task tree with status, live attempts, points and titles; areas are marked. Set open:true to show only open tasks. The footer counts open leaf tasks or says the project is finished. structuredContent is the same raw response as --json.",
+    description: "Show the task tree with status, live attempts (open tasks only), points and titles; areas are marked. Set open:true to show only open tasks. The footer counts open leaf tasks or says the project is finished. structuredContent is the same raw response as --json.",
     inputSchema: {
       type: "object",
       properties: {
         open: boolProp("Show only open tasks (default false)."),
+      },
+    },
+  },
+  {
+    name: "minga_sync",
+    description: "After an accepted submit: fetch origin and clean up files left in the worktree. Local changes identical to the branch head or from your last accepted submission are discarded; others are refused unless discard:true is set.",
+    inputSchema: {
+      type: "object",
+      properties: {
+        discard: boolProp("Discard all local changes, including unrelated ones (default false)."),
       },
     },
   },
@@ -233,7 +244,11 @@ function setOpt(options: Record<string, ParsedValue>, key: string, value: string
 }
 
 /** Translate a tool call into the same ParsedCli the CLI builds. */
-export function toolToCli(name: string, args: Record<string, unknown>): ParsedCli {
+export function toolToCli(
+  name: string,
+  args: Record<string, unknown>,
+  onNotice?: (line: string) => void,
+): ParsedCli {
   const options: Record<string, ParsedValue> = {};
   let command = "status";
   let positionals: string[] = [];
@@ -271,7 +286,9 @@ export function toolToCli(name: string, args: Record<string, unknown>): ParsedCl
       }
       positionals = [reqString(args, "attempt"), ...(files as string[])];
       options.claim = reqString(args, "claim");
-      options.message = reqString(args, "message");
+      const fitted = fitSubmitMessage(reqString(args, "message"));
+      options.message = fitted.message;
+      if (fitted.notice !== undefined) onNotice?.(fitted.notice);
       setOpt(options, "root", optString(args, "root"));
       options.wait = args.wait !== false;
       break;
@@ -313,6 +330,10 @@ export function toolToCli(name: string, args: Record<string, unknown>): ParsedCl
     case "minga_tasks":
       command = "tasks";
       if (args.open === true) options.open = true;
+      break;
+    case "minga_sync":
+      command = "sync";
+      if (args.discard === true) options.discard = true;
       break;
     default:
       throw new Error(`unknown tool: ${name}`);
@@ -375,7 +396,7 @@ export function createMcpHandler(ctx: McpContext): McpHandler {
         }
         try {
           const cli = toolToCli(name, (params.arguments !== null && typeof params.arguments === "object"
-            && !Array.isArray(params.arguments)) ? params.arguments as Record<string, unknown> : {});
+            && !Array.isArray(params.arguments)) ? params.arguments as Record<string, unknown> : {}, ctx.onProgress);
           const outcome: DispatchOutcome = await execute(cli);
           const text: string = (outcome.result as CommandResult).text;
           const body: Record<string, unknown> = {

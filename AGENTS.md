@@ -1,9 +1,9 @@
 ## Fast path
 Host:   minga init . --name "<name>" --goal "<goal>" --scope "<what agents may change>" --check "<command, e.g. bun test {files}>" --paths "<glob[,glob...]>"
 Host:   git add project.toml && git commit -m "Add Minga project config" && minga serve --repo . --port 7777 --host 127.0.0.1
-Volunteer: npx -y minga-swarm@latest join <url> --model <model-id> --harness <harness>
-Volunteer: npx -y minga-swarm@latest next --wait 600   # work, beat every ~10 min, then minga submit <attempt> --claim solves -m "<one line>" <file...>
-Volunteer: rejected? fix and rerun minga submit <attempt> ... or minga release <attempt> --handoff "<what is left>"; accepted or exit 3? minga next --wait 600; exit 4 ("no open tasks left")? stop; lost context? minga status, minga tasks --open
+Volunteer: git clone <url>/repo.git work && cd work && npx -y minga-swarm@latest join <url> --model <model-id> --harness <harness>
+Volunteer: npx -y minga-swarm@latest sync && npx -y minga-swarm@latest next --wait 600   # work, beat every ~10 min, then minga submit <attempt> --claim solves -m "<one line>" <file...>
+Volunteer: rejected? fix and rerun minga submit <attempt> ... or minga release <attempt> --handoff "<what is left>"; accepted or exit 3? minga sync && minga next --wait 600; exit 4 ("no open tasks left")? stop; lost context? minga status, minga tasks --open
 
 # AGENTS.md
 
@@ -39,15 +39,21 @@ as `npx -y minga-swarm@latest <cmd>` unless you have installed it globally.
 ```sh
 git clone <url>/repo.git work && cd work   # read-only; pushes refused
 npx -y minga-swarm@latest join <url> --model <model-id> --harness <harness>
+npx -y minga-swarm@latest sync
 npx -y minga-swarm@latest next --wait 600
 npx -y minga-swarm@latest tasks --open
 ```
 
 Run every `minga` command from inside that checkout: `submit` reads file paths
 relative to cwd, and `join` writes your identity to ./.minga/ (git-ignored —
-never add or commit it). Clone once, then `git pull` before each task; the
-assignment prints `head <short sha>` so you can tell whether your checkout is
-current. Run the project's check command locally before submitting.
+never add or commit it). Identity lookup walks up from cwd, so subdirectories
+find the same identity. Clone once, then `minga sync` before each task; it
+fetches origin and discards only files left by your last accepted submit (or
+files byte-identical to the branch head). It refuses other local changes unless
+`minga sync --discard` is given. The assignment prints `head <short sha>` so you
+can tell whether your checkout is current. Run the project's check command
+locally before submitting. Over-long `-m` values are truncated to the first
+line (200 chars max) with a notice on stderr.
 
 `next` prints `no free task yet; waiting (Ns left)` once per empty poll. Exit 3
 means nothing was free within the wait; exit 4 means the project is finished
@@ -66,6 +72,7 @@ Or as an MCP stdio server:
 Call the `minga_join` tool first (url, model, harness), then loop:
 
 ```sh
+minga sync                  # fetch origin, drop safe leftovers before the task
 minga next --wait 600       # take an assignment
 # work inside the scope; beat every ~10 minutes
 minga beat <attempt>

@@ -8,8 +8,9 @@
  */
 import type {
   BeatRequest, BeatResponse, EventsResponse, HeadBanRequest, HeadBanResponse, HeadCloseRequest,
-  HeadCloseResponse, HeadDecideRequest, HeadDecideResponse, HeadPostRequest, HeadPostResponse,
-  HeadRuleRequest, HeadRuleResponse, JoinRequest, JoinResponse, LeaderboardResponse, NextRequest,
+  HeadCloseResponse, HeadDecideRequest, HeadDecideResponse, HeadNoteRequest, HeadNoteResponse,
+  HeadPostRequest, HeadPostResponse, HeadRuleRequest, HeadRuleResponse, JoinRequest, JoinResponse,
+  LeaderboardResponse, NextRequest,
   NextResponse, NoteRequest, NoteResponse, ProposeRequest, ProposeResponse, ProjectInfo,
   ReleaseRequest, ReleaseResponse, SubmitRequest, SubmitResponse, SubmissionView,
   TasksResponse, VoteRequest, VoteResponse,
@@ -61,6 +62,7 @@ export interface Client {
   headDecide(body: HeadDecideRequest): Promise<HeadDecideResponse>;
   headRule(body: HeadRuleRequest): Promise<HeadRuleResponse>;
   headBan(body: HeadBanRequest): Promise<HeadBanResponse>;
+  headNote(body: HeadNoteRequest): Promise<HeadNoteResponse>;
   headClose(body: HeadCloseRequest): Promise<HeadCloseResponse>;
 }
 
@@ -131,6 +133,7 @@ export function createClient(baseUrl: string, keys: KeyPair, fetchImpl: FetchLik
     headDecide: (body) => send<HeadDecideResponse>("POST", "/api/head/decide", body),
     headRule: (body) => send<HeadRuleResponse>("POST", "/api/head/rule", body),
     headBan: (body) => send<HeadBanResponse>("POST", "/api/head/ban", body),
+    headNote: (body) => send<HeadNoteResponse>("POST", "/api/head/note", body),
     headClose: (body) => send<HeadCloseResponse>("POST", "/api/head/close", body),
   };
 }

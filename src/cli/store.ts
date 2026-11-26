@@ -4,10 +4,12 @@
  *   <dir>/.minga/agent.json  the volunteer agent's session identity
  *   <dir>/.minga/head.json   the maintainer's head-agent identity
  *
- * `dir` is --dir, else $MINGA_DIR, else the current working directory.
+ * `dir` is --dir, else $MINGA_DIR, else the current working directory. Agent
+ * identity lookup walks up from there to the nearest ancestor holding one,
+ * the way git finds .git; writes still go to an explicit directory.
  * node:fs only: this module is bundled into the kit for plain Node.
  */
-import { chmodSync, mkdirSync, readFileSync, writeFileSync } from "node:fs";
+import { chmodSync, existsSync, mkdirSync, readFileSync, writeFileSync } from "node:fs";
 import { dirname, join, resolve } from "node:path";
 import type { AgentId } from "../core/types.ts";
 import type { KeyPair } from "../identity/keys.ts";
@@ -33,6 +35,8 @@ export interface SessionIdentity {
   lastAssignment?: LastAssignment;
   /** Last submission id from `submit`. */
   lastSubmission?: string;
+  /** Files of the last accepted submission, so `minga sync` can drop leftovers. */
+  lastAccepted?: { submission: string; files: string[] };
 }
 
 export interface HeadIdentity {
@@ -107,9 +111,25 @@ export function headPath(dir: string): string {
   return join(dir, MINGA_DIR, "head.json");
 }
 
+/**
+ * Nearest directory at or above `dir` holding .minga/agent.json, like git
+ * finding .git. When none exists, returns the starting directory unchanged so
+ * `join` can create the identity there.
+ */
+export function resolveAgentDir(dir?: string): string {
+  const start = resolveDir(dir);
+  let current = start;
+  for (;;) {
+    if (existsSync(agentPath(current))) return current;
+    const parent = dirname(current);
+    if (parent === current) return start;
+    current = parent;
+  }
+}
+
 /** null when the file does not exist; throws when it is unreadable or malformed. */
 export function readAgent(dir: string): SessionIdentity | null {
-  const path = agentPath(dir);
+  const path = agentPath(resolveAgentDir(dir));
   const obj = readObject(path);
   if (!obj) return null;
   const identity: SessionIdentity = {
@@ -135,6 +155,15 @@ export function readAgent(dir: string): SessionIdentity | null {
   }
   const lastSubmission = optionalString(obj, "lastSubmission");
   if (lastSubmission !== undefined) identity.lastSubmission = lastSubmission;
+  const accepted = obj.lastAccepted;
+  if (accepted && typeof accepted === "object" && !Array.isArray(accepted)) {
+    const entry = accepted as Record<string, unknown>;
+    const submission = optionalString(entry, "submission");
+    const files = entry.files;
+    if (submission && Array.isArray(files) && files.every((f) => typeof f === "string")) {
+      identity.lastAccepted = { submission, files: files as string[] };
+    }
+  }
   return identity;
 }
 
@@ -150,6 +179,7 @@ export function writeAgent(dir: string, identity: SessionIdentity): string {
   if (identity.owner !== undefined) value.owner = identity.owner;
   if (identity.lastAssignment !== undefined) value.lastAssignment = identity.lastAssignment;
   if (identity.lastSubmission !== undefined) value.lastSubmission = identity.lastSubmission;
+  if (identity.lastAccepted !== undefined) value.lastAccepted = identity.lastAccepted;
   return writeObject(agentPath(dir), value);
 }
 

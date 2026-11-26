@@ -11,16 +11,20 @@ import { agentIdFromPublicKey, canonicalRequest, generateKeyPair, verifyMessage 
 import type { FetchLike } from "../src/cli/client.ts";
 import { createClient } from "../src/cli/client.ts";
 import {
-  formatRules, headKeygenCommand, joinCommand, nextCommand, parseAcceptPolicy, parseCli,
-  parseRuleArgs, readSubmissionFiles, renderSubmission, statusCommand, submitCommand, tasksCommand,
+  fitSubmitMessage, formatRules, headKeygenCommand, headNoteCommand, joinCommand, nextCommand,
+  parseAcceptPolicy, parseCli, parseRuleArgs, readSubmissionFiles, renderSubmission, statusCommand,
+  submitCommand, tasksCommand,
 } from "../src/cli/commands.ts";
+import { dispatch } from "../src/cli/dispatch.ts";
 import { doctorCommand } from "../src/cli/doctor.ts";
 import { initCommand, renderProjectToml, tomlBasicString } from "../src/cli/init.ts";
 import { renderJoinDoc } from "../src/cli/join-doc.ts";
 import { findPackageRoot, serveCommand, type RunResult } from "../src/cli/runtime.ts";
 import { parseProject } from "../src/project/config.ts";
+import type { GitRunner } from "../src/cli/sync.ts";
+import { syncCommand } from "../src/cli/sync.ts";
 import type { SessionIdentity } from "../src/cli/store.ts";
-import { agentPath, readAgent, readHead, writeAgent, writeHead } from "../src/cli/store.ts";
+import { agentPath, readAgent, readHead, resolveAgentDir, writeAgent, writeHead } from "../src/cli/store.ts";
 
 const project: ProjectInfo = {
   name: "Minga",
@@ -250,6 +254,12 @@ describe("argument parsing", () => {
       argv: ["head", "keygen", "--url", "https://m.example"],
       command: "head", action: "keygen", positionals: [], options: { url: "https://m.example" },
     },
+    {
+      name: "head note",
+      argv: ["head", "note", "T-2", "fixed", "the", "test", "--kind", "result"],
+      command: "head", action: "note", positionals: ["T-2", "fixed", "the", "test"],
+      options: { kind: "result" },
+    },
   ];
 
   for (const c of cases) {
@@ -385,6 +395,66 @@ describe("join, store and head", () => {
     });
   });
 
+  test("identity lookup walks up to the nearest ancestor holding agent.json", () => {
+    withTempDir((dir) => {
+      const outer = join(dir, "work");
+      const inner = join(outer, "src", "deep");
+      mkdirSync(inner, { recursive: true });
+      const outerKeys = generateKeyPair();
+      const outerIdentity: SessionIdentity = {
+        url: "https://minga.test", agent: agentIdFromPublicKey(outerKeys.publicKey),
+        publicKey: outerKeys.publicKey, privateKey: outerKeys.privateKey, model: "m", harness: "h",
+      };
+      writeAgent(dir, outerIdentity);
+      expect(resolveAgentDir(inner)).toBe(dir);
+      expect(readAgent(inner)!.agent).toBe(outerIdentity.agent);
+
+      // A nearer identity wins, just like the nearest .git directory.
+      const innerKeys = generateKeyPair();
+      const innerIdentity: SessionIdentity = { ...outerIdentity,
+        agent: agentIdFromPublicKey(innerKeys.publicKey),
+        publicKey: innerKeys.publicKey, privateKey: innerKeys.privateKey };
+      writeAgent(outer, innerIdentity);
+      expect(resolveAgentDir(inner)).toBe(outer);
+      expect(readAgent(inner)!.agent).toBe(innerIdentity.agent);
+      expect(agentPath(resolveAgentDir(inner))).toBe(agentPath(outer));
+    });
+  });
+
+  test("join writes to cwd, reusing an ancestor identity only for the same URL", async () => {
+    await withTempDir(async (dir) => {
+      const parent = join(dir, "parent");
+      const child = join(parent, "work");
+      mkdirSync(child, { recursive: true });
+      const ancestorKeys = generateKeyPair();
+      const url = "https://minga.test";
+      writeAgent(parent, {
+        url, agent: agentIdFromPublicKey(ancestorKeys.publicKey),
+        publicKey: ancestorKeys.publicKey, privateKey: ancestorKeys.privateKey,
+        model: "m", harness: "h",
+      });
+      const mock = mockFetch((call) => {
+        const body = JSON.parse(call.init.body as string) as { publicKey: string };
+        return json({ agent: agentIdFromPublicKey(body.publicKey), rejoin: false, project, live: [] });
+      });
+      const deps = { dir: child, fetchImpl: mock.fn };
+      const joined = await dispatch({
+        command: "join", options: { model: "m", harness: "h" }, positionals: [url],
+      }, deps);
+      expect(joined.code).toBe(0);
+      expect(existsSync(agentPath(child))).toBe(false);
+      expect(readAgent(child)!.publicKey).toBe(ancestorKeys.publicKey);
+
+      const before = readAgent(parent)!;
+      await dispatch({
+        command: "join", options: { model: "m", harness: "h" }, positionals: ["https://other.test"],
+      }, deps);
+      expect(existsSync(agentPath(child))).toBe(true);
+      expect(readAgent(child)!.url).toBe("https://other.test");
+      expect(readAgent(parent)!.publicKey).toBe(before.publicKey);
+    });
+  });
+
   test("join output names the agent, goal, scope and rules", async () => {
     const keys = generateKeyPair();
     const mock = mockFetch(() => json({ agent: agentIdFromPublicKey(keys.publicKey), rejoin: true, project, live: ["A-2"] }));
@@ -434,11 +504,72 @@ describe("join, store and head", () => {
       "width=2 leaseMinutes=10 maxAttemptsPerAgent=2 defaultPoints=10 accept=head-or-votes:2",
     );
   });
+
+  test("head note posts a signed /api/head/note body and defaults to result", async () => {
+    const keys = generateKeyPair();
+    const note = {
+      id: "N-9", task: "T-2", agent: agentIdFromPublicKey(keys.publicKey),
+      kind: "result" as const, text: "fixed the test", at: "2026-01-01T00:00:00.000Z",
+    };
+    const mock = mockFetch(() => json({ note }));
+    const client = createClient("https://minga.test", keys, mock.fn);
+    const result = await headNoteCommand(client, { task: "T-2", text: "fixed the test" });
+    expect(new URL(mock.calls[0]!.url).pathname).toBe("/api/head/note");
+    expect(JSON.parse(mock.calls[0]!.init.body as string)).toEqual({
+      task: "T-2", text: "fixed the test",
+    });
+    expect((mock.calls[0]!.init.headers as Record<string, string>)[HEADER.agent]).toBe(note.agent);
+    expect(result.text).toBe("note N-9 on T-2 (result)");
+    expect(result.data.note).toEqual(note);
+
+    await headNoteCommand(client, { task: "T-2", text: "an idea", kind: "idea" });
+    expect(JSON.parse(mock.calls[1]!.init.body as string)).toEqual({
+      task: "T-2", text: "an idea", kind: "idea",
+    });
+  });
+
+  test("head note through the dispatcher uses the head identity", async () => {
+    await withTempDir(async (dir) => {
+      const keys = generateKeyPair();
+      writeHead(dir, {
+        agent: agentIdFromPublicKey(keys.publicKey),
+        publicKey: keys.publicKey, privateKey: keys.privateKey, url: "https://minga.test",
+      });
+      const mock = mockFetch(() => json({
+        note: {
+          id: "N-10", task: "T-3", agent: agentIdFromPublicKey(keys.publicKey),
+          kind: "handoff", text: "handled", at: "2026-01-01T00:00:00.000Z",
+        },
+      }));
+      const outcome = await dispatch(parseCli([
+        "head", "note", "T-3", "handled", "--kind", "handoff", "--dir", dir,
+      ]), { dir, fetchImpl: mock.fn });
+      expect(outcome.code).toBe(0);
+      expect(outcome.result.text).toBe("note N-10 on T-3 (handoff)");
+      expect(JSON.parse(mock.calls[0]!.init.body as string)).toEqual({
+        task: "T-3", text: "handled", kind: "handoff",
+      });
+      expect((mock.calls[0]!.init.headers as Record<string, string>)[HEADER.agent]).toBe(
+        agentIdFromPublicKey(keys.publicKey),
+      );
+    });
+  });
 });
 
 // ---------------------------------------------------------------- submit / result / next logic
 
 describe("submit and result logic", () => {
+  test("over-long messages are fitted to the server's 200-char first line", () => {
+    const long = `${"x".repeat(220)}\nsecond line`;
+    const fitted = fitSubmitMessage(long);
+    expect(fitted.message).toBe(`${"x".repeat(197)}...`);
+    expect(fitted.message).toHaveLength(200);
+    expect(fitted.notice).toContain("over 200 chars");
+    expect(fitSubmitMessage("short")).toEqual({ message: "short" });
+    // A short first line is kept as-is even when later lines exceed the limit.
+    expect(fitSubmitMessage(`first\n${"y".repeat(220)}`).message).toBe("first");
+  });
+
   test("reads files, queues and waits for a verdict", async () => {
     await withTempDir(async (dir) => {
       writeFileSync(join(dir, "a.ts"), "export const a = 1;\n");
@@ -466,7 +597,7 @@ describe("submit and result logic", () => {
       expect(result.text).toContain("exit code: 0");
       expect(result.text).toContain("commit: abc1234");
       expect(result.text).toContain("points: 10");
-      expect(result.text).toContain("next: minga next --wait 600");
+      expect(result.text).toContain("next: minga sync && minga next --wait 600");
     });
   });
 
@@ -564,12 +695,14 @@ describe("next with wait", () => {
 
   test("repeats with capped long-poll until an assignment arrives", async () => {
     let calls = 0;
-    const mock = mockFetch(() => {
+    const mock = mockFetch((call) => {
+      if (call.url.endsWith("/api/project")) return json(project);
       calls++;
       return json(calls < 3 ? { assignment: null, retryAfterSeconds: 5 } : { assignment });
     });
     const result = await nextCommand(createClient("https://minga.test", generateKeyPair(), mock.fn), { wait: 60 });
     expect(calls).toBe(3);
+    expect(mock.calls).toHaveLength(4); // the final assignment also looks up its notes' author
     expect(result.text).toContain("attempt   A-5");
     expect(result.text).toContain("role      build");
     expect(result.text).toContain("T-4  Wire the parser");
@@ -577,7 +710,8 @@ describe("next with wait", () => {
     expect(result.text).toContain("start at parse");
     expect(result.text).toContain("A-6 fedcba9876543210 claude-y attack — fuzz it");
     expect(result.text).not.toContain("git pull if your checkout is older");
-    const waits = mock.calls.map((c) => JSON.parse(c.init.body as string).wait as number);
+    const waits = mock.calls.filter((c) => c.init.method === "POST")
+      .map((c) => JSON.parse(c.init.body as string).wait as number);
     expect(waits[0]).toBe(30);
     expect(Math.max(...waits)).toBeLessThanOrEqual(30);
   });
@@ -585,8 +719,27 @@ describe("next with wait", () => {
   test("shows the assigned branch head with a pull hint", async () => {
     const mock = mockFetch(() => json({ assignment: { ...assignment, head: "0123456789abcdef0123" } }));
     const result = await nextCommand(createClient("https://minga.test", generateKeyPair(), mock.fn));
-    expect(result.text).toContain("head 0123456 (git pull if your checkout is older)");
+    expect(result.text).toContain("head 0123456 (minga sync if your checkout is older)");
     expect(result.data.assignment?.head).toBe("0123456789abcdef0123");
+  });
+
+  test("marks notes from the head agent with a head: prefix", async () => {
+    const headNotes = {
+      ...assignment,
+      notes: [
+        { id: "N-8", task: "T-4", agent: project.headAgent, kind: "result",
+          text: "the check was fixed", at: "2026-01-01T00:00:00.000Z" },
+        { id: "N-9", task: "T-4", agent: "fedcba9876543210", kind: "idea",
+          text: "try another way", at: "2026-01-01T00:00:00.000Z" },
+      ],
+    };
+    const mock = mockFetch((call) => call.url.endsWith("/api/project")
+      ? json(project)
+      : json({ assignment: headNotes }));
+    const result = await nextCommand(createClient("https://minga.test", generateKeyPair(), mock.fn));
+    expect(result.text).toContain("N-8 head: 0123456789abcdef result: the check was fixed");
+    expect(result.text).toContain("N-9 fedcba9876543210 idea: try another way");
+    expect(result.text).toContain("handoff   N-2 head: (handoff) start at parse");
   });
 
   test("prints one remaining-time progress line per empty poll", async () => {
@@ -639,10 +792,11 @@ describe("tasks overview", () => {
     const result = await tasksCommand(createClient("https://minga.test", generateKeyPair(), mock.fn));
     expect(new URL(mock.calls[0]!.url).pathname).toBe("/api/tasks");
     expect(result.data).toEqual(overview);
-    expect(result.text).toContain("T-1  solved 0 live  0 pts  Root [area]");
-    expect(result.text).toContain("  T-2  open   1 live  0 pts  An area [area]");
-    expect(result.text).toContain("    T-3  open   2 live  20 pts  isPrime");
-    expect(result.text).toContain("    T-4  solved 0 live  5 pts  closed leaf");
+    expect(result.text).toContain("T-1  solved      0 pts  Root [area]");
+    expect(result.text).toContain("  T-2  open · 1 live  0 pts  An area [area]");
+    expect(result.text).toContain("    T-3  open · 2 live  20 pts  isPrime");
+    expect(result.text).toContain("    T-4  solved      5 pts  closed leaf");
+    expect(result.text).not.toContain("0 live");
     expect(result.text).toContain("open leaf tasks: 1");
     expect(result.text).not.toContain("project finished");
   });
@@ -652,8 +806,8 @@ describe("tasks overview", () => {
     const result = await tasksCommand(createClient("https://minga.test", generateKeyPair(), mock.fn), {
       openOnly: true,
     });
-    expect(result.text).toContain("  T-2  open   1 live  0 pts  An area [area]");
-    expect(result.text).toContain("    T-3  open   2 live  20 pts  isPrime");
+    expect(result.text).toContain("  T-2  open · 1 live  0 pts  An area [area]");
+    expect(result.text).toContain("    T-3  open · 2 live  20 pts  isPrime");
     expect(result.text).not.toContain("T-1  solved");
     expect(result.text).not.toContain("closed leaf");
   });
@@ -663,6 +817,116 @@ describe("tasks overview", () => {
     const result = await tasksCommand(createClient("https://minga.test", generateKeyPair(), mock.fn));
     expect(result.text).toBe("project finished");
     expect(result.data.done).toBe(true);
+  });
+});
+
+// ---------------------------------------------------------------- sync
+
+describe("minga sync", () => {
+  function fakeGit(options: {
+    status: string;
+    head?: Record<string, string>;
+    ref?: string | null;
+    calls: string[];
+  }): GitRunner {
+    return (args) => {
+      options.calls.push(args.join(" "));
+      switch (args[0]) {
+        case "fetch": return "";
+        case "symbolic-ref":
+          if (options.ref === null) throw new Error("no origin/HEAD");
+          return `${options.ref ?? "refs/remotes/origin/main"}\n`;
+        case "status": return options.status;
+        case "show": {
+          const path = args[1]!.slice(args[1]!.indexOf(":") + 1);
+          const content = options.head?.[path];
+          if (content === undefined) throw new Error(`no ${path} in head`);
+          return content;
+        }
+        case "reset":
+        case "clean": return "";
+        default: throw new Error(`unexpected git ${args.join(" ")}`);
+      }
+    };
+  }
+
+  function withKeys(dir: string, accepted?: string[]): void {
+    const keys = generateKeyPair();
+    writeAgent(dir, {
+      url: "https://minga.test", agent: agentIdFromPublicKey(keys.publicKey),
+      publicKey: keys.publicKey, privateKey: keys.privateKey, model: "m", harness: "h",
+      ...(accepted !== undefined ? { lastAccepted: { submission: "S-1", files: accepted } } : {}),
+    });
+  }
+
+  test("drops untracked leftovers identical to the fetched branch head", () => {
+    withTempDir((dir) => {
+      writeFileSync(join(dir, "a.ts"), "same\n");
+      withKeys(dir);
+      const calls: string[] = [];
+      const result = syncCommand({ dir, runner: fakeGit({
+        status: "?? a.ts\n", head: { "a.ts": "same\n" }, calls,
+      }) });
+      expect(result.data.synced).toBe(true);
+      expect(result.data.discarded).toEqual(["a.ts"]);
+      expect(result.data.conflicting).toEqual([]);
+      expect(calls).toContain("fetch origin");
+      expect(calls).toContain("reset --hard origin/main");
+      expect(calls).toContain("clean -fd -- a.ts");
+      expect(result.text).toContain("synced to origin/main");
+    });
+  });
+
+  test("drops a file from the last accepted submission even when head lacks it", () => {
+    withTempDir((dir) => {
+      writeFileSync(join(dir, "new.ts"), "leftover\n");
+      withKeys(dir, ["new.ts"]);
+      const calls: string[] = [];
+      const result = syncCommand({ dir, runner: fakeGit({
+        status: "?? new.ts\n", head: {}, calls,
+      }) });
+      expect(result.data.synced).toBe(true);
+      expect(calls).toContain("clean -fd -- new.ts");
+    });
+  });
+
+  test("refuses unrelated changes, honours --discard and falls back to main", () => {
+    withTempDir((dir) => {
+      writeFileSync(join(dir, "other.ts"), "local\n");
+      withKeys(dir);
+      const calls: string[] = [];
+      const refused = syncCommand({ dir, runner: fakeGit({
+        status: " M other.ts\n", head: { "other.ts": "remote\n" }, ref: null, calls,
+      }) });
+      expect(refused.data.synced).toBe(false);
+      expect(refused.data.refused).toBe(true);
+      expect(refused.data.conflicting).toEqual(["other.ts"]);
+      expect(refused.text).toContain("refusing to sync");
+      expect(refused.text).toContain("other.ts");
+      expect(calls).not.toContain("reset --hard origin/main");
+      expect(calls).toContain("fetch origin");
+
+      calls.length = 0;
+      const forced = syncCommand({ dir, discard: true, runner: fakeGit({
+        status: " M other.ts\n", head: { "other.ts": "remote\n" }, ref: null, calls,
+      }) });
+      expect(forced.data.synced).toBe(true);
+      expect(forced.data.refused).toBe(false);
+      expect(forced.data.conflicting).toEqual(["other.ts"]);
+      expect(calls).toContain("reset --hard origin/main");
+      expect(forced.text).toContain("(--discard)");
+    });
+  });
+
+  test("a clean worktree needs no destructive git commands", () => {
+    withTempDir((dir) => {
+      const calls: string[] = [];
+      const result = syncCommand({ dir, runner: fakeGit({ status: "", calls }) });
+      expect(result.data.changed).toEqual([]);
+      expect(result.data.synced).toBe(false);
+      expect(result.text).toContain("no local changes to sync");
+      expect(calls).toEqual(["fetch origin", "symbolic-ref --quiet refs/remotes/origin/HEAD", "status --porcelain"]);
+    });
   });
 });
 
@@ -917,7 +1181,10 @@ describe("join document", () => {
     expect(doc).toContain("GET THE CODE");
     expect(doc).toContain("git clone https://minga.example/repo.git work && cd work");
     expect(doc).toContain("git-ignores .minga/");
-    expect(doc).toContain("git pull");
+    expect(doc.indexOf("GET THE CODE")).toBeLessThan(doc.indexOf("GET THE KIT"));
+    expect(doc.indexOf("git clone")).toBeLessThan(doc.indexOf("minga join"));
+    expect(doc).toContain("minga sync");
+    expect(doc).not.toContain("git pull");
     expect(doc).toContain("Run the project's check command locally");
     expect(doc).toContain("minga next --wait 600");
     expect(doc).toContain("minga beat <attempt>");
@@ -1002,7 +1269,7 @@ describe("bundle on plain Node", () => {
         expect(ok.stdout).toContain("exit code: 0");
         expect(ok.stdout).toContain("commit: deadbeef");
         expect(ok.stdout).toContain("points: 10");
-        expect(ok.stdout).toContain("next: minga next --wait 600");
+        expect(ok.stdout).toContain("next: minga sync && minga next --wait 600");
 
         withIdentity(dir, rejected.url);
         const bad = await runKit([
@@ -1019,6 +1286,26 @@ describe("bundle on plain Node", () => {
     } finally {
       accepted.server.stop();
       rejected.server.stop();
+    }
+  });
+
+  test("an over-long -m is truncated with a stderr notice, not rejected", async () => {
+    const server = startFakeServer({ verdict: "accepted", finalDelayMs: 100 });
+    try {
+      await withTempDir(async (dir) => {
+        withIdentity(dir, server.url);
+        writeFileSync(join(dir, "a.ts"), "x");
+        const result = await runKit([
+          "submit", "A-1", "--claim", "solves", "-m", `${"x".repeat(220)}\nsecond line`, "a.ts",
+          "--root", dir, "--dir", dir, "--url", server.url,
+        ], dir);
+        expect(result.status).toBe(0);
+        expect(result.stderr).toContain("submit message over 200 chars");
+        const sent = [...server.submissions.values()][0] as { message: string };
+        expect(sent.message).toBe(`${"x".repeat(197)}...`);
+      });
+    } finally {
+      server.server.stop();
     }
   });
 
@@ -1103,14 +1390,14 @@ describe("bundle on plain Node", () => {
         withIdentity(dir, server.url);
         const tree = await runKit(["tasks", "--dir", dir, "--url", server.url], dir);
         expect(tree.status).toBe(0);
-        expect(tree.stdout).toContain("T-1  solved 0 live  0 pts  Root [area]");
-        expect(tree.stdout).toContain("  T-3  open   2 live  20 pts  isPrime");
+        expect(tree.stdout).toContain("T-1  solved      0 pts  Root [area]");
+        expect(tree.stdout).toContain("  T-3  open · 2 live  20 pts  isPrime");
         expect(tree.stdout).toContain("open leaf tasks: 1");
 
         const open = await runKit(["tasks", "--open", "--dir", dir, "--url", server.url], dir);
         expect(open.status).toBe(0);
         expect(open.stdout).not.toContain("T-1  solved");
-        expect(open.stdout).toContain("  T-3  open   2 live  20 pts  isPrime");
+        expect(open.stdout).toContain("  T-3  open · 2 live  20 pts  isPrime");
 
         const raw = await runKit(["tasks", "--json", "--dir", dir, "--url", server.url], dir);
         expect(raw.status).toBe(0);
@@ -1130,7 +1417,7 @@ describe("bundle on plain Node", () => {
         expect(got.status).toBe(0);
         expect(got.stdout).toContain("attempt   A-5");
         expect(got.stdout).toContain("T-4  Wire the parser");
-        expect(got.stdout).toContain("head abcdef1 (git pull if your checkout is older)");
+        expect(got.stdout).toContain("head abcdef1 (minga sync if your checkout is older)");
       });
     } finally {
       server.server.stop();
