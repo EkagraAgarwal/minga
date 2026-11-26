@@ -18,7 +18,7 @@ import type { BranchHead, ChangedPaths, CheckPool, CheckResult, CommitAccepted, 
 import type {
   Assignment, BeatRequest, ErrorBody, EventsResponse, HeadBanRequest, HeadCloseRequest, HeadDecideRequest,
   HeadPostRequest, HeadRuleRequest, JoinRequest, JoinResponse, MetricsResponse, NextRequest, NextResponse,
-  NoteRequest, ProjectInfo, ProposeRequest, ReleaseRequest, SubmissionView, SubmitRequest, SubmitResponse,
+  NoteRequest, ProjectInfo, ProposeRequest, ReleaseRequest, SubmissionView, SubmitRequest, SubmitResponse, TasksResponse,
   VoteRequest,
 } from "../core/protocol.ts";
 import {
@@ -32,6 +32,7 @@ import { buildView } from "../log/view.ts";
 import { pathAllowed, parseAcceptPolicy } from "../project/config.ts";
 import { decideByVotes, expiredAttempts, pickTask } from "../sched/scheduler.ts";
 import { authenticate, HttpError, NonceCache, RateLimiter } from "./auth.ts";
+import { Latency } from "./latency.ts";
 
 export interface AppDeps {
   cfg: ProjectConfig;
@@ -60,10 +61,10 @@ const NOTE_MAX = 4000;
 const MAX_WAIT_SECONDS = 30;
 /** SSE frames a slow viewer may fall behind before it is disconnected (it reconnects with Last-Event-ID). */
 const MAX_STREAM_BACKLOG = 2000;
-/** Event types that can free capacity for a waiting `next`. */
-const CAPACITY_EVENTS = new Set<MingaEvent["type"]>(["task.posted", "attempt.ended", "rule.changed"]);
+/** Event types that can free capacity for, or end, a waiting `next`. */
+const CAPACITY_EVENTS = new Set<MingaEvent["type"]>(["task.posted", "attempt.ended", "rule.changed", "task.closed"]);
 
-type Waiter = { agent: AgentId; model: string; approach: string; finish: (a: Assignment | null) => void };
+type Waiter = { agent: AgentId; model: string; approach: string; finish: (a: Assignment | null | "done") => void };
 
 export function createApp(deps: AppDeps) {
   const { cfg, store, repoDir } = deps;
@@ -85,6 +86,9 @@ export function createApp(deps: AppDeps) {
   let waitersScheduled = false;
   const submissionWaiters = new Map<SubmissionId, Set<() => void>>();
   const statuses: Record<string, number> = {};
+  const latency = new Map<string, Latency>();
+  /** Requests that long-polled; their wall time is not handling time, so latency skips them. */
+  const heldRequests = new WeakSet<AbortSignal>();
 
   // ---------------------------------------------------------------- state
   const state: State = initialState(structuredClone(cfg.rules));
@@ -233,8 +237,17 @@ export function createApp(deps: AppDeps) {
     waitersScheduled = true;
     queueMicrotask(serveWaiters);
   }
+  /** True while some open task has no children: there is still work, even if every slot is busy. */
+  function hasOpenLeaf(): boolean {
+    for (const t of Object.values(state.tasks)) if (t.status === "open" && t.children.length === 0) return true;
+    return false;
+  }
   function serveWaiters() {
     waitersScheduled = false;
+    if (!hasOpenLeaf()) {
+      for (const w of [...waiters.values()]) w.finish("done");
+      return;
+    }
     for (const w of [...waiters.values()]) {
       const a = state.agents[w.agent];
       if (!a || a.banned) { w.finish(null); continue; }
@@ -259,7 +272,9 @@ export function createApp(deps: AppDeps) {
     // Waiters queued earlier are served first.
     const assignment = waiters.size ? null : tryAssign(agent, model, approach);
     if (assignment) return { assignment };
+    if (!hasOpenLeaf()) return { assignment: null, done: true };
     if (!wait) return { assignment: null, retryAfterSeconds: 60 };
+    if (signal) heldRequests.add(signal);
     return new Promise<NextResponse>((resolve) => {
       waiters.get(agent)?.finish(null); // a newer request from the same agent replaces the older one
       let timer: ReturnType<typeof setTimeout> | undefined;
@@ -268,7 +283,7 @@ export function createApp(deps: AppDeps) {
         finish(x) {
           if (timer) clearTimeout(timer);
           if (waiters.get(agent) === w) waiters.delete(agent);
-          resolve(x ? { assignment: x } : { assignment: null, retryAfterSeconds: 0 });
+          resolve(x === "done" ? { assignment: null, done: true } : x ? { assignment: x } : { assignment: null, retryAfterSeconds: 0 });
         },
       };
       waiters.set(agent, w);
@@ -479,6 +494,7 @@ export function createApp(deps: AppDeps) {
     const s = state.submissions[id];
     if (!s) throw new HttpError(404, `no submission ${id}`);
     if (isFinal(s) || !wait) return submissionView(id);
+    if (signal) heldRequests.add(signal);
     return new Promise((resolve) => {
       let set = submissionWaiters.get(id);
       if (!set) submissionWaiters.set(id, (set = new Set()));
@@ -633,6 +649,15 @@ export function createApp(deps: AppDeps) {
     return new Response(v.body, { headers });
   }
 
+  function tasksOverview(): TasksResponse {
+    const tasks = Object.values(state.tasks).map((t) => ({
+      id: t.id, title: t.title, parent: t.parent, status: t.status, points: t.points,
+      live: liveAttempts(state, t.id, now()).length, leaf: t.children.length === 0,
+    }));
+    const open = tasks.filter((t) => t.status === "open" && t.leaf).length;
+    return { tasks, open, done: open === 0 };
+  }
+
   function metrics(): MetricsResponse {
     const cpu = process.cpuUsage();
     const mem = process.memoryUsage();
@@ -654,6 +679,7 @@ export function createApp(deps: AppDeps) {
       waiting: waiters.size,
       requests: { ...requests },
       statuses: { ...statuses },
+      latencyMs: Object.fromEntries([...latency].map(([route, h]) => [route, h.summary()])),
     };
   }
 
@@ -698,6 +724,7 @@ export function createApp(deps: AppDeps) {
       if (path === "/api/view") return viewResponse(req);
       if (path === "/api/leaderboard") return json(computeLeaderboard(state, 1000));
       if (path === "/api/metrics") return json(metrics());
+      if (path === "/api/tasks") return json(tasksOverview());
       if (path === "/api/events") {
         const after = Number(url.searchParams.get("after") ?? 0) || 0;
         const limit = Math.min(5000, Number(url.searchParams.get("limit") ?? 1000) || 1000);
@@ -743,6 +770,7 @@ export function createApp(deps: AppDeps) {
 
   /** `ip` is the client address (Bun: server.requestIP(req)?.address); used for the join limit. */
   async function fetch(req: Request, ip?: string): Promise<Response> {
+    const t0 = performance.now();
     const url = new URL(req.url);
     const route = `${req.method} ${url.pathname.startsWith("/api/submission/") ? "/api/submission/:id" : url.pathname}`;
     requests[route] = (requests[route] ?? 0) + 1;
@@ -755,6 +783,11 @@ export function createApp(deps: AppDeps) {
         console.error(err);
         res = fail(500, "internal error", (err as Error).message);
       }
+    }
+    if (!heldRequests.has(req.signal) && !url.pathname.startsWith("/api/stream")) {
+      let h = latency.get(route);
+      if (!h) latency.set(route, (h = new Latency()));
+      h.record(performance.now() - t0);
     }
     const cls = `${Math.floor(res.status / 100)}xx`;
     statuses[cls] = (statuses[cls] ?? 0) + 1;

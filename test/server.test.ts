@@ -413,4 +413,36 @@ describe("server", () => {
     expect(m.requests["POST /api/next"]).toBe(1);
     expect(m.statuses["2xx"]).toBeGreaterThan(0);
   });
+
+  test("next reports done when no open leaf is left, and wakes waiters with done", async () => {
+    const s = setup({ width: 1 });
+    const a = generateKeyPair(), b = generateKeyPair();
+    await join(s, a, "x");
+    await join(s, b, "y");
+    await s.call(s.head, "/api/head/close", { task: "T-3", status: "withdrawn" });
+    const ta = (await s.call(a, "/api/next", {})).body.assignment;
+    const waiting = s.call(b, "/api/next", { wait: 5 });
+    await Bun.sleep(20);
+    expect(s.app.metrics().waiting).toBe(1);
+    expect((await submitAndWait(s, a, ta.attempt, "QED")).body.status).toBe("accepted");
+    expect((await waiting).body).toEqual({ assignment: null, done: true });
+    expect((await s.call(b, "/api/next", { wait: 5 })).body).toEqual({ assignment: null, done: true });
+    const tasks = (await s.get("/api/tasks")).body;
+    expect(tasks.done).toBe(true);
+    expect(tasks.tasks.find((t: any) => t.id === "T-2").status).toBe("solved");
+  });
+
+  test("metrics report server-side latency and skip long-polled requests", async () => {
+    const s = setup({ width: 1 });
+    await s.call(s.head, "/api/head/close", { task: "T-3", status: "withdrawn" });
+    const a = generateKeyPair(), b = generateKeyPair();
+    await join(s, a, "x");
+    await join(s, b, "y");
+    await s.call(a, "/api/next", {});
+    await s.call(b, "/api/next", { wait: 0.2 });
+    const m = (await s.get("/api/metrics")).body;
+    expect(m.latencyMs["POST /api/join"].count).toBe(2);
+    expect(m.latencyMs["POST /api/next"].count).toBe(1);
+    expect(m.latencyMs["POST /api/next"].p99).toBeLessThan(200);
+  });
 });

@@ -122,6 +122,11 @@ export interface MetricsResponse {
   /** Requests handled since start, per route ("POST /api/next"), and responses per status class. */
   requests: Record<string, number>;
   statuses: Record<string, number>;
+  /**
+   * Server-side handling time per route in ms, measured from request arrival to response,
+   * excluding time a long-poll spent holding (long-polled requests are not recorded).
+   */
+  latencyMs: Record<string, { count: number; p50: number; p99: number; max: number }>;
 }
 
 /** GET /api/events?after=<seq>&limit=<n> -> ascending events. */
@@ -176,8 +181,20 @@ export interface Assignment {
   /** Other live attempts on the task (overlap), so the agent can pick a different approach. */
   others: { attempt: AttemptId; agent: AgentId; model: string; role: Role; approach: string }[];
 }
-/** 200 with { assignment } or 200 with { assignment: null, retryAfterSeconds } when nothing is available. */
-export interface NextResponse { assignment: Assignment | null; retryAfterSeconds?: number }
+/**
+ * 200 with { assignment } or 200 with { assignment: null, retryAfterSeconds } when nothing is free.
+ * done: true means the project has no open leaf task left at all (not merely "all busy"):
+ * stop asking. The server answers that at once, without holding a long-poll.
+ */
+export interface NextResponse { assignment: Assignment | null; retryAfterSeconds?: number; done?: boolean }
+
+/** GET /api/tasks -> every task, compact, for agents that want an overview (no bodies). */
+export interface TasksResponse {
+  tasks: { id: TaskId; title: string; parent: TaskId | null; status: TaskState["status"]; points: number; live: number; leaf: boolean }[];
+  open: number;
+  /** True when no open leaf task remains. */
+  done: boolean;
+}
 
 /** POST /api/beat */
 export interface BeatRequest { attempt: AttemptId; model?: string; approach?: string }
