@@ -9,8 +9,9 @@ import { readFileSync } from "node:fs";
 import { isAbsolute, relative, resolve, sep } from "node:path";
 import { parseArgs } from "node:util";
 import type {
-  BeatResponse, JoinResponse, LeaderboardResponse, NextResponse, NoteResponse, ProposeResponse,
-  ProjectInfo, ReleaseResponse, SubmitResponse, VoteResponse, HeadDecideResponse, HeadRuleResponse,
+  Assignment, BeatResponse, JoinResponse, LeaderboardResponse, NextResponse, NoteResponse,
+  ProposeResponse, ProjectInfo, ReleaseResponse, SubmitResponse, SubmissionView, VoteResponse,
+  HeadDecideResponse, HeadRuleResponse,
 } from "../core/protocol.ts";
 import type {
   AcceptPolicy, AgentId, Claim, NoteKind, ProposalId, ProposalKind, Rules, TaskId,
@@ -37,6 +38,8 @@ export interface ParsedCli {
   action?: string;
   options: Record<string, ParsedValue>;
   positionals: string[];
+  /** Verbatim arguments for `serve`, forwarded to the Bun server. */
+  raw?: string[];
 }
 
 const COMMON_OPTIONS: OptionSet = {
@@ -55,6 +58,7 @@ const COMMAND_OPTIONS: Record<string, OptionSet> = {
   next: {
     model: { type: "string" },
     approach: { type: "string" },
+    wait: { type: "string" },
   },
   beat: {
     model: { type: "string" },
@@ -66,6 +70,11 @@ const COMMAND_OPTIONS: Record<string, OptionSet> = {
     message: { type: "string", short: "m" },
     root: { type: "string" },
     model: { type: "string" },
+    // `--no-wait` sets this to false; the default is true.
+    wait: { type: "boolean" },
+  },
+  result: {
+    wait: { type: "boolean" },
   },
   release: {
     handoff: { type: "string" },
@@ -79,6 +88,19 @@ const COMMAND_OPTIONS: Record<string, OptionSet> = {
   vote: {},
   status: {},
   board: {},
+  init: {
+    name: { type: "string" },
+    goal: { type: "string" },
+    scope: { type: "string" },
+    check: { type: "string" },
+    paths: { type: "string" },
+    branch: { type: "string" },
+    force: { type: "boolean" },
+  },
+  doctor: {
+    repo: { type: "string" },
+  },
+  mcp: {},
 };
 
 const HEAD_OPTIONS: Record<string, OptionSet> = {
@@ -118,16 +140,23 @@ function cleanValues(
 }
 
 function parseTail(args: string[], extra: OptionSet): { options: Record<string, ParsedValue>; positionals: string[] } {
+  // Bun's parseArgs does not treat --no-wait as the negation of --wait, so
+  // normalise it to an explicit flag and fold it back afterwards.
   const parsed = parseArgs({
-    args,
-    options: { ...COMMON_OPTIONS, ...extra },
+    args: args.map((arg) => arg === "--no-wait" ? "--nowait" : arg),
+    options: { ...COMMON_OPTIONS, ...extra, nowait: { type: "boolean" } },
     allowPositionals: true,
     strict: true,
   }) as {
     values: Record<string, string | boolean | (string | boolean)[] | undefined>;
     positionals: string[];
   };
-  return { options: cleanValues(parsed.values), positionals: parsed.positionals };
+  const options = cleanValues(parsed.values);
+  if (options.nowait === true) {
+    options.wait = false;
+    delete options.nowait;
+  }
+  return { options, positionals: parsed.positionals };
 }
 
 export function parseCli(argv: string[]): ParsedCli {
@@ -137,6 +166,12 @@ export function parseCli(argv: string[]): ParsedCli {
     return { command: "help", options: {}, positionals: argv.slice(1) };
   }
   if (first.startsWith("-")) throw new Error(`unexpected option: ${first} (try "minga help")`);
+
+  // `serve` forwards its flags to the Bun server verbatim, so it is parsed
+  // separately: only this CLI's own --json/--dir/--help are stripped later.
+  if (first === "serve") {
+    return { command: "serve", options: {}, positionals: [], raw: argv.slice(1) };
+  }
 
   if (first === "head") {
     const action = argv[1];
@@ -307,19 +342,12 @@ export async function joinCommand(client: Client, input: JoinInput): Promise<Joi
 export interface NextInput {
   model?: string;
   approach?: string;
+  /** Total seconds to keep asking. 0 means a single request. */
+  wait?: number;
+  onProgress?: (line: string) => void;
 }
 
-export async function nextCommand(client: Client, input: NextInput = {}): Promise<CommandResult<NextResponse>> {
-  const response = await client.next({
-    ...(input.model !== undefined ? { model: input.model } : {}),
-    ...(input.approach !== undefined ? { approach: input.approach } : {}),
-  });
-  const a = response.assignment;
-  if (!a) {
-    const wait = response.retryAfterSeconds ?? 60;
-    return { text: `nothing to do, retry in ${wait}s`, data: response };
-  }
-
+function formatAssignment(a: Assignment): string {
   const lines = [
     `attempt   ${a.attempt}`,
     `role      ${a.role}`,
@@ -344,8 +372,170 @@ export async function nextCommand(client: Client, input: NextInput = {}): Promis
       lines.push(`  ${other.attempt} ${other.agent} ${other.model} ${other.role}${approach}`);
     }
   }
-  return { text: lines.join("\n"), data: response };
+  return lines.join("\n");
 }
+
+/**
+ * POST /api/next with `wait` seconds, repeated until an assignment arrives or
+ * the total budget is used up. Each individual request waits at most 30 s.
+ */
+export async function nextCommand(client: Client, input: NextInput = {}): Promise<CommandResult<NextResponse>> {
+  const total = Math.max(0, Math.floor(input.wait ?? 0));
+  const started = Date.now();
+  let last: NextResponse | undefined;
+
+  for (;;) {
+    const remaining = total - (Date.now() - started) / 1000;
+    const chunk = total === 0 ? 0 : Math.min(30, remaining);
+    if (total > 0 && chunk <= 0) break;
+
+    const t0 = Date.now();
+    const response = await client.next({
+      ...(input.model !== undefined ? { model: input.model } : {}),
+      ...(input.approach !== undefined ? { approach: input.approach } : {}),
+      ...(chunk > 0 ? { wait: chunk } : {}),
+    });
+    if (response.assignment) return { text: formatAssignment(response.assignment), data: response };
+    last = response;
+    input.onProgress?.(`waiting for a task (retry in ${response.retryAfterSeconds ?? 60}s)`);
+
+    if (total === 0 || chunk <= 0) break;
+    // A server that ignores `wait` must not spin the CPU in a tight loop.
+    if (Date.now() - t0 < 50) {
+      const rest = total - (Date.now() - started) / 1000;
+      if (rest <= 0) break;
+      await new Promise<void>((done) => setTimeout(done, Math.min(100, rest * 1000)));
+    }
+  }
+
+  const wait = last?.retryAfterSeconds ?? 60;
+  return {
+    text: `nothing to do, retry in ${wait}s`,
+    data: last ?? { assignment: null, retryAfterSeconds: wait },
+  };
+}
+
+// ---------------------------------------------------------------- submit / result
+
+export interface SubmitInput {
+  attempt: string;
+  claim: Claim;
+  message: string;
+  /** Paths as given on the command line, relative to `root` unless absolute. */
+  files: string[];
+  root?: string;
+  model?: string;
+  /** Default true: poll for the verdict. `--no-wait` sets this to false. */
+  wait?: boolean;
+  onProgress?: (line: string) => void;
+}
+
+/** `data` for --json is the queued acknowledgement or the final submission view. */
+export type SubmitView = SubmissionView | SubmitResponse;
+
+/** Reads `files` and maps them to repo-relative POSIX paths (protocol SubmitRequest.files). */
+export function readSubmissionFiles(root: string, files: string[]): Record<string, string> {
+  const resolvedRoot = resolve(root);
+  const out: Record<string, string> = {};
+  for (const file of files) {
+    const absolute = isAbsolute(file) ? file : resolve(resolvedRoot, file);
+    const rel = relative(resolvedRoot, absolute);
+    if (rel.length === 0 || rel === ".." || rel.startsWith(`..${sep}`) || isAbsolute(rel)) {
+      throw new Error(`file is outside the repo root: ${file}`);
+    }
+    if (rel.split(sep)[0] === ".minga") throw new Error(`refusing to submit ${file}: .minga/ holds your private key`);
+    out[rel.split(sep).join("/")] = readFileSync(absolute, "utf8");
+  }
+  return out;
+}
+
+function isFinal(status: string): boolean {
+  return status === "accepted" || status === "rejected";
+}
+
+/** Poll GET /api/submission/<id>?wait=30 until a final status is returned. */
+export async function waitForSubmission(
+  client: Client,
+  id: string,
+  onProgress?: (line: string) => void,
+  initialStatus = "queued",
+): Promise<SubmissionView> {
+  let lastStatus = initialStatus;
+  // Each poll holds the connection for up to 30 s; 1000 polls is > 8 hours.
+  for (let i = 0; i < 1000; i++) {
+    const view = await client.submission(id, 30);
+    if (view.status !== lastStatus) {
+      lastStatus = view.status;
+      if (view.status === "checking") onProgress?.(`checking ${id}`);
+    }
+    if (isFinal(view.status)) {
+      onProgress?.(`verdict ${view.status} ${id}`);
+      return view;
+    }
+  }
+  throw new Error(`submission ${id} has no verdict yet; check it with "minga result ${id}"`);
+}
+
+/** The exact text printed for a submission, shared by submit and result. */
+export function renderSubmission(view: SubmitView): string {
+  // The ack uses `submission`; the view returned by GET uses `id`.
+  const id = "submission" in view ? view.submission : view.id;
+  if (view.status === "queued") {
+    const position = "position" in view ? ` #${view.position}` : "";
+    return `submission ${id}: queued${position}`;
+  }
+  const lines: string[] = [];
+  if (view.status === "checking") lines.push(`submission ${id}: checking`);
+  else lines.push(`verdict: ${view.status}`, `submission ${id}`);
+  lines.push(`exit code: ${view.exitCode ?? 0}${view.timedOut ? " (timed out)" : ""}`);
+  if (view.outputTail && view.outputTail.length > 0) {
+    lines.push("output tail:", indent(view.outputTail));
+  }
+  if (view.commit !== undefined) lines.push(`commit: ${view.commit}`);
+  lines.push(`points: ${view.points}`);
+  return lines.join("\n");
+}
+
+/** 0 while pending or accepted, 2 when the project's check rejected the work. */
+export function submissionExitCode(view: { status?: string }): number {
+  return view.status === "rejected" ? 2 : 0;
+}
+
+export async function submitCommand(client: Client, input: SubmitInput): Promise<CommandResult<SubmitView>> {
+  if (input.files.length === 0) throw new Error("submit needs at least one file");
+  const files = readSubmissionFiles(input.root ?? process.cwd(), input.files);
+  const queued = await client.submit({
+    attempt: input.attempt,
+    claim: input.claim,
+    message: input.message,
+    files,
+    ...(input.model !== undefined ? { model: input.model } : {}),
+  });
+
+  const progress = `queued ${queued.submission} #${queued.position}`;
+  input.onProgress?.(progress);
+  if (input.wait === false) return { text: progress, data: queued };
+
+  const final = await waitForSubmission(client, queued.submission, input.onProgress);
+  return { text: renderSubmission(final), data: final };
+}
+
+export interface ResultInput {
+  submission: string;
+  wait?: boolean;
+  onProgress?: (line: string) => void;
+}
+
+export async function resultCommand(client: Client, input: ResultInput): Promise<CommandResult<SubmissionView>> {
+  const id = input.submission;
+  if (!/^S-\d+$/.test(id)) throw new Error(`result needs a submission id like S-1, got "${id}"`);
+  const view = input.wait === true
+    ? await waitForSubmission(client, id, input.onProgress)
+    : await client.submission(id, 0);
+  return { text: renderSubmission(view), data: view };
+}
+
+// ---------------------------------------------------------------- other verbs
 
 export interface BeatInput {
   attempt: string;
@@ -377,58 +567,6 @@ export async function noteCommand(client: Client, input: NoteInput): Promise<Com
   };
 }
 
-// ---------------------------------------------------------------- submit
-
-export interface SubmitInput {
-  attempt: string;
-  claim: Claim;
-  message: string;
-  /** Paths as given on the command line, relative to `root` unless absolute. */
-  files: string[];
-  root?: string;
-  model?: string;
-}
-
-/** Reads `files` and maps them to repo-relative POSIX paths (protocol SubmitRequest.files). */
-export function readSubmissionFiles(root: string, files: string[]): Record<string, string> {
-  const resolvedRoot = resolve(root);
-  const out: Record<string, string> = {};
-  for (const file of files) {
-    const absolute = isAbsolute(file) ? file : resolve(resolvedRoot, file);
-    const rel = relative(resolvedRoot, absolute);
-    if (rel.length === 0 || rel === ".." || rel.startsWith(`..${sep}`) || isAbsolute(rel)) {
-      throw new Error(`file is outside the repo root: ${file}`);
-    }
-    if (rel.split(sep)[0] === ".minga") throw new Error(`refusing to submit ${file}: .minga/ holds your private key`);
-    out[rel.split(sep).join("/")] = readFileSync(absolute, "utf8");
-  }
-  return out;
-}
-
-export async function submitCommand(client: Client, input: SubmitInput): Promise<CommandResult<SubmitResponse>> {
-  if (input.files.length === 0) throw new Error("submit needs at least one file");
-  const files = readSubmissionFiles(input.root ?? process.cwd(), input.files);
-  const response = await client.submit({
-    attempt: input.attempt,
-    claim: input.claim,
-    message: input.message,
-    files,
-    ...(input.model !== undefined ? { model: input.model } : {}),
-  });
-
-  const lines = [
-    `submission ${response.submission}`,
-    `ok: ${response.ok}`,
-    `exit code: ${response.exitCode}${response.timedOut ? " (timed out)" : ""}`,
-  ];
-  if (response.commit !== undefined) lines.push(`commit: ${response.commit}`);
-  lines.push(`points: ${response.points}`, `task status: ${response.taskStatus}`);
-  if (!response.ok) {
-    lines.push("output tail:", indent(response.outputTail.length > 0 ? response.outputTail : "(empty)"));
-  }
-  return { text: lines.join("\n"), data: response };
-}
-
 export interface ReleaseInput {
   attempt: string;
   handoff?: string;
@@ -444,8 +582,6 @@ export async function releaseCommand(client: Client, input: ReleaseInput): Promi
     : `released ${input.attempt}`;
   return { text, data: response };
 }
-
-// ---------------------------------------------------------------- proposals & votes
 
 export interface ProposeInput {
   kind: ProposalKind;

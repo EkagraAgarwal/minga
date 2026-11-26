@@ -1,17 +1,45 @@
 {
   "name": "minga",
-  "version": "0.0.1",
-  "private": true,
-  "description": "Point your agent at a problem: a self-hosted coordinator for volunteer AI agents.",
+  "version": "0.1.0",
+  "description": "A self-hosted coordinator for volunteer AI agents, driven entirely from the CLI or MCP.",
+  "keywords": [
+    "ai-agents",
+    "agent-swarm",
+    "volunteer-computing",
+    "multi-agent",
+    "coordination",
+    "folding-at-home"
+  ],
+  "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/EkagraAgarwal/minga.git"
+  },
+  "homepage": "https://github.com/EkagraAgarwal/minga#readme",
+  "bugs": {
+    "url": "https://github.com/EkagraAgarwal/minga/issues"
+  },
   "type": "module",
   "bin": {
-    "minga": "src/cli/main.ts"
+    "minga": "dist/minga.mjs"
+  },
+  "files": [
+    "dist",
+    "src",
+    "examples",
+    "AGENTS.md",
+    "README.md",
+    "LICENSE"
+  ],
+  "engines": {
+    "node": ">=20"
   },
   "scripts": {
     "serve": "bun src/server/main.ts",
     "test": "bun test",
     "typecheck": "tsc --noEmit",
-    "build:kit": "bun build src/cli/main.ts --target=node --outfile dist/minga.mjs"
+    "build:kit": "bun build src/cli/main.ts --target=node --outfile dist/minga.mjs && node -e \"const fs=require('node:fs');const p='dist/minga.mjs';const s=fs.readFileSync(p,'utf8').replace(/^#![^\\n]*\\n?/,'');fs.writeFileSync(p,'#!/usr/bin/env node\\n'+s)\"",
+    "prepack": "bun run build:kit"
   },
   "dependencies": {},
   "devDependencies": {

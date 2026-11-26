@@ -1,40 +1,70 @@
 /**
- * Local development server for the Observatory UI.
+ * Development server for the lab-notebook UI.
  *
- *   bun src/ui/dev-server.ts            -> http://localhost:7778
- *   PORT=9000 bun src/ui/dev-server.ts
+ *   bun src/ui/dev-server.ts --agents 400 --tasks 240 --rate 15 --port 7778
  *
  * Serves:
- *   GET /           the single-file app (src/ui/index.html)
- *   GET /api/state  a consistent fixture snapshot (StateResponse)
- *   GET /api/stream a text/event-stream of plausible MingaEvents
- *   GET /join       a short pointer to the real join document
+ *   GET /             src/ui/index.html
+ *   GET /api/view     ViewResponse (v2 snapshot)
+ *   GET /api/stream   text/event-stream of real MingaEvent shapes, seq ascending
+ *   GET /join         plain text join document
  *
- * One fake event is emitted every 1-2 seconds and the fixture is mutated so
- * /api/state always reflects the events already sent.
+ * The fixture is mutated by the same events that are broadcast, so a fresh
+ * /api/view always describes the events already sent. The stream honours both
+ * ?after=<seq> and Last-Event-ID, and keeps a bounded replay buffer.
  */
 import { join } from "node:path";
 import type {
-  AgentId, AgentState, AttemptEndReason, AttemptState, Claim, DecidedBy, Leaderboard, LeaderRow,
-  ModelRow, MingaEvent, NoteKind, NoteState, ProposalKind, ProposalState, Role, Rules,
-  State, SubmissionState, TaskId, TaskState, TaskStatus,
+  Actor, AgentId, AgentState, AttemptEndReason, AttemptId, AttemptState, Claim, DecidedBy,
+  EventType, Leaderboard, LeaderRow, MingaEvent, ModelRow, NoteId, NoteKind, NoteState,
+  ProposalId, ProposalKind, ProposalState, Role, Rules, SubmissionId, SubmissionState,
+  TaskId, TaskState, TaskStatus,
 } from "../core/types.ts";
-import type { ProjectInfo, StateResponse } from "../core/protocol.ts";
+import type { ProjectInfo, ViewResponse, ViewTask } from "../core/protocol.ts";
 import { NOTE_KINDS, ROLES } from "../core/types.ts";
 
-const PORT = Number(process.env.PORT || 7778);
+// ---------------------------------------------------------------- flags
+
+interface Flags { agents: number; tasks: number; rate: number; port: number }
+
+function parseFlags(argv: string[]): Flags {
+  const out: Flags = {
+    agents: 400,
+    tasks: 240,
+    rate: 15,
+    port: Number(process.env.PORT || 7778),
+  };
+  const names: Record<string, keyof Flags> = { agents: "agents", tasks: "tasks", rate: "rate", port: "port" };
+  for (let i = 0; i < argv.length; i += 1) {
+    const raw = argv[i] ?? "";
+    const eq = raw.indexOf("=");
+    const key = (eq >= 0 ? raw.slice(0, eq) : raw).replace(/^--/, "");
+    const name = names[key];
+    if (!name) continue;
+    const value = eq >= 0 ? raw.slice(eq + 1) : argv[i + 1];
+    if (value === undefined) continue;
+    if (eq < 0) i += 1;
+    const n = Number(value);
+    if (Number.isFinite(n) && n > 0) out[name] = Math.floor(n);
+  }
+  return out;
+}
+
+const FLAGS = parseFlags(process.argv.slice(2));
 const HTML_PATH = join(import.meta.dir, "index.html");
 const HEAD: AgentId = "a7f3c1d2e5b60481";
 const encoder = new TextEncoder();
+const MAX_REPLAY = 10000;
+const MAX_PENDING = 400;
 
-// ---------------------------------------------------------------- rules & project
+// ---------------------------------------------------------------- fixture data
 
 const rules: Rules = {
-  width: 3,
+  width: 6,
   leaseMinutes: 45,
-  maxAttemptsPerAgent: 2,
+  maxAttemptsPerAgent: 6,
   roles: { explore: 1, build: 2, attack: 1, distill: 0.5, plan: 0.25 },
-  accept: { mode: "head" },
+  accept: { mode: "head-or-votes", votes: 2 },
   defaultPoints: 20,
 };
 
@@ -48,41 +78,121 @@ const project: ProjectInfo = {
   rules,
 };
 
-// ---------------------------------------------------------------- fixture state
+interface Counters { task: number; attempt: number; note: number; submission: number; proposal: number }
 
-const state: State = {
+const db = {
   seq: 0,
-  rules,
-  agents: {},
-  tasks: {},
-  attempts: {},
-  notes: {},
-  submissions: {},
-  proposals: {},
-  counters: { task: 0, attempt: 0, note: 0, submission: 0, proposal: 0 },
+  counters: { task: 0, attempt: 0, note: 0, submission: 0, proposal: 0 } as Counters,
+  agents: {} as Record<AgentId, AgentState>,
+  tasks: {} as Record<TaskId, TaskState>,
+  attempts: {} as Record<AttemptId, AttemptState>,
+  notes: {} as Record<NoteId, NoteState>,
+  submissions: {} as Record<SubmissionId, SubmissionState>,
+  proposals: {} as Record<ProposalId, ProposalState>,
 };
 
-const randomHex = (n: number): string =>
-  Array.from({ length: n }, () => "0123456789abcdef"[Math.floor(Math.random() * 16)] ?? "0").join("");
+const liveIds: AttemptId[] = [];
+const liveIdsSet = new Set<AttemptId>();
+const noteOrder: NoteId[] = [];
+const submissionOrder: SubmissionId[] = [];
+const pendingIds: SubmissionId[] = [];
+const proposalIds: ProposalId[] = [];
+const events: MingaEvent[] = [];
+interface Pending { id: SubmissionId; startAt: number; checkAt: number }
+const pipeline: Pending[] = [];
+let eventCounter = 0;
 
+// Deterministic fixture: a hostile string in a dev run is always the fixture's fault, not chance.
+let rngState = 0x9e3779b9;
+const rnd = (): number => {
+  rngState = (rngState + 0x6d2b79f5) | 0;
+  let t = rngState;
+  t = Math.imul(t ^ (t >>> 15), t | 1);
+  t ^= t + Math.imul(t ^ (t >>> 7), t | 61);
+  return ((t ^ (t >>> 14)) >>> 0) / 4294967296;
+};
+const int = (lo: number, hi: number): number => lo + Math.floor(rnd() * (hi - lo + 1));
+const pick = <T>(xs: readonly T[]): T | undefined => xs.length ? xs[Math.floor(rnd() * xs.length)] : undefined;
+const hex = (n: number): string => {
+  let s = "";
+  for (let i = 0; i < n; i += 1) s += "0123456789abcdef"[int(0, 15)];
+  return s;
+};
 const isoAgo = (minutes: number): string => new Date(Date.now() - minutes * 60000).toISOString();
 const nowIso = (): string => new Date().toISOString();
-const pick = <T>(xs: readonly T[]): T | undefined => xs.length ? xs[Math.floor(Math.random() * xs.length)] : undefined;
 
-function addAgent(id: AgentId, model: string, harness: string, at = new Date()): AgentState {
+const MODELS = [
+  "claude-opus-5.5", "gpt-6", "deepseek-v4.1-flash", "hy4-flash",
+  "kimi-k3", "glm-5.3", "gemini-4",
+] as const;
+const HARNESSES = ["claude-code", "codex", "opencode", "hermes", "pi"] as const;
+const OWNERS = [
+  "mrcat", "lambda-factory", "hans-m", "t-void", "nprof", "orbitals", "sable-ko",
+  "yzhou", "bitbucket", "proofsmith", "cold-sun", "rngbot",
+] as const;
+
+const APPROACHES: Record<Role, readonly string[]> = {
+  build: [
+    "induction on gate count", "Finset counting over the gate set", "reuse Mathlib.SetFamily",
+    "decide for small n, then generalise", "restate with an explicit witness",
+  ],
+  explore: [
+    "sketch on paper first", "search the literature for the sharp constant",
+    "try the probabilistic method", "look for a smaller counterexample",
+  ],
+  attack: [
+    "hunt for a counterexample, n <= 6", "check the claim against the barrier list",
+    "stress the hypothesis that looks too weak",
+  ],
+  distill: ["merge three hand-offs into one dossier", "summarise the failed routes"],
+  plan: ["split the lemma into two checkable goals", "write the skeleton first"],
+};
+
+const NOTE_TEXT: Record<NoteKind, readonly string[]> = {
+  idea: ["Finset.card_le_card closes the bound", "the switching route avoids this barrier", "try the contrapositive"],
+  result: ["holds for n <= 5 by decide", "counterexample at n = 4", "the reduction is linear"],
+  question: ["is a hypothesis missing?", "does this hold for monotone formulas?", "should the bound be strict?"],
+  handoff: ["base case done, stuck on induction", "lease ran out mid-proof", "last attempt failed the check"],
+};
+
+const MESSAGES = [
+  "close the induction step", "add explicit witnesses", "trim the auxiliary lemma",
+  "checked small cases", "rewrite with decidable equality",
+];
+
+const AREA_TITLES = [
+  "Circuit lower bounds", "Formula size and switching", "Reductions library", "Barrier desk",
+  "Combinatorial core", "Oracle constructions", "Proof infrastructure", "Lean tooling",
+  "Resolution and width", "Communication games", "Set systems", "Complexity separations",
+] as const;
+
+const LEAF_TITLES = [
+  "Razborov approximation step", "Sunflower lemma (Erdos-Rado)", "Hastad switching lemma",
+  "Karchmer-Wigderson depth game", "SAT <=p 3-SAT", "3-SAT <=p CLIQUE",
+  "Andreev function bound", "Resolution width gap", "Monotone circuit bound",
+  "Shrinkage exponent", "Backdoor set search", "CLIQUE <=p VERTEX-COVER",
+  "Oracle B with P^B != NP^B", "Relativization check", "Contractions and minors",
+  "Entropy bound on set families", "Decision tree to formula", "Polynomial method step",
+] as const;
+
+// ---------------------------------------------------------------- seeding
+
+function addAgent(model: string, harness: string, owner?: string, atMs = Date.now()): AgentState {
+  const id = hex(16);
   const a: AgentState = {
     id,
-    publicKey: "ed25519:demo-" + id,
+    publicKey: "ed25519:fixture-" + id,
     model,
     harness,
-    joinedAt: at.toISOString(),
-    lastSeenAt: at.toISOString(),
+    joinedAt: new Date(atMs).toISOString(),
+    lastSeenAt: new Date(atMs).toISOString(),
     banned: false,
     points: 0,
     accepted: 0,
     submissions: 0,
   };
-  state.agents[id] = a;
+  if (owner) a.owner = owner;
+  db.agents[id] = a;
   return a;
 }
 
@@ -90,26 +200,22 @@ function addTask(
   title: string, body: string, parent: TaskId | null, status: TaskStatus,
   points: number, ageMinutes: number,
 ): TaskState {
-  const id: TaskId = `T-${++state.counters.task}`;
-  const postedAt = new Date(Date.now() - ageMinutes * 60000).toISOString();
+  const id: TaskId = "T-" + (++db.counters.task);
   const t: TaskState = {
-    id, title, body, parent, children: [], status, points, postedAt, attempts: [], notes: [],
+    id, title, body, parent, children: [], status, points,
+    postedAt: new Date(Date.now() - ageMinutes * 60000).toISOString(),
+    attempts: [], notes: [],
   };
-  state.tasks[id] = t;
-  if (parent) state.tasks[parent]?.children.push(id);
+  db.tasks[id] = t;
+  if (parent && db.tasks[parent]) db.tasks[parent]!.children.push(id);
   return t;
 }
 
 function addAttempt(
-  task: TaskState, agent: AgentState, role: Role, approach: string,
-  opts: { live: boolean; startedMinAgo?: number; leaseMinLeft?: number; reason?: AttemptEndReason },
+  task: TaskState, agent: AgentState, role: Role, approach: string, leaseMinutes: number,
 ): AttemptState {
-  const id = `A-${++state.counters.attempt}`;
-  const now = Date.now();
-  const started = now - (opts.startedMinAgo ?? 8) * 60000;
-  const lease = opts.live
-    ? new Date(now + (opts.leaseMinLeft ?? state.rules.leaseMinutes) * 60000)
-    : new Date(started + 20 * 60000);
+  const id: AttemptId = "A-" + (++db.counters.attempt);
+  const started = Date.now() - int(1, 18) * 60000;
   const a: AttemptState = {
     id,
     task: task.id,
@@ -118,206 +224,317 @@ function addAttempt(
     approach,
     model: agent.model,
     startedAt: new Date(started).toISOString(),
-    leaseUntil: lease.toISOString(),
-    lastBeatAt: new Date(now).toISOString(),
+    leaseUntil: new Date(Date.now() + leaseMinutes * 60000).toISOString(),
+    lastBeatAt: new Date(started + 60000).toISOString(),
   };
-  if (!opts.live) {
-    a.endedAt = new Date(started + 20 * 60000).toISOString();
-    a.endReason = opts.reason ?? "submitted";
-  }
+  db.attempts[id] = a;
   task.attempts.push(id);
-  state.attempts[id] = a;
-  agent.lastSeenAt = nowIso();
+  liveIds.push(id);
+  liveIdsSet.add(id);
   return a;
 }
 
-function addNote(task: TaskState, agent: AgentState, kind: NoteKind, text: string, at = new Date()): NoteState {
-  const id = `N-${++state.counters.note}`;
-  const n: NoteState = { id, task: task.id, agent: agent.id, kind, text, at: at.toISOString() };
+function addNote(task: TaskState, agent: AgentState, kind: NoteKind, text: string, atMs: number): NoteState {
+  const id: NoteId = "N-" + (++db.counters.note);
+  const n: NoteState = { id, task: task.id, agent: agent.id, kind, text, at: new Date(atMs).toISOString() };
+  db.notes[id] = n;
   task.notes.unshift(id);
-  state.notes[id] = n;
+  noteOrder.unshift(id);
   return n;
 }
 
-function makeSubmission(
-  task: TaskState, attempt: AttemptState, ok: boolean, claim: Claim, points: number, at = new Date(),
+let lastSubmissionAt = Date.now() - 600000;
+function addSubmission(
+  task: TaskState, attempt: AttemptState, agent: AgentState, status: SubmissionState["status"],
+  ok: boolean,
 ): SubmissionState {
-  const id = `S-${++state.counters.submission}`;
+  const id: SubmissionId = "S-" + (++db.counters.submission);
+  lastSubmissionAt += int(500, 4000);
+  const claim: Claim = ok ? (rnd() < 0.8 ? "solves" : "refutes") : "progress";
   const s: SubmissionState = {
-    submission: id,
+    id,
     attempt: attempt.id,
     task: task.id,
-    agent: attempt.agent,
+    agent: agent.id,
     model: attempt.model,
     claim,
+    message: pick(MESSAGES) ?? "check the lemma",
     files: ["Proofs/Main.lean"],
-    ok,
-    exitCode: ok ? 0 : 1,
-    timedOut: false,
-    outputTail: ok
-      ? "Build completed successfully.\n"
-      : "error: unsolved goals\n  case h : Nat.succ n = n + 1\n",
-    durationMs: ok ? 4200 : 2600,
-    points,
-    at: at.toISOString(),
+    bytes: int(200, 8000),
+    status,
+    queuedAt: new Date(lastSubmissionAt).toISOString(),
+    runs: status === "queued" ? 0 : 1,
+    points: ok ? task.points : 0,
   };
-  if (ok) s.commit = randomHex(7);
-  state.submissions[id] = s;
+  if (status !== "queued") {
+    s.checkedAt = new Date(lastSubmissionAt + 3000).toISOString();
+    s.ok = ok;
+    s.exitCode = ok ? 0 : 1;
+    s.timedOut = false;
+    s.durationMs = int(1200, 9000);
+    if (ok) s.commit = hex(7);
+  }
+  if (status === "checking") s.startedAt = new Date(lastSubmissionAt + 1000).toISOString();
+  db.submissions[id] = s;
+  submissionOrder.unshift(id);
+  if (status === "queued" || status === "checking") pendingIds.push(id);
+  if (ok) { agent.accepted += 1; agent.points += task.points; }
+  agent.submissions += 1;
   return s;
 }
 
 function seed(): void {
-  addAgent(HEAD, "claude-opus-4.5", "Claude Code", new Date(Date.now() - 300 * 60000));
-  const gpt = addAgent("19bc4a7f0e2d1538", "gpt-5.6", "Codex");
-  const deepseek = addAgent("b3f9d2046e8a1c75", "deepseek-v4.1", "OpenCode");
-  const gemini = addAgent("8d1ae5f3c70b2946", "gemini-3-pro", "Antigravity");
-  const qwen = addAgent("4e02b6c9d1a70f83", "qwen-3.5-coder", "Hermes");
-  addAgent("c7e2a904f61b3d58", "llama-5-70b", "pi");
+  const head = addAgent("claude-opus-5.5", "claude-code", "head-keeper", Date.now() - 300 * 60000);
+  db.agents[HEAD] = head;
+  delete db.agents[head.id];
+  head.id = HEAD;
+  head.publicKey = "ed25519:fixture-head";
 
-  const t1 = addTask("Monotone circuit lower bounds", "Close the gap between approximation and exact monotone circuit size.", null, "open", 40, 240);
-  const t2 = addTask("Razborov approximation step", "Formalise the approximation method with explicit error bounds.", t1.id, "open", 60, 180);
-  const t3 = addTask("Sunflower lemma (Erdős–Rado)", "Prove the sunflower bound with the sharp constant used downstream.", t1.id, "solved", 50, 150);
-  const t4 = addTask("Formula-size lower bounds", "Håstad-style switching for De Morgan formulas.", null, "open", 45, 220);
-  addTask("Håstad switching lemma", "State and prove the switching lemma for random restrictions.", t4.id, "open", 55, 120);
-  addTask("Karchmer–Wigderson depth game", "Connect formula depth to the communication game.", t4.id, "open", 50, 110);
-  const t7 = addTask("Barrier desk", "Check candidate routes against the known barriers before committing.", null, "open", 30, 200);
-  const t8 = addTask("Oracle with P^A = NP^A", "Exhibit an oracle making the two classes equal; document the relativisation barrier.", t7.id, "refuted", 35, 100);
-  const t9 = addTask("Reductions library", "Small, reusable polynomial-time reductions with checked sizes.", null, "open", 25, 190);
-  const t10 = addTask("SAT ≤ₚ 3-SAT", "Clause-gadget reduction with a linear blow-up.", t9.id, "solved", 45, 140);
-  const t11 = addTask("3-SAT ≤ₚ CLIQUE", "Graph construction and both directions of the reduction.", t9.id, "open", 40, 90);
-  addTask("Relativization check for KW route", "Superseded by the barrier desk note.", t7.id, "withdrawn", 30, 80);
-  const t13 = addTask("Random restriction shrinkage exponent", "Pin the exponent used by the formula-size route.", t4.id, "open", 35, 40);
+  const agents: AgentState[] = [];
+  for (let i = 1; i < FLAGS.agents; i += 1) {
+    const model = MODELS[i % MODELS.length] ?? "hy4-flash";
+    const harness = HARNESSES[(i + 1) % HARNESSES.length] ?? "opencode";
+    const owner = i % 4 === 0 ? undefined : OWNERS[i % OWNERS.length];
+    const a = addAgent(model, harness, owner, Date.now() - int(0, 600) * 60000);
+    if (rnd() < 0.72) a.lastSeenAt = new Date(Date.now() - int(0, 14) * 60000).toISOString();
+    const subs = int(0, 14);
+    a.submissions = subs;
+    a.accepted = Math.floor(subs * (0.2 + rnd() * 0.65));
+    a.points = a.accepted * int(10, 60);
+    agents.push(a);
+  }
 
-  // solved / refuted history
-  const a3 = addAttempt(t3, gpt, "build", "induction on the set-family size", { live: false, startedMinAgo: 130, reason: "submitted" });
-  makeSubmission(t3, a3, true, "solves", t3.points, new Date(Date.now() - 40 * 60000));
-  gpt.submissions += 1; gpt.accepted += 1; gpt.points += t3.points;
-  t3.closedAt = isoAgo(40); t3.closedBy = gpt.id;
+  const total = Math.max(4, FLAGS.tasks);
+  const areaCount = Math.max(2, Math.min(AREA_TITLES.length, Math.round(Math.sqrt(total) / 2)));
+  const subCount = Math.min(Math.max(2, total - areaCount - 1), areaCount * 3);
+  const areas: TaskState[] = [];
+  for (let i = 0; i < areaCount; i += 1) {
+    const a = addTask(AREA_TITLES[i] ?? "Area " + (i + 1), "Branch point. Leaves below carry the work.", null, "open", 0, int(120, 400));
+    areas.push(a);
+  }
+  const subs: TaskState[] = [];
+  for (let i = 0; i < subCount; i += 1) {
+    const area = areas[i % areas.length]!;
+    subs.push(addTask("Subarea " + (i + 1), "Grouping of related leaves.", area.id, "open", 0, int(90, 320)));
+  }
+  const leaves = total - areaCount - subCount;
+  for (let i = 0; i < leaves; i += 1) {
+    const parent = subs[i % subs.length]!;
+    const base = LEAF_TITLES[i % LEAF_TITLES.length] ?? "Lemma " + (i + 1);
+    const title = i < LEAF_TITLES.length ? base : base + " (variant " + (1 + Math.floor(i / LEAF_TITLES.length)) + ")";
+    const roll = rnd();
+    const status: TaskStatus = roll < 0.06 ? "solved" : roll < 0.1 ? "refuted" : roll < 0.13 ? "impossible" : roll < 0.16 ? "withdrawn" : "open";
+    const t = addTask(title, "Prove or refute the statement with machine-checked steps in Proofs/**.", parent.id, status, int(10, 80), int(10, 300));
+    if (status !== "open") t.closedAt = isoAgo(int(5, 90));
+  }
 
-  const a8 = addAttempt(t8, gemini, "attack", "exhibit an oracle separating the classes", { live: false, startedMinAgo: 95, reason: "submitted" });
-  makeSubmission(t8, a8, true, "refutes", t8.points, new Date(Date.now() - 55 * 60000));
-  gemini.submissions += 1; gemini.accepted += 1; gemini.points += t8.points;
-  t8.closedAt = isoAgo(55); t8.closedBy = gemini.id;
+  const leafTasks = Object.values(db.tasks).filter(t => t.children.length === 0);
+  const openLeaves = leafTasks.filter(t => t.status === "open");
+  const target = Math.min(1500, openLeaves.length * rules.width, agents.length * rules.maxAttemptsPerAgent);
+  const perAgent = new Map<AgentId, number>();
+  for (let i = 0; i < target; i += 1) {
+    const task = pick(openLeaves);
+    if (!task) break;
+    let agent: AgentState | undefined;
+    for (let tries = 0; tries < 4 && !agent; tries += 1) {
+      const candidate = pick(agents);
+      if (!candidate) break;
+      const used = perAgent.get(candidate.id) ?? 0;
+      if (used < rules.maxAttemptsPerAgent) {
+        perAgent.set(candidate.id, used + 1);
+        agent = candidate;
+      }
+    }
+    if (!agent) agent = agents[i % agents.length];
+    if (!agent) break;
+    const role = pick(ROLES) ?? "build";
+    addAttempt(task, agent, role, pick(APPROACHES[role]) ?? "", int(5, 45));
+  }
 
-  const a10 = addAttempt(t10, qwen, "build", "clause gadget with one variable per literal", { live: false, startedMinAgo: 80, reason: "submitted" });
-  makeSubmission(t10, a10, true, "solves", t10.points, new Date(Date.now() - 30 * 60000));
-  qwen.submissions += 1; qwen.accepted += 1; qwen.points += t10.points;
-  t10.closedAt = isoAgo(30); t10.closedBy = qwen.id;
+  for (let i = 0; i < Math.min(100, leafTasks.length); i += 1) {
+    const t = leafTasks[i]!;
+    const a = agents[i % agents.length];
+    if (!a) break;
+    addNote(t, a, pick(NOTE_KINDS) ?? "idea", pick(NOTE_TEXT.idea) ?? "", Date.now() - i * 60000);
+  }
 
-  const a11 = addAttempt(t11, deepseek, "build", "tableau reduction via clause gadget", { live: false, startedMinAgo: 60, reason: "submitted" });
-  makeSubmission(t11, a11, false, "progress", 0, new Date(Date.now() - 20 * 60000));
-  deepseek.submissions += 1;
-
-  // live attempts (overlap on T-2)
-  addAttempt(t2, gpt, "build", "Finset counting over the gate set", { live: true, startedMinAgo: 12, leaseMinLeft: 33 });
-  addAttempt(t2, deepseek, "attack", "hunt for a counterexample at width 3", { live: true, startedMinAgo: 7, leaseMinLeft: 12 });
-  addAttempt(state.tasks["T-5"]!, gemini, "explore", "search the literature for the sharp constant", { live: true, startedMinAgo: 20, leaseMinLeft: 40 });
-  addAttempt(state.tasks["T-6"]!, qwen, "build", "restate the game with explicit witnesses", { live: true, startedMinAgo: 3, leaseMinLeft: 5 });
-
-  // notes (oldest first so the newest ends up first)
-  addNote(t2, gpt, "idea", "Finset.card_le_card closes the bound", new Date(Date.now() - 9 * 60000));
-  addNote(state.tasks["T-5"]!, gemini, "result", "holds for n ≤ 5 by decide", new Date(Date.now() - 7 * 60000));
-  addNote(t11, deepseek, "result", "counterexample to the weak form at n = 4", new Date(Date.now() - 5 * 60000));
-  addNote(t2, deepseek, "handoff", "base case done, stuck on the induction step", new Date(Date.now() - 2 * 60000));
-
-  // one accepted proposal, with the task it created
-  state.counters.proposal = 1;
-  state.proposals["P-1"] = {
-    id: "P-1",
-    agent: gemini.id,
-    kind: "new_task",
-    task: t4.id,
-    title: t13.title,
-    body: t13.body,
-    at: isoAgo(70),
-    votes: { [gpt.id]: true },
-    decided: { accepted: true, by: "head", at: isoAgo(50) },
-  };
+  for (let i = 0; i < 8; i += 1) {
+    const id: SubmissionId = "S-" + (++db.counters.submission);
+    const t = leafTasks[i]!;
+    const a = agents[i]!;
+    const att = db.attempts[t.attempts[0] ?? ""];
+    if (!att) break;
+    const s: SubmissionState = {
+      id, attempt: att.id, task: t.id, agent: a.id, model: a.model, claim: "solves",
+      message: "queued at boot", files: ["Proofs/Main.lean"], bytes: 1024, status: "queued",
+      queuedAt: new Date(Date.now() - i * 20000).toISOString(), runs: 0, points: 0,
+    };
+    db.submissions[id] = s;
+    submissionOrder.unshift(id);
+    pendingIds.push(id);
+    pipeline.push({ id, startAt: Date.now() + int(500, 2500), checkAt: Date.now() + int(3500, 9000) });
+  }
+  lastSubmissionAt = Date.now() - 600000;
 }
 
 seed();
 
-// ---------------------------------------------------------------- derived leaderboard
+// ---------------------------------------------------------------- leaderboard
 
 function computeLeaderboard(): Leaderboard {
-  const agents: LeaderRow[] = [];
-  for (const a of Object.values(state.agents)) {
-    if (a.banned) continue;
+  const all = Object.values(db.agents).filter(a => !a.banned);
+  const rows: LeaderRow[] = all.map(a => {
     const row: LeaderRow = {
-      agent: a.id, model: a.model, harness: a.harness, points: a.points,
-      accepted: a.accepted, submissions: a.submissions,
+      agent: a.id, model: a.model, harness: a.harness,
+      points: a.points, accepted: a.accepted, submissions: a.submissions,
     };
     if (a.owner) row.owner = a.owner;
-    agents.push(row);
-  }
-  agents.sort((x, y) => y.points - x.points || y.accepted - x.accepted || x.agent.localeCompare(y.agent));
+    return row;
+  });
+  rows.sort((x, y) => y.points - x.points || y.accepted - x.accepted || x.agent.localeCompare(y.agent));
 
-  const groups = new Map<string, { agentIds: Set<string>; points: number; accepted: number; submissions: number }>();
-  for (const s of Object.values(state.submissions)) {
-    const key = s.model || "unknown";
-    let g = groups.get(key);
-    if (!g) {
-      g = { agentIds: new Set(), points: 0, accepted: 0, submissions: 0 };
-      groups.set(key, g);
-    }
-    g.agentIds.add(s.agent);
-    g.points += s.points;
-    if (s.ok) g.accepted += 1;
-    g.submissions += 1;
+  const groups = new Map<string, { agents: number; points: number; accepted: number; submissions: number }>();
+  for (const a of all) {
+    let g = groups.get(a.model);
+    if (!g) { g = { agents: 0, points: 0, accepted: 0, submissions: 0 }; groups.set(a.model, g); }
+    g.agents += 1;
+    g.points += a.points;
+    g.accepted += a.accepted;
+    g.submissions += a.submissions;
   }
   const models: ModelRow[] = [...groups.entries()].map(([model, g]) => ({
-    model,
-    agents: g.agentIds.size,
-    points: g.points,
-    accepted: g.accepted,
-    submissions: g.submissions,
+    model, agents: g.agents, points: g.points, accepted: g.accepted, submissions: g.submissions,
     passRate: g.submissions ? g.accepted / g.submissions : 0,
   }));
   models.sort((x, y) => y.points - x.points || x.model.localeCompare(y.model));
-
-  return { agents, models };
+  return { agents: rows.slice(0, 100), models };
 }
 
-function snapshot(): StateResponse {
-  return { project, state, leaderboard: computeLeaderboard(), now: nowIso() };
+// ---------------------------------------------------------------- view snapshot
+
+function buildView(): ViewResponse {
+  const now = Date.now();
+  const liveByTask = new Map<TaskId, number>();
+  for (const id of liveIds) {
+    const a = db.attempts[id];
+    if (!a || a.endedAt || Date.parse(a.leaseUntil) <= now) continue;
+    liveByTask.set(a.task, (liveByTask.get(a.task) ?? 0) + 1);
+  }
+  const liveAttempts: AttemptState[] = [];
+  for (const id of liveIds) {
+    const a = db.attempts[id];
+    if (a && !a.endedAt && Date.parse(a.leaseUntil) > now) liveAttempts.push(a);
+  }
+
+  const tasks: ViewTask[] = Object.values(db.tasks).map(t => ({
+    id: t.id, title: t.title, body: t.body, parent: t.parent, children: t.children.slice(),
+    status: t.status, points: t.points, postedAt: t.postedAt,
+    ...(t.closedAt ? { closedAt: t.closedAt } : {}),
+    ...(t.closedBy ? { closedBy: t.closedBy } : {}),
+    attemptCount: t.attempts.length,
+    noteCount: t.notes.length,
+    liveCount: liveByTask.get(t.id) ?? 0,
+  }));
+  tasks.sort((a, b) => Number(a.id.slice(2)) - Number(b.id.slice(2)));
+
+  const agents = Object.values(db.agents).sort((a, b) => Date.parse(b.lastSeenAt) - Date.parse(a.lastSeenAt)).slice(0, 2000);
+  const notes = noteOrder.map(id => db.notes[id]).filter((n): n is NoteState => !!n).slice(0, 100);
+  const finished = submissionOrder.map(id => db.submissions[id]).filter((s): s is SubmissionState => !!s && (s.status === "accepted" || s.status === "rejected")).slice(0, 100);
+  const pending = pendingIds.map(id => db.submissions[id]).filter((s): s is SubmissionState => !!s && (s.status === "queued" || s.status === "checking"));
+  const proposals = proposalIds.map(id => db.proposals[id]).filter((p): p is ProposalState => !!p)
+    .filter(p => !p.decided).concat(proposalIds.map(id => db.proposals[id]).filter((p): p is ProposalState => !!p && !!p.decided).slice(0, 50));
+
+  let queued = 0, checking = 0;
+  for (const s of pending) { if (s.status === "queued") queued += 1; else checking += 1; }
+  const activeAgents = Object.values(db.agents).filter(a => Date.parse(a.lastSeenAt) >= now - 15 * 60000).length;
+  let accepted = 0;
+  for (const a of Object.values(db.agents)) accepted += a.accepted;
+
+  return {
+    project,
+    seq: db.seq,
+    now: new Date(now).toISOString(),
+    totals: {
+      agents: Object.keys(db.agents).length,
+      activeAgents,
+      tasks: tasks.length,
+      openTasks: tasks.filter(t => t.status === "open").length,
+      liveAttempts: liveAttempts.length,
+      queuedSubmissions: queued,
+      checkingSubmissions: checking,
+      submissions: db.counters.submission,
+      accepted,
+      notes: db.counters.note,
+      events: db.seq,
+    },
+    tasks,
+    attempts: liveAttempts,
+    agents,
+    notes,
+    submissions: pending.concat(finished),
+    proposals,
+    leaderboard: computeLeaderboard(),
+  };
 }
 
 // ---------------------------------------------------------------- SSE plumbing
 
-const clients = new Set<ReadableStreamDefaultController<Uint8Array>>();
+interface Client { controller: ReadableStreamDefaultController<Uint8Array>; after: number }
+const clients = new Set<Client>();
+
+function encode(frame: string): Uint8Array { return encoder.encode(frame); }
 
 function broadcast(event: MingaEvent): void {
   const frame = `id: ${event.seq}\nevent: ${event.type}\ndata: ${JSON.stringify(event)}\n\n`;
-  const bytes = encoder.encode(frame);
+  const bytes = encode(frame);
   for (const c of clients) {
-    try { c.enqueue(bytes); } catch { clients.delete(c); }
+    if (event.seq <= c.after) continue;
+    c.after = event.seq;
+    try { c.controller.enqueue(bytes); } catch { clients.delete(c); }
   }
 }
 
-function emit(type: string, actor: string, data: unknown): MingaEvent {
-  state.seq += 1;
-  const event = { seq: state.seq, at: nowIso(), type, actor, data } as unknown as MingaEvent;
+function emit(type: EventType, actor: Actor, data: Record<string, unknown>): MingaEvent {
+  db.seq += 1;
+  eventCounter += 1;
+  const event = { seq: db.seq, at: nowIso(), type, actor, data } as unknown as MingaEvent;
+  events.push(event);
+  if (events.length > MAX_REPLAY) events.splice(0, events.length - MAX_REPLAY);
   broadcast(event);
   return event;
 }
 
 setInterval(() => {
-  const ping = encoder.encode(": ping\n\n");
+  const ping = encode(": ping\n\n");
   for (const c of clients) {
-    try { c.enqueue(ping); } catch { clients.delete(c); }
+    try { c.controller.enqueue(ping); } catch { clients.delete(c); }
   }
 }, 20000);
 
-function streamResponse(): Response {
+function streamResponse(req: Request): Response {
+  const url = new URL(req.url);
+  const queryAfter = Number(url.searchParams.get("after") ?? 0);
+  const headerId = Number(req.headers.get("last-event-id") ?? 0);
+  let after = Math.max(Number.isFinite(queryAfter) ? queryAfter : 0, Number.isFinite(headerId) ? headerId : 0);
   let controller: ReadableStreamDefaultController<Uint8Array> | null = null;
   const body = new ReadableStream<Uint8Array>({
     start(c) {
       controller = c;
-      clients.add(c);
-      c.enqueue(encoder.encode("retry: 2000\n\n: connected\n\n"));
+      const client: Client = { controller: c, after };
+      clients.add(client);
+      c.enqueue(encode("retry: 2000\n\n: connected\n\n"));
+      const from = Math.max(0, events.length - 200);
+      for (let i = from; i < events.length; i += 1) {
+        const e = events[i]!;
+        if (e.seq <= after) continue;
+        c.enqueue(encode(`id: ${e.seq}\nevent: ${e.type}\ndata: ${JSON.stringify(e)}\n\n`));
+        client.after = e.seq;
+      }
     },
     cancel() {
-      if (controller) clients.delete(controller);
+      if (controller) {
+        for (const c of clients) if (c.controller === controller) clients.delete(c);
+      }
     },
   });
   return new Response(body, {
@@ -332,349 +549,299 @@ function streamResponse(): Response {
 
 // ---------------------------------------------------------------- fixture mutation
 
-function liveAttempts(): AttemptState[] {
-  const now = Date.now();
-  return Object.values(state.attempts).filter(a => !a.endedAt && Date.parse(a.leaseUntil) > now);
-}
-
-function liveOnTask(taskId: TaskId): AttemptState[] {
-  return liveAttempts().filter(a => a.task === taskId);
-}
-
-function agentLive(agentId: AgentId): AttemptState[] {
-  return liveAttempts().filter(a => a.agent === agentId);
-}
-
-function openLeaves(): TaskState[] {
-  return Object.values(state.tasks).filter(t => t.children.length === 0 && t.status === "open");
-}
-
-const APPROACHES: Record<Role, readonly string[]> = {
-  build: [
-    "direct proof by induction on gates",
-    "Finset counting argument",
-    "reuse Mathlib Combinatorics.SetFamily",
-    "decide for small n, then generalise",
-    "restate with an explicit witness",
-  ],
-  explore: [
-    "sketch on paper first",
-    "search the literature for the sharp constant",
-    "try the probabilistic method",
-    "look for a smaller counterexample",
-  ],
-  attack: [
-    "hunt for a counterexample, n ≤ 6",
-    "check the statement against the barrier list",
-    "stress the hypothesis that looks too weak",
-  ],
-  distill: [
-    "merge three hand-offs into one dossier",
-    "summarise the failed routes",
-  ],
-  plan: [
-    "split the lemma into two checkable goals",
-    "write the proof skeleton first",
-  ],
-};
-
-const NOTE_TEXT: Record<NoteKind, readonly string[]> = {
-  idea: [
-    "Finset.card_le_card closes the bound",
-    "the switching lemma route avoids this barrier",
-    "try the contrapositive with an explicit witness",
-  ],
-  result: [
-    "holds for n ≤ 5 by decide",
-    "counterexample to the weak form at n = 4",
-    "the reduction is linear in the number of clauses",
-  ],
-  question: [
-    "is a hypothesis missing from the statement?",
-    "does this still hold for monotone formulas?",
-    "should the bound be strict at n = 2?",
-  ],
-  handoff: [
-    "base case done, stuck on the induction step",
-    "lease ran out mid-proof, partial work on branch",
-    "last attempt failed the check, see output",
-  ],
-};
-
-const NEW_TITLES: readonly string[] = [
-  "Approximator error bound, plus side",
-  "Sunflower bound with the sharp constant",
-  "Lift CLIQUE bound to perfect matching",
-  "Andreev function formula bound",
-  "Oracle B with P^B ≠ NP^B",
-  "CLIQUE ≤ₚ VERTEX-COVER",
-  "Backdoor-set search on hard instances",
-  "Resolution width lower bound check",
-];
-
-function actionStart(): boolean {
-  const tasks = openLeaves();
-  const agents = Object.values(state.agents).filter(a => !a.banned);
-  for (let i = 0; i < 24; i += 1) {
-    const t = pick(tasks);
-    const a = pick(agents);
-    if (!t || !a) continue;
-    const onTask = liveOnTask(t.id);
-    if (onTask.length >= state.rules.width) continue;
-    if (agentLive(a.id).length >= state.rules.maxAttemptsPerAgent) continue;
-    if (onTask.some(x => x.agent === a.id)) continue;
-    const role = pick(ROLES) ?? "build";
-    const approach = pick(APPROACHES[role]) ?? "";
-    const att = addAttempt(t, a, role, approach, { live: true, leaseMinLeft: state.rules.leaseMinutes });
-    a.lastSeenAt = nowIso();
-    emit("attempt.started", a.id, {
-      attempt: att.id, task: t.id, agent: a.id, role, approach, model: a.model, leaseUntil: att.leaseUntil,
-    });
-    return true;
+function liveAttempt(): AttemptState | undefined {
+  for (let i = 0; i < 8; i += 1) {
+    const id = pick(liveIds);
+    if (!id) return undefined;
+    const a = db.attempts[id];
+    if (a && !a.endedAt && Date.parse(a.leaseUntil) > Date.now()) return a;
   }
-  return false;
+  return undefined;
+}
+
+function liveOn(task: TaskId): AttemptState[] {
+  const out: AttemptState[] = [];
+  for (const id of liveIds) {
+    const a = db.attempts[id];
+    if (a && !a.endedAt && a.task === task) out.push(a);
+  }
+  return out;
+}
+
+function activeAgents(): AgentState[] {
+  return Object.values(db.agents).filter(a => !a.banned);
+}
+
+function someOpenLeaf(): TaskState | undefined {
+  for (let i = 0; i < 12; i += 1) {
+    const t = pick(Object.values(db.tasks));
+    if (t && t.children.length === 0 && t.status === "open") return t;
+  }
+  return undefined;
+}
+
+function endAttempt(a: AttemptState, reason: AttemptEndReason): void {
+  if (a.endedAt) return;
+  a.endedAt = nowIso();
+  a.endReason = reason;
+  liveIdsSet.delete(a.id);
+  emit("attempt.ended", a.agent, { attempt: a.id, reason });
 }
 
 function actionBeat(): boolean {
-  const att = pick(liveAttempts());
-  if (!att) return false;
-  att.leaseUntil = new Date(Date.now() + state.rules.leaseMinutes * 60000).toISOString();
-  att.lastBeatAt = nowIso();
-  const a = state.agents[att.agent];
-  if (a) a.lastSeenAt = att.lastBeatAt;
-  emit("attempt.beat", att.agent, { attempt: att.id, leaseUntil: att.leaseUntil, model: att.model });
+  const a = liveAttempt();
+  if (!a) return false;
+  a.leaseUntil = new Date(Date.now() + rules.leaseMinutes * 60000).toISOString();
+  a.lastBeatAt = nowIso();
+  const agent = db.agents[a.agent];
+  if (agent) agent.lastSeenAt = a.lastBeatAt;
+  emit("attempt.beat", a.agent, { attempt: a.id, leaseUntil: a.leaseUntil, model: a.model });
   return true;
 }
 
-function actionEnd(): boolean {
-  const att = pick(liveAttempts());
-  if (!att) return false;
-  att.endedAt = nowIso();
-  att.endReason = "released";
-  emit("attempt.ended", att.agent, { attempt: att.id, reason: "released" });
+function actionStart(): boolean {
+  const t = someOpenLeaf();
+  if (!t) return false;
+  const onTask = liveOn(t.id);
+  if (onTask.length >= rules.width) return false;
+  const a = pick(activeAgents());
+  if (!a) return false;
+  const held = liveIds.filter(id => db.attempts[id]?.agent === a.id).length;
+  if (held >= rules.maxAttemptsPerAgent) return false;
+  const role = pick(ROLES) ?? "build";
+  const approach = pick(APPROACHES[role]) ?? "";
+  const att = addAttempt(t, a, role, approach, rules.leaseMinutes);
+  a.lastSeenAt = nowIso();
+  emit("attempt.started", a.id, {
+    attempt: att.id, task: t.id, agent: a.id, role, approach, model: a.model, leaseUntil: att.leaseUntil,
+  });
   return true;
 }
 
 function actionNote(): boolean {
-  const agents = Object.values(state.agents).filter(a => !a.banned);
-  const a = pick(agents);
+  const a = pick(activeAgents());
   if (!a) return false;
-  const att = pick(agentLive(a.id));
-  const task = att ? state.tasks[att.task] : pick(openLeaves()) ?? pick(Object.values(state.tasks));
-  if (!task) return false;
+  const held = liveIds.filter(id => db.attempts[id]?.agent === a.id)
+    .map(id => db.attempts[id]).filter((x): x is AttemptState => !!x);
+  const att = pick(held) ?? liveAttempt();
+  const t = att ? db.tasks[att.task] : someOpenLeaf();
+  if (!t) return false;
   const kind = pick(NOTE_KINDS) ?? "idea";
   const text = pick(NOTE_TEXT[kind]) ?? "note";
-  const note = addNote(task, a, kind, text);
+  const n = addNote(t, a, kind, text, Date.now());
   a.lastSeenAt = nowIso();
-  emit("note.added", a.id, { note: note.id, task: task.id, agent: a.id, kind, text });
+  emit("note.added", a.id, { note: n.id, task: t.id, agent: a.id, kind, text });
   return true;
 }
 
 function actionSubmit(): boolean {
-  const att = pick(liveAttempts());
+  if (pendingIds.length >= MAX_PENDING) return false;
+  const att = liveAttempt();
   if (!att) return false;
-  const task = state.tasks[att.task];
-  const agent = state.agents[att.agent];
+  const task = db.tasks[att.task];
+  const agent = db.agents[att.agent];
   if (!task || !agent) return false;
-
-  const ok = Math.random() < 0.5;
-  const roll = Math.random();
-  const claim: Claim = !ok ? "progress" : roll < 0.55 ? "solves" : roll < 0.8 ? "progress" : "refutes";
-  const points = ok ? task.points : 0;
-
-  att.endedAt = nowIso();
-  att.endReason = "submitted";
-  agent.submissions += 1;
-  if (ok) {
-    agent.accepted += 1;
-    agent.points += points;
-  }
+  const id: SubmissionId = "S-" + (++db.counters.submission);
+  const s: SubmissionState = {
+    id, attempt: att.id, task: task.id, agent: agent.id, model: att.model,
+    claim: rnd() < 0.75 ? "solves" : "progress",
+    message: pick(MESSAGES) ?? "check the lemma", files: ["Proofs/Main.lean"],
+    bytes: int(100, 12000), status: "queued", queuedAt: nowIso(), runs: 0, points: 0,
+  };
+  db.submissions[id] = s;
+  submissionOrder.unshift(id);
+  pendingIds.push(id);
+  pipeline.push({ id, startAt: Date.now() + int(200, 1200), checkAt: Date.now() + int(2500, 6000) });
   agent.lastSeenAt = nowIso();
-
-  const s = makeSubmission(task, att, ok, claim, points);
-  emit("submission.checked", s.agent, {
-    submission: s.submission, attempt: s.attempt, task: s.task, agent: s.agent, model: s.model,
-    claim: s.claim, files: s.files, ok: s.ok, exitCode: s.exitCode, timedOut: s.timedOut,
-    outputTail: s.outputTail, durationMs: s.durationMs, commit: s.commit, points: s.points,
+  emit("submission.queued", agent.id, {
+    submission: id, attempt: att.id, task: task.id, agent: agent.id, model: att.model,
+    claim: s.claim, message: s.message, files: s.files, bytes: s.bytes,
   });
+  return true;
+}
 
-  if (ok && claim !== "progress") {
-    const status: TaskStatus = claim === "refutes" ? "refuted" : "solved";
-    task.status = status;
-    task.closedAt = nowIso();
-    task.closedBy = agent.id;
-    for (const other of liveOnTask(task.id)) {
-      if (other.id === att.id) continue;
-      other.endedAt = nowIso();
-      other.endReason = "task_closed";
-      emit("attempt.ended", other.agent, { attempt: other.id, reason: "task_closed" });
+function runPipeline(): void {
+  const now = Date.now();
+  for (let i = pipeline.length - 1; i >= 0; i -= 1) {
+    const p = pipeline[i]!;
+    const s = db.submissions[p.id];
+    if (!s) { pipeline.splice(i, 1); continue; }
+    if (s.status === "queued" && now >= p.startAt) {
+      s.status = "checking";
+      s.startedAt = nowIso();
+      s.base = hex(7);
+      emit("submission.started", s.agent, { submission: s.id, base: s.base, round: s.runs });
+      s.runs += 1;
+    } else if (s.status === "checking" && now >= p.checkAt) {
+      const ok = rnd() < 0.42;
+      const task = db.tasks[s.task];
+      const agent = db.agents[s.agent];
+      s.status = ok ? "accepted" : "rejected";
+      s.checkedAt = nowIso();
+      s.ok = ok;
+      s.exitCode = ok ? 0 : 1;
+      s.timedOut = false;
+      s.durationMs = int(900, 8000);
+      const outputTail = ok ? "lake build: ok\n" : "error: unsolved goals\n";
+      s.points = ok && task ? task.points : 0;
+      if (ok) { s.commit = hex(7); if (agent) { agent.accepted += 1; agent.points += s.points; } }
+      if (agent) agent.submissions += 1;
+      emit("submission.checked", s.agent, {
+        submission: s.id, attempt: s.attempt, task: s.task, agent: s.agent, model: s.model,
+        claim: s.claim, files: s.files, base: s.base ?? "", ok, exitCode: s.exitCode,
+        timedOut: false, outputTail, durationMs: s.durationMs,
+        commit: s.commit, points: s.points,
+      });
+      const where = pendingIds.indexOf(s.id);
+      if (where >= 0) pendingIds.splice(where, 1);
+      pipeline.splice(i, 1);
+      if (ok && task && s.claim !== "progress" && task.status === "open") {
+        const status: TaskStatus = s.claim === "refutes" ? "refuted" : "solved";
+        task.status = status;
+        task.closedAt = nowIso();
+        task.closedBy = s.agent;
+        emit("task.closed", "server", { task: task.id, status, agent: s.agent, submission: s.id });
+        const others = liveOn(task.id).filter(a => a.id !== s.attempt).slice(0, 4);
+        for (const other of others) endAttempt(other, "task_closed");
+      }
     }
-    emit("task.closed", "server", { task: task.id, status, agent: agent.id, submission: s.submission });
   }
+}
+
+function actionEnd(): boolean {
+  const a = liveAttempt();
+  if (!a) return false;
+  endAttempt(a, "released");
   return true;
 }
 
 function actionPropose(): boolean {
-  const agents = Object.values(state.agents).filter(a => !a.banned);
-  const a = pick(agents);
-  if (!a) return false;
-  const task = pick(openLeaves()) ?? pick(Object.values(state.tasks));
-  const kind: ProposalKind = Math.random() < 0.85 ? "new_task" : "impossible";
-  const title = pick(NEW_TITLES) ?? "New lemma";
-  const id = `P-${++state.counters.proposal}`;
+  const a = pick(activeAgents());
+  const t = someOpenLeaf();
+  if (!a || !t) return false;
+  const id: ProposalId = "P-" + (++db.counters.proposal);
+  const kind: ProposalKind = rnd() < 0.85 ? "new_task" : "impossible";
   const p: ProposalState = {
-    id,
-    agent: a.id,
-    kind,
-    task: task ? (kind === "impossible" ? task.id : task.parent) : null,
-    title: kind === "new_task" ? title : undefined,
-    body: kind === "new_task" ? "A smaller checkable step toward the parent goal." : undefined,
-    evidence: kind === "impossible" ? "The statement fails for the stated range; see the note trail." : undefined,
-    at: nowIso(),
-    votes: {},
+    id, agent: a.id, kind, task: kind === "impossible" ? t.id : t.parent,
+    at: nowIso(), votes: {},
   };
-  state.proposals[id] = p;
+  if (kind === "new_task") { p.title = "Refinement of " + t.title; p.body = "A smaller checkable step toward the parent goal."; }
+  else p.evidence = "The statement fails on small cases; see the note trail.";
+  db.proposals[id] = p;
+  proposalIds.unshift(id);
   a.lastSeenAt = nowIso();
   emit("proposal.made", a.id, {
-    proposal: p.id, agent: p.agent, kind: p.kind, task: p.task,
-    title: p.title, body: p.body, evidence: p.evidence,
+    proposal: id, agent: a.id, kind, task: p.task, title: p.title, body: p.body, evidence: p.evidence,
   });
   return true;
 }
 
-function decideProposal(p: ProposalState, accepted: boolean, by: DecidedBy): void {
-  if (p.decided) return;
-  p.decided = { accepted, by, at: nowIso(), reason: accepted ? "within declared scope" : "outside declared scope" };
+function decide(p: ProposalState, accepted: boolean, by: DecidedBy): void {
+  p.decided = { accepted, by, reason: accepted ? "within declared scope" : "outside declared scope", at: nowIso() };
   emit("proposal.decided", "server", { proposal: p.id, accepted, by, reason: p.decided.reason });
-
   if (!accepted) return;
   if (p.kind === "new_task") {
-    const t = addTask(p.title ?? "New task", p.body ?? "", p.task, "open", state.rules.defaultPoints, 0);
+    const t = addTask(p.title ?? "New task", p.body ?? "", p.task, "open", rules.defaultPoints, 0);
     emit("task.posted", HEAD, {
       task: t.id, title: t.title, body: t.body, parent: t.parent, points: t.points, by: "head", proposal: p.id,
     });
-  } else if (p.kind === "impossible" && p.task) {
-    const t = state.tasks[p.task];
-    if (t && t.status === "open") {
-      t.status = "impossible";
-      t.closedAt = nowIso();
-      t.closedBy = p.agent;
-      emit("task.closed", "server", { task: t.id, status: "impossible", agent: p.agent, proposal: p.id });
-    }
+  } else if (p.task && db.tasks[p.task]?.status === "open") {
+    const t = db.tasks[p.task]!;
+    t.status = "impossible";
+    t.closedAt = nowIso();
+    emit("task.closed", "server", { task: t.id, status: "impossible", agent: p.agent, proposal: p.id });
   }
 }
 
 function actionVote(): boolean {
-  const undecided = Object.values(state.proposals).filter(p => !p.decided);
-  const p = pick(undecided);
+  const open = proposalIds.map(id => db.proposals[id]).filter((p): p is ProposalState => !!p && !p.decided);
+  const p = pick(open);
   if (!p) return false;
-  const voters = Object.values(state.agents).filter(a => !a.banned && a.id !== p.agent && !(a.id in p.votes));
+  const voters = activeAgents().filter(a => a.id !== p.agent && !(a.id in p.votes));
   const a = pick(voters);
   if (!a) return false;
-  const approve = Math.random() < 0.7;
+  const approve = rnd() < 0.7;
   p.votes[a.id] = approve;
-  a.lastSeenAt = nowIso();
   emit("proposal.voted", a.id, { proposal: p.id, agent: a.id, approve });
-  if (Object.values(p.votes).filter(Boolean).length >= 2) decideProposal(p, true, "vote");
+  if (Object.values(p.votes).filter(Boolean).length >= 2) decide(p, true, "vote");
   return true;
 }
 
 function actionDecide(): boolean {
-  const undecided = Object.values(state.proposals).filter(p => !p.decided);
-  const p = pick(undecided);
+  const open = proposalIds.map(id => db.proposals[id]).filter((p): p is ProposalState => !!p && !p.decided);
+  const p = pick(open);
   if (!p) return false;
-  decideProposal(p, Math.random() < 0.65, "head");
+  decide(p, rnd() < 0.6, "head");
   return true;
 }
 
 function actionJoin(): boolean {
-  if (Object.keys(state.agents).length >= 14) return false;
-  const models: readonly { model: string; harness: string }[] = [
-    { model: "claude-opus-4.5", harness: "Claude Code" },
-    { model: "gpt-5.6", harness: "Codex" },
-    { model: "gemini-3-pro", harness: "Antigravity" },
-    { model: "deepseek-v4.1", harness: "OpenCode" },
-    { model: "qwen-3.5-coder", harness: "Hermes" },
-    { model: "llama-5-70b", harness: "pi" },
-  ];
-  const m = pick(models);
-  if (!m) return false;
-  let id = randomHex(16);
-  while (state.agents[id]) id = randomHex(16);
-  const a = addAgent(id, m.model, m.harness);
-  emit("agent.joined", id, {
-    agent: id, publicKey: a.publicKey, model: a.model, harness: a.harness, rejoin: false,
+  const a = addAgent(pick(MODELS) ?? "hy4-flash", pick(HARNESSES) ?? "opencode", rnd() < 0.7 ? pick(OWNERS) : undefined);
+  emit("agent.joined", a.id, {
+    agent: a.id, publicKey: a.publicKey, model: a.model, harness: a.harness, rejoin: false,
+    ...(a.owner ? { owner: a.owner } : {}),
   });
   return true;
 }
 
 function actionPost(): boolean {
-  if (Object.keys(state.tasks).length >= 60) return false;
-  const parent = pick(Object.values(state.tasks)) ?? null;
-  const title = pick(NEW_TITLES) ?? "New task";
-  const t = addTask(title, "Posted by the head agent from the dev fixture.", parent ? parent.id : null, "open", state.rules.defaultPoints, 0);
-  emit("task.posted", HEAD, {
-    task: t.id, title: t.title, body: t.body, parent: t.parent, points: t.points, by: "head",
-  });
+  const parent = pick(Object.values(db.tasks));
+  const title = "Refinement of " + (pick(LEAF_TITLES) ?? "lemma");
+  const t = addTask(title, "Posted from the dev fixture.", parent ? parent.id : null, "open", rules.defaultPoints, 0);
+  emit("task.posted", HEAD, { task: t.id, title: t.title, body: t.body, parent: t.parent, points: t.points, by: "head" });
   return true;
 }
 
 function actionBan(): boolean {
-  const candidates = Object.values(state.agents).filter(a => !a.banned && a.id !== HEAD);
+  const candidates = activeAgents().filter(a => a.id !== HEAD);
   const a = pick(candidates);
   if (!a) return false;
   a.banned = true;
   emit("agent.banned", "server", { agent: a.id, reason: "repeated off-scope submissions" });
+  for (const id of [...liveIds]) {
+    const att = db.attempts[id];
+    if (att && att.agent === a.id) endAttempt(att, "banned");
+  }
   return true;
 }
 
-function expireLeases(): void {
-  const now = Date.now();
-  for (const a of Object.values(state.attempts)) {
-    if (a.endedAt) continue;
-    if (Date.parse(a.leaseUntil) > now) continue;
-    a.endedAt = nowIso();
-    a.endReason = "expired";
-    emit("attempt.ended", a.agent, { attempt: a.id, reason: "expired" });
-  }
+function actionRule(): boolean {
+  const width = int(4, 8);
+  rules.width = width;
+  emit("rule.changed", HEAD, { rules: { width } });
+  return true;
 }
 
 function step(): void {
-  const roll = Math.random();
+  runPipeline();
+  const roll = rnd();
   let done = false;
-  if (roll < 0.18) done = actionBeat();
-  else if (roll < 0.34) done = actionNote();
-  else if (roll < 0.5) done = actionStart();
-  else if (roll < 0.6) done = actionEnd();
-  else if (roll < 0.74) done = actionSubmit();
-  else if (roll < 0.82) done = actionPropose();
-  else if (roll < 0.88) done = actionVote();
-  else if (roll < 0.93) done = actionDecide();
-  else if (roll < 0.97) done = actionJoin();
-  else if (roll < 0.995) done = actionPost();
-  else done = actionBan();
-  if (!done) {
-    done = actionBeat();
-    if (!done) actionNote();
+  if (roll < 0.26) done = actionBeat();
+  else if (roll < 0.40) done = actionStart();
+  else if (roll < 0.52) done = actionNote();
+  else if (roll < 0.65) done = actionSubmit();
+  else if (roll < 0.71) done = actionEnd();
+  else if (roll < 0.77) done = actionPropose();
+  else if (roll < 0.83) done = actionVote();
+  else if (roll < 0.87) done = actionDecide();
+  else if (roll < 0.92) done = actionJoin();
+  else if (roll < 0.96) done = actionPost();
+  else if (roll < 0.98) done = actionBan();
+  else done = actionRule();
+  if (!done) actionBeat();
+  if (eventCounter % 40 === 0) {
+    const now = Date.now();
+    for (const id of [...liveIds]) {
+      const att = db.attempts[id];
+      if (att && !att.endedAt && Date.parse(att.leaseUntil) <= now) endAttempt(att, "expired");
+    }
   }
 }
 
-function run(): void {
-  const tick = (): void => {
-    try {
-      expireLeases();
-      const head = state.agents[HEAD];
-      if (head) head.lastSeenAt = nowIso();
-      step();
-    } catch (err) {
-      console.error("fixture tick failed", err);
-    }
-    setTimeout(tick, 1000 + Math.random() * 1000);
-  };
-  setTimeout(tick, 800);
-}
-
-void run();
+const interval = Math.max(1, Math.round(1000 / FLAGS.rate));
+setInterval(() => {
+  try { step(); } catch (err) { console.error("fixture tick failed", err); }
+}, interval);
 
 // ---------------------------------------------------------------- HTTP
 
@@ -682,14 +849,14 @@ const JOIN_TEXT = `Minga join
 ----------------
 Point an agent at this coordinator:
 
-  curl -fsSL ${"<origin>"}/kit/minga.mjs -o minga.mjs && node minga.mjs join ${"<origin>"} --model <model> --harness <harness>
+  curl -fsSL <origin>/kit/minga.mjs -o minga.mjs && node minga.mjs join <origin> --model <model> --harness <harness>
 
 In this development server the CLI itself is not served; use the real
 coordinator's /kit/minga.mjs. This route exists so the UI link resolves.
 `;
 
 const server = Bun.serve({
-  port: PORT,
+  port: FLAGS.port,
   idleTimeout: 0,
   fetch(req) {
     const url = new URL(req.url);
@@ -698,22 +865,20 @@ const server = Bun.serve({
         headers: { "content-type": "text/html; charset=utf-8", "cache-control": "no-store" },
       });
     }
-    if (url.pathname === "/api/state") {
-      return new Response(JSON.stringify(snapshot()), {
+    if (url.pathname === "/api/view") {
+      return new Response(JSON.stringify(buildView()), {
         headers: { "content-type": "application/json; charset=utf-8", "cache-control": "no-store" },
       });
     }
-    if (url.pathname === "/api/stream") return streamResponse();
+    if (url.pathname === "/api/stream") return streamResponse(req);
     if (url.pathname === "/join") {
       return new Response(JOIN_TEXT, { headers: { "content-type": "text/plain; charset=utf-8" } });
     }
-    return new Response("not found\n", {
-      status: 404,
-      headers: { "content-type": "text/plain; charset=utf-8" },
-    });
+    return new Response("not found\n", { status: 404, headers: { "content-type": "text/plain; charset=utf-8" } });
   },
 });
 
-console.log(`Observatory dev server on http://localhost:${server.port}`);
-console.log(`  state  http://localhost:${server.port}/api/state`);
+console.log(`Minga lab notebook on http://localhost:${server.port}`);
+console.log(`  agents ${FLAGS.agents}  tasks ${FLAGS.tasks}  rate ${FLAGS.rate}/s`);
+console.log(`  view   http://localhost:${server.port}/api/view`);
 console.log(`  stream http://localhost:${server.port}/api/stream`);

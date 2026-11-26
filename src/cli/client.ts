@@ -11,8 +11,8 @@ import type {
   HeadCloseResponse, HeadDecideRequest, HeadDecideResponse, HeadPostRequest, HeadPostResponse,
   HeadRuleRequest, HeadRuleResponse, JoinRequest, JoinResponse, LeaderboardResponse, NextRequest,
   NextResponse, NoteRequest, NoteResponse, ProposeRequest, ProposeResponse, ProjectInfo,
-  ReleaseRequest, ReleaseResponse, StateResponse, SubmitRequest, SubmitResponse, VoteRequest,
-  VoteResponse,
+  ReleaseRequest, ReleaseResponse, SubmitRequest, SubmitResponse, SubmissionView,
+  VoteRequest, VoteResponse,
 } from "../core/protocol.ts";
 import type { AgentId } from "../core/types.ts";
 import { agentIdFromPublicKey, signRequest } from "../identity/keys.ts";
@@ -20,6 +20,14 @@ import type { KeyPair } from "../identity/keys.ts";
 
 /** Structural fetch type so tests can inject a mock. */
 export type FetchLike = (input: string, init?: RequestInit) => Promise<Response>;
+
+/** GET /api/state shape (not part of the v2 public contract). */
+export interface StateResponse {
+  project: ProjectInfo;
+  state: unknown;
+  leaderboard: LeaderboardResponse;
+  now: string;
+}
 
 export interface Client {
   /** Normalised base URL (no trailing slash). */
@@ -33,6 +41,8 @@ export interface Client {
   state(): Promise<StateResponse>;
   events(after?: number, limit?: number): Promise<EventsResponse>;
   leaderboard(): Promise<LeaderboardResponse>;
+  /** GET /api/submission/<id>?wait=<seconds>. Long-polls at most 30 s per call. */
+  submission(id: string, waitSeconds?: number): Promise<SubmissionView>;
 
   // signed agent verbs
   join(body: JoinRequest): Promise<JoinResponse>;
@@ -99,6 +109,11 @@ export function createClient(baseUrl: string, keys: KeyPair, fetchImpl: FetchLik
       return send<EventsResponse>("GET", `/api/events?${query}`);
     },
     leaderboard: () => send<LeaderboardResponse>("GET", "/api/leaderboard"),
+    submission: (id, waitSeconds = 0) => {
+      const wait = Math.max(0, Math.min(30, Math.floor(waitSeconds)));
+      const query = wait > 0 ? `?wait=${wait}` : "";
+      return send<SubmissionView>("GET", `/api/submission/${encodeURIComponent(id)}${query}`);
+    },
 
     join: (body) => send<JoinResponse>("POST", "/api/join", body),
     next: (body = {}) => send<NextResponse>("POST", "/api/next", body),
