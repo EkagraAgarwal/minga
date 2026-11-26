@@ -225,6 +225,12 @@ export const reduce: Reduce = (state: State, event: MingaEvent): State => {
       if (attempt.endedAt === undefined) unindexAttempt(index, attempt);
       attempt.endedAt = at;
       attempt.endReason = d.reason;
+      // A release means the agent gave up on this task: reuse the rejection
+      // counter so the scheduler steers it elsewhere while other work exists.
+      if (d.reason === "released") {
+        const byTask = (index.failures[attempt.agent] ??= {});
+        byTask[attempt.task] = (byTask[attempt.task] ?? 0) + 1;
+      }
       break;
     }
 

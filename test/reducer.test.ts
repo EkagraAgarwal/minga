@@ -2,7 +2,7 @@ import { describe, expect, test } from "bun:test";
 import {
   agentLiveAttempts, computeLeaderboard, initialState, isLive, liveAttempts, nextId, reduce, replay,
 } from "../src/log/reducer.ts";
-import type { MingaEvent, NewEvent, Rules } from "../src/core/types.ts";
+import type { AttemptEndReason, MingaEvent, NewEvent, Rules } from "../src/core/types.ts";
 
 const RULES: Rules = {
   width: 2,
@@ -779,6 +779,71 @@ describe("state index", () => {
     expect(state.index.pendingSubmissions).toEqual([]);
     expect(state.index.failures).toEqual({ aaa: { "T-1": 1 } });
     expect(state.agents["aaa"]!.submissions).toBe(1);
+  });
+});
+
+describe("release failures", () => {
+  const ended = (attempt: string, reason: AttemptEndReason): NewEvent => ({
+    type: "attempt.ended",
+    actor: "aaa",
+    data: { attempt, reason },
+  });
+
+  test("a released attempt increments the same failure counter as a rejection", () => {
+    const ev = logger();
+    const state = replay(RULES, [
+      ev(join("aaa")),
+      ev(post("T-1")),
+      ev(start("A-1", "T-1", "aaa")),
+      ev(ended("A-1", "released"), "2026-01-01T00:04:00.000Z"),
+    ]);
+
+    expect(state.index.failures).toEqual({ aaa: { "T-1": 1 } });
+  });
+
+  test("releases accumulate on the rejection counter and other reasons do not count", () => {
+    const ev = logger();
+    const state = replay(RULES, [
+      ev(join("aaa")),
+      ev(post("T-1")),
+      ev(post("T-2")),
+      ev(post("T-3")),
+      // A rejected submission counts once.
+      ev(submission("S-1", "aaa", "model-a", false, 0)),
+      // A released attempt counts on the same per-agent/per-task counter.
+      ev(start("A-2", "T-2", "aaa")),
+      ev(ended("A-2", "released")),
+      // A second release on the same task adds to that counter.
+      ev(start("A-3", "T-1", "aaa")),
+      ev(ended("A-3", "released")),
+      // An ordinary end is not a give-up and must not count.
+      ev(start("A-4", "T-3", "aaa")),
+      ev(ended("A-4", "submitted")),
+    ]);
+
+    expect(state.index.failures).toEqual({ aaa: { "T-1": 2, "T-2": 1 } });
+  });
+
+  test("replaying a release log is consistent with folding it incrementally", () => {
+    const ev = logger();
+    const events: MingaEvent[] = [
+      ev(join("aaa")),
+      ev(post("T-1")),
+      ev(post("T-2")),
+      ev(start("A-1", "T-1", "aaa")),
+      ev(ended("A-1", "released")),
+      ev(submission("S-2", "aaa", "model-a", false, 0)),
+      ev(start("A-3", "T-2", "aaa")),
+      ev(ended("A-3", "released")),
+    ];
+
+    const replayed = replay(RULES, events);
+    const folded = initialState(RULES);
+    for (const event of events) reduce(folded, event);
+
+    expect(replayed.index.failures).toEqual({ aaa: { "T-1": 2, "T-2": 1 } });
+    expect(folded.index.failures).toEqual(replayed.index.failures);
+    expect(folded).toEqual(replayed);
   });
 });
 

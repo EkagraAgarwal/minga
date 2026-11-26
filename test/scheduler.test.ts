@@ -5,9 +5,12 @@ import {
   modelFamily,
   pickTask,
 } from "../src/sched/scheduler.ts";
+import { initialState, reduce } from "../src/log/reducer.ts";
 import type {
   AgentState,
   AttemptState,
+  MingaEvent,
+  NewEvent,
   Role,
   Rules,
   State,
@@ -375,6 +378,66 @@ describe("pickTask", () => {
     delete state.submissions["S-1"];
 
     expect(pickTask({ state, agent: "me", now: NOW, rng: () => 0 })?.task).toBe("T-2");
+  });
+
+  /** Build a state where "me" started then released the first of `taskIds`. */
+  function stateAfterRelease(taskIds: string[]): State {
+    const state = initialState(defaultRules());
+    let seq = 0;
+    const fold = (event: NewEvent, at = iso(0)): void => {
+      seq += 1;
+      reduce(state, { ...event, seq, at } as MingaEvent);
+    };
+    fold({
+      type: "agent.joined", actor: "me",
+      data: { agent: "me", publicKey: "k", model: "claude-3", harness: "test", rejoin: false },
+    });
+    for (const id of taskIds) {
+      fold({
+        type: "task.posted", actor: "server",
+        data: { task: id, title: id, body: "", parent: null, points: 10, by: "config" },
+      });
+    }
+    fold({
+      type: "attempt.started", actor: "me",
+      data: {
+        attempt: "A-1", task: taskIds[0]!, agent: "me", role: "build",
+        approach: "", model: "claude-3", leaseUntil: LEASE,
+      },
+    });
+    fold({ type: "attempt.ended", actor: "me", data: { attempt: "A-1", reason: "released" } }, iso(5));
+    return state;
+  }
+
+  test("a released task is skipped while another open task exists", () => {
+    const state = stateAfterRelease(["T-1", "T-2"]);
+    expect(state.index.failures).toEqual({ me: { "T-1": 1 } });
+
+    // Both tasks are otherwise identical; only the release tier steers away from T-1.
+    expect(pickTask({ state, agent: "me", now: NOW, rng: () => 0 })?.task).toBe("T-2");
+  });
+
+  test("a released task is still pickable when it is the only open task", () => {
+    const state = stateAfterRelease(["T-1"]);
+    expect(pickTask({ state, agent: "me", now: NOW, rng: () => 0 })?.task).toBe("T-1");
+  });
+
+  test("a failed task is never chosen while any un-failed task remains", () => {
+    const state = makeState();
+    state.rules.maxAttemptsPerAgent = 5;
+    addAgent(state, "me", "claude-4-sonnet");
+    addTask(state, "T-1");
+    addTask(state, "T-2");
+    addTask(state, "T-3");
+    // T-1 is failed by release and also the newest/most attractive otherwise.
+    state.index.failures["me"] = { "T-1": 3 };
+    addAttempt(state, "A-1", "T-2", "other", { model: "gpt-4" });
+    addAttempt(state, "A-2", "T-3", "other", { model: "gpt-4" });
+    state.tasks["T-1"]!.postedAt = iso(20);
+
+    const picked = pickTask({ state, agent: "me", now: NOW, rng: () => 0 })?.task;
+    expect(picked).not.toBe("T-1");
+    expect(["T-2", "T-3"]).toContain(picked!);
   });
 
   test("1,000 picks over 5,000 tasks and 2,000 agents average under 2 ms", () => {

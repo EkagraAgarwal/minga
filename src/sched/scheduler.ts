@@ -86,8 +86,10 @@ function pickRole(roles: Record<Role, number>, rng: () => number): Role {
  *
  * Candidates: open leaf tasks with room under `rules.width`, excluding tasks
  * the agent already holds live, when the agent is under `maxAttemptsPerAgent`
- * and not banned. Candidates are scored (same-family avoidance, zero live
- * attempts, no prior failure, age) with a small rng tiebreak.
+ * and not banned. Tasks with no prior failure from the agent form the first
+ * tier; failed tasks are a fallback only when that tier is empty. Within a
+ * tier candidates are scored (same-family avoidance, zero live attempts, age)
+ * with a small rng tiebreak.
  */
 export const pickTask: PickTask = (input) => {
   const { state, agent, now } = input;
@@ -140,9 +142,20 @@ export const pickTask: PickTask = (input) => {
   );
   if (candidates.length === 0) return null;
 
+  // Hard tier: tasks the agent never failed come first. Failed tasks are only
+  // considered when no un-failed candidate exists, so a release steers the
+  // agent elsewhere while other open work is available.
+  const preferred: TaskState[] = [];
+  const fallback: TaskState[] = [];
+  for (const task of candidates) {
+    if (failedTasks.has(task.id)) fallback.push(task);
+    else preferred.push(task);
+  }
+  const tier = preferred.length > 0 ? preferred : fallback;
+
   let oldest = Infinity;
   let newest = -Infinity;
-  for (const task of candidates) {
+  for (const task of tier) {
     const postedAt = Date.parse(task.postedAt);
     if (Number.isFinite(postedAt)) {
       if (postedAt < oldest) oldest = postedAt;
@@ -153,12 +166,11 @@ export const pickTask: PickTask = (input) => {
 
   let bestTask: TaskState | null = null;
   let bestScore = -Infinity;
-  for (const task of candidates) {
+  for (const task of tier) {
     let score = 0;
 
     if (!liveFamiliesByTask.get(task.id)?.has(agentFamily)) score += 4;
     if ((liveCountByTask.get(task.id) ?? 0) === 0) score += 2;
-    if (!failedTasks.has(task.id)) score += 1;
 
     const postedAt = Date.parse(task.postedAt);
     if (Number.isFinite(postedAt) && Number.isFinite(oldest) && Number.isFinite(newest)) {
