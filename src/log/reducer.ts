@@ -48,7 +48,52 @@ function emptyIndex(): StateIndex {
     openAttempts: [],
     pendingSubmissions: [],
     failures: {},
+    openQuestions: {},
+    digests: {},
+    deadEnds: {},
+    openByPath: {},
+    unnotified: {},
+    inbox: {},
+    leadAreas: {},
   };
+}
+
+/** Fills index maps added after 0.1.x, for states built by older code or tests. */
+function upgradeIndex(index: StateIndex): Required<StateIndex> {
+  index.openQuestions ??= {};
+  index.digests ??= {};
+  index.deadEnds ??= {};
+  index.openByPath ??= {};
+  index.unnotified ??= {};
+  index.inbox ??= {};
+  index.leadAreas ??= {};
+  return index as Required<StateIndex>;
+}
+
+const INBOX_KEEP = 50;
+
+function addToList(map: Record<string, string[]>, key: string, id: string): void {
+  const list = (map[key] ??= []);
+  if (!list.includes(id)) list.push(id);
+}
+
+function removeFromList(map: Record<string, string[]>, key: string, id: string): void {
+  const list = map[key];
+  if (!list) return;
+  removeId(list, id);
+  if (list.length === 0) delete map[key];
+}
+
+function indexPaths(index: Required<StateIndex>, attempt: AttemptState): void {
+  for (const path of attempt.paths ?? []) addToList(index.openByPath, path, attempt.id);
+}
+
+function unindexPaths(index: Required<StateIndex>, attempt: AttemptState): void {
+  for (const path of attempt.paths ?? []) removeFromList(index.openByPath, path, attempt.id);
+}
+
+function recordDeadEnd(index: Required<StateIndex>, task: string, model: string): void {
+  (index.deadEnds[task] ??= []).push(model);
 }
 
 /** Remove every occurrence of `id` (normally one) without changing oldest-first order. */
@@ -93,6 +138,7 @@ export const initialState: InitialState = (rules: Rules): State => ({
   notes: {},
   submissions: {},
   proposals: {},
+  leads: {},
   counters: { task: 0, attempt: 0, note: 0, submission: 0, proposal: 0 },
   index: emptyIndex(),
 });
@@ -107,7 +153,9 @@ export const reduce: Reduce = (state: State, event: MingaEvent): State => {
   const at = event.at;
   // States replayed from older code may not have the index yet.
   state.index ??= emptyIndex();
-  const index = state.index;
+  const index = upgradeIndex(state.index);
+  state.leads ??= {};
+  const leads = state.leads;
 
   // Any event by a known agent is a heartbeat.
   if (event.actor !== "server") {
@@ -163,6 +211,7 @@ export const reduce: Reduce = (state: State, event: MingaEvent): State => {
         attempts: [],
         notes: [],
       };
+      if (d.paths !== undefined && d.paths.length > 0) task.paths = [...d.paths];
       state.tasks[d.task] = task;
       if (d.parent !== null) state.tasks[d.parent]?.children.push(d.task);
       state.counters.task = Math.max(state.counters.task, idNumber(d.task));
@@ -176,6 +225,7 @@ export const reduce: Reduce = (state: State, event: MingaEvent): State => {
         task.status = d.status;
         task.closedAt = at;
         if (d.agent !== undefined) task.closedBy = d.agent;
+        if (d.submission !== undefined) task.closedSubmission = d.submission;
       }
       break;
     }
@@ -195,9 +245,12 @@ export const reduce: Reduce = (state: State, event: MingaEvent): State => {
         leaseUntil: d.leaseUntil,
         lastBeatAt: at,
       };
+      const paths = d.paths ?? task.paths;
+      if (paths !== undefined && paths.length > 0) attempt.paths = [...paths];
       state.attempts[d.attempt] = attempt;
       task.attempts.push(d.attempt);
       indexAttempt(index, attempt);
+      indexPaths(index, attempt);
       const agent = state.agents[d.agent];
       if (agent) agent.model = d.model;
       state.counters.attempt = Math.max(state.counters.attempt, idNumber(d.attempt));
@@ -210,6 +263,14 @@ export const reduce: Reduce = (state: State, event: MingaEvent): State => {
       if (!attempt) break;
       attempt.leaseUntil = d.leaseUntil;
       attempt.lastBeatAt = at;
+      if (d.approach !== undefined) attempt.approach = d.approach;
+      if (d.paths !== undefined) {
+        const open = attempt.endedAt === undefined;
+        if (open) unindexPaths(index, attempt);
+        if (d.paths.length > 0) attempt.paths = [...d.paths];
+        else delete attempt.paths;
+        if (open) indexPaths(index, attempt);
+      }
       if (d.model !== undefined) {
         attempt.model = d.model;
         const agent = state.agents[attempt.agent];
@@ -222,15 +283,47 @@ export const reduce: Reduce = (state: State, event: MingaEvent): State => {
       const d = event.data;
       const attempt = state.attempts[d.attempt];
       if (!attempt) break;
-      if (attempt.endedAt === undefined) unindexAttempt(index, attempt);
+      if (attempt.endedAt === undefined) {
+        unindexAttempt(index, attempt);
+        unindexPaths(index, attempt);
+      }
       attempt.endedAt = at;
       attempt.endReason = d.reason;
+      if (d.why !== undefined) {
+        attempt.releaseReason = d.why;
+        if (d.why === "dead_end") recordDeadEnd(index, attempt.task, attempt.model);
+      }
+      if (d.reason === "task_closed" && attempt.notifiedAt === undefined) {
+        addToList(index.unnotified, attempt.agent, attempt.id);
+      }
       // A release means the agent gave up on this task: reuse the rejection
       // counter so the scheduler steers it elsewhere while other work exists.
       if (d.reason === "released") {
         const byTask = (index.failures[attempt.agent] ??= {});
         byTask[attempt.task] = (byTask[attempt.task] ?? 0) + 1;
       }
+      break;
+    }
+
+    case "attempt.notified": {
+      const d = event.data;
+      const attempt = state.attempts[d.attempt];
+      if (attempt && attempt.notifiedAt === undefined) attempt.notifiedAt = at;
+      removeFromList(index.unnotified, d.agent, d.attempt);
+      break;
+    }
+
+    case "lead.granted": {
+      const d = event.data;
+      addToList(leads, d.area, d.agent);
+      addToList(index.leadAreas, d.agent, d.area);
+      break;
+    }
+
+    case "lead.revoked": {
+      const d = event.data;
+      removeFromList(leads, d.area, d.agent);
+      removeFromList(index.leadAreas, d.agent, d.area);
       break;
     }
 
@@ -246,9 +339,26 @@ export const reduce: Reduce = (state: State, event: MingaEvent): State => {
         text: d.text,
         at,
       };
+      if (d.replyTo !== undefined) note.replyTo = d.replyTo;
+      if (d.to !== undefined) note.to = d.to;
       state.notes[d.note] = note;
       task.notes.unshift(d.note);
       state.counters.note = Math.max(state.counters.note, idNumber(d.note));
+      if (d.replyTo !== undefined) {
+        const parent = state.notes[d.replyTo];
+        if (parent) {
+          parent.replies = (parent.replies ?? 0) + 1;
+          if (parent.kind === "question") removeFromList(index.openQuestions, parent.task, parent.id);
+        }
+      }
+      if (d.kind === "question") addToList(index.openQuestions, d.task, d.note);
+      if (d.kind === "digest") index.digests[d.task] = d.note;
+      if (d.kind === "dead_end") recordDeadEnd(index, d.task, state.agents[d.agent]?.model ?? "");
+      if (d.to !== undefined) {
+        const box = (index.inbox[d.to] ??= []);
+        box.push(d.note);
+        if (box.length > INBOX_KEEP) box.splice(0, box.length - INBOX_KEEP);
+      }
       break;
     }
 

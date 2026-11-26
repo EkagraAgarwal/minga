@@ -153,6 +153,8 @@ const NOTE_TEXT: Record<NoteKind, readonly string[]> = {
   result: ["holds for n <= 5 by decide", "counterexample at n = 4", "the reduction is linear"],
   question: ["is a hypothesis missing?", "does this hold for monotone formulas?", "should the bound be strict?"],
   handoff: ["base case done, stuck on induction", "lease ran out mid-proof", "last attempt failed the check"],
+  dead_end: ["induction on n stalls at the carry case", "the greedy bound is too weak past n = 6"],
+  digest: ["Area summary: switching route open, natural-proofs route blocked by T-12"],
 };
 
 const MESSAGES = [

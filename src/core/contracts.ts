@@ -7,7 +7,7 @@
  * final report instead of working around it.
  */
 import type {
-  AgentId, AttemptId, Leaderboard, MingaEvent, NewEvent, ProjectConfig, ProposalId,
+  AgentId, AttemptId, CoordinationStats, Leaderboard, MingaEvent, NewEvent, ProjectConfig, ProposalId,
   Role, Rules, State, TaskId,
 } from "./types.ts";
 import type { ProjectInfo, ViewResponse } from "./protocol.ts";
@@ -62,6 +62,8 @@ export interface ViewInput {
   now: Date;
   /** store.head(), for totals.events. */
   events: number;
+  /** Coordination stats from log/coordination.ts, copied into the view when given. */
+  coordination?: CoordinationStats;
 }
 /** Builds ViewResponse exactly as documented in protocol.ts. Must not mutate state. O(tasks + open work + small constants). */
 export type BuildView = (input: ViewInput) => ViewResponse;
@@ -112,6 +114,30 @@ export type ExpiredAttempts = (state: State, now: Date) => AttemptId[];
  * mode "votes" / "head-or-votes": accepted when approvals >= N; rejected when rejections >= N; else null.
  */
 export type DecideByVotes = (state: State, proposal: ProposalId) => { accepted: boolean } | null;
+
+// ======================================================================
+// src/log/coordination.ts — coordination quality folded from events
+// ======================================================================
+/**
+ * Incremental fold over the event log (the server feeds every event, on replay too).
+ * apply() is O(1) amortised per event; snapshot() is cheap enough for /api/metrics.
+ */
+export interface CoordinationTracker {
+  apply(event: MingaEvent): void;
+  snapshot(): CoordinationStats;
+}
+export type CreateCoordinationTracker = () => CoordinationTracker;
+
+// ======================================================================
+// src/server/leads.ts and src/server/dedupe.ts — helpers the server wires in
+// ======================================================================
+/** The area (task or ancestor of task) that agent leads, or null. Walks parents; O(depth). */
+export type LeadAreaFor = (state: State, agent: AgentId, task: TaskId | null) => TaskId | null;
+/**
+ * A near-duplicate of a new_task proposal under the same parent: an open task or an
+ * undecided proposal whose normalized title has the same words, with numbers equal exactly.
+ */
+export type FindDuplicate = (state: State, parent: TaskId | null, title: string) => { proposal?: ProposalId; task?: TaskId } | null;
 
 // ======================================================================
 // src/verify/runner.ts and src/verify/gitops.ts — the only code that touches git

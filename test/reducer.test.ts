@@ -124,7 +124,15 @@ describe("initialState", () => {
       openAttempts: [],
       pendingSubmissions: [],
       failures: {},
+      openQuestions: {},
+      digests: {},
+      deadEnds: {},
+      openByPath: {},
+      unnotified: {},
+      inbox: {},
+      leadAreas: {},
     });
+    expect(state.leads).toEqual({});
     expect(state.agents).toEqual({});
 
     state.rules.roles.explore = 99;
@@ -970,4 +978,76 @@ describe("reducer performance", () => {
     console.log(`fold 200,000 mixed events: ${elapsed.toFixed(1)} ms`);
     expect(elapsed).toBeLessThan(4000);
   }, 20_000);
+});
+
+describe("coordination state (0.2)", () => {
+  const note = (id: string, task: string, agent: string, kind: string, extra: Record<string, unknown> = {}): NewEvent => ({
+    type: "note.added", actor: agent, data: { note: id, task, agent, kind, text: `${kind} ${id}`, ...extra },
+  } as NewEvent);
+
+  test("task paths seed attempt intents; beat pivots approach and paths; end clears the path index", () => {
+    const ev = logger();
+    const state = replay(RULES, [
+      ev(join("aaa")),
+      ev({ type: "task.posted", actor: "server", data: { task: "T-1", title: "t", body: "b", parent: null, points: 3, by: "config", paths: ["src/a.ts"] } }),
+      ev(start("A-1", "T-1", "aaa")),
+    ]);
+    expect(state.tasks["T-1"]!.paths).toEqual(["src/a.ts"]);
+    expect(state.attempts["A-1"]!.paths).toEqual(["src/a.ts"]);
+    expect(state.index.openByPath).toEqual({ "src/a.ts": ["A-1"] });
+
+    reduce(state, ev({ type: "attempt.beat", actor: "aaa", data: { attempt: "A-1", leaseUntil: "2026-01-01T00:20:00.000Z", approach: "new plan", paths: ["src/b.ts", "lib/"] } }));
+    expect(state.attempts["A-1"]!.approach).toBe("new plan");
+    expect(state.index.openByPath).toEqual({ "src/b.ts": ["A-1"], "lib/": ["A-1"] });
+
+    reduce(state, ev({ type: "attempt.ended", actor: "aaa", data: { attempt: "A-1", reason: "released", why: "dead_end" } }));
+    expect(state.index.openByPath).toEqual({});
+    expect(state.attempts["A-1"]!.releaseReason).toBe("dead_end");
+    expect(state.index.deadEnds).toEqual({ "T-1": ["model-a"] });
+  });
+
+  test("closed-under attempts wait in unnotified until attempt.notified; task keeps its closing submission", () => {
+    const ev = logger();
+    const state = replay(RULES, [
+      ev(join("aaa")), ev(join("bbb")), ev(post("T-1")),
+      ev(start("A-1", "T-1", "aaa")), ev(start("A-2", "T-1", "bbb")),
+      ev({ type: "task.closed", actor: "aaa", data: { task: "T-1", status: "solved", agent: "aaa", submission: "S-1" } }),
+      ev({ type: "attempt.ended", actor: "server", data: { attempt: "A-2", reason: "task_closed" } }),
+    ]);
+    expect(state.tasks["T-1"]!.closedSubmission).toBe("S-1");
+    expect(state.index.unnotified).toEqual({ bbb: ["A-2"] });
+    reduce(state, ev({ type: "attempt.notified", actor: "server", data: { attempt: "A-2", agent: "bbb", via: "beat" } }, "2026-01-01T00:05:00.000Z"));
+    expect(state.index.unnotified).toEqual({});
+    expect(state.attempts["A-2"]!.notifiedAt).toBe("2026-01-01T00:05:00.000Z");
+  });
+
+  test("questions stay open until answered; digests pin; dead_end notes record the model; to fills the inbox", () => {
+    const ev = logger();
+    const state = replay(RULES, [
+      ev(join("aaa", { model: "kimi-k2" })), ev(join("bbb")), ev(post("T-1")),
+      ev(note("N-1", "T-1", "aaa", "question")),
+      ev(note("N-2", "T-1", "bbb", "idea", { replyTo: "N-1", to: "aaa" })),
+      ev(note("N-3", "T-1", "bbb", "digest")),
+      ev(note("N-4", "T-1", "aaa", "dead_end")),
+      ev(note("N-5", "T-1", "aaa", "question")),
+    ]);
+    expect(state.notes["N-1"]!.replies).toBe(1);
+    expect(state.notes["N-2"]).toMatchObject({ replyTo: "N-1", to: "aaa" });
+    expect(state.index.openQuestions).toEqual({ "T-1": ["N-5"] });
+    expect(state.index.digests).toEqual({ "T-1": "N-3" });
+    expect(state.index.deadEnds).toEqual({ "T-1": ["kimi-k2"] });
+    expect(state.index.inbox).toEqual({ aaa: ["N-2"] });
+  });
+
+  test("leads are granted and revoked per area", () => {
+    const ev = logger();
+    const state = replay(RULES, [
+      ev(join("aaa")), ev(post("T-1")), ev(post("T-2")),
+      ev({ type: "lead.granted", actor: "server", data: { agent: "aaa", area: "T-1" } }),
+      ev({ type: "lead.granted", actor: "server", data: { agent: "aaa", area: "T-2" } }),
+      ev({ type: "lead.revoked", actor: "server", data: { agent: "aaa", area: "T-1" } }),
+    ]);
+    expect(state.leads).toEqual({ "T-2": ["aaa"] });
+    expect(state.index.leadAreas).toEqual({ aaa: ["T-2"] });
+  });
 });

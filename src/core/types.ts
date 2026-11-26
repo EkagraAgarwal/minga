@@ -35,16 +35,27 @@ export const ROLES: readonly Role[] = ["explore", "build", "attack", "distill", 
 export type TaskStatus = "open" | "solved" | "refuted" | "impossible" | "withdrawn";
 export const CLOSED_STATUSES: readonly TaskStatus[] = ["solved", "refuted", "impossible", "withdrawn"];
 
-export type NoteKind = "idea" | "result" | "question" | "handoff";
-export const NOTE_KINDS: readonly NoteKind[] = ["idea", "result", "question", "handoff"];
+/**
+ * idea/result/question/handoff: free notes on a task.
+ * dead_end: an approach that did not work, so the next agent does not retry it.
+ * digest: a pinned summary of an area (a task with children) or a task; every assignment
+ *   under it shows the newest digest first. Only the head, a lead of the area, or an agent
+ *   with accepted work under it may post one. Max 1,500 chars.
+ */
+export type NoteKind = "idea" | "result" | "question" | "handoff" | "dead_end" | "digest";
+export const NOTE_KINDS: readonly NoteKind[] = ["idea", "result", "question", "handoff", "dead_end", "digest"];
 
 export type AttemptEndReason = "submitted" | "released" | "expired" | "task_closed" | "banned";
+
+/** Why an agent released an attempt (optional on release). "dead_end" also counts as a dead end for the agent's model on the task. */
+export type ReleaseReason = "dead_end" | "too_hard" | "out_of_time" | "blocked" | "duplicate" | "other";
+export const RELEASE_REASONS: readonly ReleaseReason[] = ["dead_end", "too_hard", "out_of_time", "blocked", "duplicate", "other"];
 
 /** What an accepted submission claims about its task. */
 export type Claim = "solves" | "refutes" | "progress";
 
 export type ProposalKind = "new_task" | "impossible";
-export type DecidedBy = "head" | "vote";
+export type DecidedBy = "head" | "vote" | "lead";
 
 // ---------------------------------------------------------------- rules & config
 
@@ -75,6 +86,8 @@ export interface SeedTask {
   /** `key` of another seed task. */
   under?: string;
   points?: number;
+  /** Repo-relative paths or directory prefixes (ending in "/") this task expects to touch. */
+  paths?: string[];
 }
 
 /** Parsed project.toml. Immutable while the server runs (except `rules`, via events). */
@@ -147,6 +160,8 @@ export type TaskPosted = Ev<"task.posted", {
   points: number;
   by: DecidedBy | "config";
   proposal?: ProposalId;
+  /** Paths or directory prefixes (ending in "/") the task expects to touch; seeds attempts' intents. */
+  paths?: string[];
 }>;
 
 export type TaskClosed = Ev<"task.closed", {
@@ -166,11 +181,24 @@ export type AttemptStarted = Ev<"attempt.started", {
   approach: string;
   model: string;
   leaseUntil: string;
+  /** Declared file intents at start (copied from the task's paths). */
+  paths?: string[];
 }>;
 
-export type AttemptBeat = Ev<"attempt.beat", { attempt: AttemptId; leaseUntil: string; model?: string }>;
+/** approach/paths replace the attempt's current values when present (a pivot). */
+export type AttemptBeat = Ev<"attempt.beat", { attempt: AttemptId; leaseUntil: string; model?: string; approach?: string; paths?: string[] }>;
 
-export type AttemptEnded = Ev<"attempt.ended", { attempt: AttemptId; reason: AttemptEndReason }>;
+export type AttemptEnded = Ev<"attempt.ended", { attempt: AttemptId; reason: AttemptEndReason; why?: ReleaseReason }>;
+
+/**
+ * The server told an agent, for the first time, that its attempt ended because the task
+ * closed (in any signed response). Lets coordination metrics measure the lag after a solve.
+ */
+export type AttemptNotified = Ev<"attempt.notified", { attempt: AttemptId; agent: AgentId; via: string }>;
+
+/** The head made an agent a lead of an area: it may post tasks and decide proposals under it, and pin digests. */
+export type LeadGranted = Ev<"lead.granted", { agent: AgentId; area: TaskId }>;
+export type LeadRevoked = Ev<"lead.revoked", { agent: AgentId; area: TaskId }>;
 
 export type NoteAdded = Ev<"note.added", {
   note: NoteId;
@@ -178,6 +206,10 @@ export type NoteAdded = Ev<"note.added", {
   agent: AgentId;
   kind: NoteKind;
   text: string;
+  /** The note this one answers (threading). A reply to a question marks it answered. */
+  replyTo?: NoteId;
+  /** Addressed to one agent: it gets the note as a notice on its next signed request. */
+  to?: AgentId;
 }>;
 
 /**
@@ -244,7 +276,8 @@ export type ProposalMade = Ev<"proposal.made", {
   evidence?: string;
 }>;
 
-export type ProposalVoted = Ev<"proposal.voted", { proposal: ProposalId; agent: AgentId; approve: boolean }>;
+/** duplicate: the agent proposed something near-identical, and the server turned it into this vote. */
+export type ProposalVoted = Ev<"proposal.voted", { proposal: ProposalId; agent: AgentId; approve: boolean; duplicate?: boolean }>;
 
 export type ProposalDecided = Ev<"proposal.decided", {
   proposal: ProposalId;
@@ -263,6 +296,9 @@ export type MingaEvent =
   | AttemptStarted
   | AttemptBeat
   | AttemptEnded
+  | AttemptNotified
+  | LeadGranted
+  | LeadRevoked
   | NoteAdded
   | SubmissionQueued
   | SubmissionStarted
@@ -307,6 +343,10 @@ export interface TaskState {
   postedAt: string;
   closedAt?: string;
   closedBy?: AgentId;
+  /** The accepted submission that closed the task, if any (from task.closed). */
+  closedSubmission?: SubmissionId;
+  /** Paths or directory prefixes the task expects to touch. */
+  paths?: string[];
   /** Every attempt ever started on this task, oldest first. */
   attempts: AttemptId[];
   /** Newest first. */
@@ -325,6 +365,12 @@ export interface AttemptState {
   lastBeatAt: string;
   endedAt?: string;
   endReason?: AttemptEndReason;
+  /** Why it was released, when the agent said. */
+  releaseReason?: ReleaseReason;
+  /** Declared file intents (task paths, replaced by beat). */
+  paths?: string[];
+  /** When the server first told the agent the task closed under it (attempt.notified). */
+  notifiedAt?: string;
 }
 
 export interface NoteState {
@@ -334,6 +380,10 @@ export interface NoteState {
   kind: NoteKind;
   text: string;
   at: string;
+  replyTo?: NoteId;
+  to?: AgentId;
+  /** Replies received so far. */
+  replies?: number;
 }
 
 export type SubmissionStatus = "queued" | "checking" | "accepted" | "rejected";
@@ -405,6 +455,8 @@ export interface State {
   notes: Record<NoteId, NoteState>;
   submissions: Record<SubmissionId, SubmissionState>;
   proposals: Record<ProposalId, ProposalState>;
+  /** Area leads: area task -> agents (lead.granted minus lead.revoked). */
+  leads?: Record<TaskId, AgentId[]>;
   /** Highest number used per id prefix, so ids are never reused. */
   counters: Counters;
   /**
@@ -425,6 +477,45 @@ export interface StateIndex {
   pendingSubmissions: SubmissionId[];
   /** Rejected (non-stale) submissions per agent per task: agent -> task -> count. Used by the scheduler. */
   failures: Record<AgentId, Record<TaskId, number>>;
+  /** Unanswered question notes per task, oldest first. */
+  openQuestions?: Record<TaskId, NoteId[]>;
+  /** Newest digest note per task. */
+  digests?: Record<TaskId, NoteId>;
+  /** Models that recorded a dead end on a task (release reason or dead_end note), in order. */
+  deadEnds?: Record<TaskId, string[]>;
+  /** Open attempts per declared path (exact string, as declared). */
+  openByPath?: Record<string, AttemptId[]>;
+  /** Attempts ended by task_closed whose agent has not been told yet, per agent. */
+  unnotified?: Record<AgentId, AttemptId[]>;
+  /** Notes addressed to an agent (note.to), oldest first, newest 50 kept. The server tracks delivery in memory. */
+  inbox?: Record<AgentId, NoteId[]>;
+  /** Areas each agent leads. */
+  leadAreas?: Record<AgentId, TaskId[]>;
+}
+
+/**
+ * How well agents coordinate, folded from the event log by log/coordination.ts.
+ * Shown in /api/metrics and the observatory so each field run shows whether coordination improved.
+ */
+export interface CoordinationStats {
+  /** Tasks closed (any status). */
+  closes: number;
+  /** Attempts ended because their task closed under them. */
+  closedUnder: number;
+  /** closedUnder / all ended attempts, 0..1. */
+  closedUnderShare: number;
+  /** Seconds from task.closed to the loser being told (attempt.notified). */
+  notifyLagSeconds: { count: number; p50: number; p90: number; max: number };
+  /** Notes on closed tasks / closed tasks. */
+  notesPerClosedTask: number;
+  questions: { asked: number; answered: number; open: number };
+  /** Releases with a handoff note, and how many of those tasks were later solved. */
+  handoffs: number;
+  handoffsFollowedBySolve: number;
+  deadEnds: number;
+  digests: number;
+  /** Proposals the server turned into votes on an existing one. */
+  duplicateProposals: number;
 }
 
 export interface LeaderRow {

@@ -15,10 +15,18 @@
  * Head-only routes (/api/head/*) require x-minga-agent == id of cfg.head.
  *
  * Errors: non-2xx with body ErrorBody.
+ *
+ * Notices: every signed 2xx JSON response may carry `notices` (see Notice): news the agent
+ * has not been told yet, such as an attempt ended because another agent solved the task, or a
+ * note addressed to it. Each notice is delivered once. Old kits ignore the field.
+ *
+ * Compatibility: every field added after 0.1.x is optional, so old kits work against new
+ * servers and old event logs replay.
  */
 import type {
-  AgentId, AgentState, AttemptEndReason, AttemptId, AttemptState, Claim, Leaderboard, MingaEvent, NoteKind, NoteState,
-  ProposalId, ProposalKind, ProposalState, Role, Rules, SubmissionId, SubmissionState, TaskId, TaskState, TaskStatus,
+  AgentId, AgentState, AttemptEndReason, AttemptId, AttemptState, Claim, CoordinationStats, Leaderboard, MingaEvent, NoteId,
+  NoteKind, NoteState, ProposalId, ProposalKind, ProposalState, ReleaseReason, Role, Rules, SubmissionId, SubmissionState,
+  TaskId, TaskState, TaskStatus,
 } from "./types.ts";
 
 export const HEADER = {
@@ -31,6 +39,24 @@ export const HEADER = {
 export const MAX_CLOCK_SKEW_MS = 5 * 60 * 1000;
 
 export interface ErrorBody { error: string; detail?: string }
+
+/** News for one agent, attached once to a signed response (`notices`). */
+export type Notice =
+  | {
+    kind: "attempt_ended";
+    attempt: AttemptId;
+    task: TaskId;
+    reason: AttemptEndReason;
+    taskStatus: TaskStatus;
+    closedBy?: { agent: AgentId; model?: string; submission?: SubmissionId };
+  }
+  | { kind: "note"; note: NoteState };
+
+/** Optional on every signed 2xx response body. */
+export interface WithNotices { notices?: Notice[] }
+
+/** Another live attempt on a different task that declared an overlapping path. */
+export interface PathConflict { path: string; task: TaskId; attempt: AttemptId; agent: AgentId }
 
 // ---------------------------------------------------------------- public reads (unsigned)
 
@@ -77,6 +103,10 @@ export interface ViewResponse {
     notes: number;
     events: number;
   };
+  /** Coordination quality, folded from the log. */
+  coordination?: CoordinationStats;
+  /** Area leads: area -> agents. */
+  leads?: Record<TaskId, AgentId[]>;
   /** Every task, without its attempt and note lists (counts instead). */
   tasks: ViewTask[];
   /** Live attempts only. */
@@ -148,6 +178,8 @@ export interface MetricsResponse {
    * excluding time a long-poll spent holding (long-polled requests are not recorded).
    */
   latencyMs: Record<string, { count: number; p50: number; p99: number; max: number }>;
+  /** Coordination quality, folded from the log (log/coordination.ts). */
+  coordination?: CoordinationStats;
 }
 
 /** GET /api/events?after=<seq>&limit=<n> -> ascending events. */
@@ -201,15 +233,25 @@ export interface Assignment {
   head?: string;
   /** Up to 10 newest notes on this task. */
   notes: NoteState[];
-  /** Other live attempts on the task (overlap), so the agent can pick a different approach. */
-  others: { attempt: AttemptId; agent: AgentId; model: string; role: Role; approach: string }[];
+  /** Other live attempts on the task (overlap), so the agent can pick a different approach. Approach and paths are current (updated by beat). */
+  others: { attempt: AttemptId; agent: AgentId; model: string; role: Role; approach: string; paths?: string[] }[];
+  /** Newest pinned digest of this task and of each ancestor area, nearest first. Agent-written. */
+  digests?: NoteState[];
+  /** Up to 5 unanswered questions on this task and its siblings, oldest first. */
+  questions?: NoteState[];
+  /** Up to 5 newest dead_end notes on this task. */
+  deadEnds?: NoteState[];
+  /** Paths the task expects to touch (the attempt's initial intents). */
+  paths?: string[];
+  /** Live attempts on other tasks that declared overlapping paths. */
+  conflicts?: PathConflict[];
 }
 /**
  * 200 with { assignment } or 200 with { assignment: null, retryAfterSeconds } when nothing is free.
  * done: true means the project has no open leaf task left at all (not merely "all busy"):
  * stop asking. The server answers that at once, without holding a long-poll.
  */
-export interface NextResponse { assignment: Assignment | null; retryAfterSeconds?: number; done?: boolean }
+export interface NextResponse extends WithNotices { assignment: Assignment | null; retryAfterSeconds?: number; done?: boolean }
 
 /** GET /api/tasks -> every task, compact, for agents that want an overview (no bodies). */
 export interface TasksResponse {
@@ -219,13 +261,30 @@ export interface TasksResponse {
   done: boolean;
 }
 
-/** POST /api/beat */
-export interface BeatRequest { attempt: AttemptId; model?: string; approach?: string }
-export interface BeatResponse { leaseUntil: string }
+/**
+ * POST /api/beat — renew the lease. approach and paths, when given, replace the attempt's
+ * current ones (a pivot) and are shown to others on the task. The response carries what
+ * changed since the previous beat, built from indexes only (beat is the hottest route).
+ */
+export interface BeatRequest { attempt: AttemptId; model?: string; approach?: string; paths?: string[] }
+export interface BeatNews {
+  taskStatus: TaskStatus;
+  /** Notes on the task since this attempt's previous beat, newest first, at most 20. */
+  notes: NoteState[];
+  /** Other live attempts on the task now. */
+  others: Assignment["others"];
+  /** Live attempts on other tasks with overlapping declared paths. */
+  conflicts: PathConflict[];
+}
+export interface BeatResponse extends WithNotices { leaseUntil: string; news?: BeatNews }
 
-/** POST /api/note */
-export interface NoteRequest { task: TaskId; kind: NoteKind; text: string }
-export interface NoteResponse { note: NoteState }
+/**
+ * POST /api/note. kind "digest" is restricted (see NoteKind). replyTo threads a reply
+ * (a reply to a question marks it answered); to addresses one agent, who gets it as a notice.
+ * Text max 4,000 chars (digest 1,500).
+ */
+export interface NoteRequest { task: TaskId; kind: NoteKind; text: string; replyTo?: NoteId; to?: AgentId }
+export interface NoteResponse extends WithNotices { note: NoteState }
 
 /**
  * POST /api/submit — validates, stores the files, queues the check and answers at once (202).
@@ -248,9 +307,9 @@ export interface SubmitResponse {
   position: number;
 }
 
-/** POST /api/release — give up an attempt, optionally leaving a hand-off note. */
-export interface ReleaseRequest { attempt: AttemptId; handoff?: string }
-export interface ReleaseResponse { ok: true }
+/** POST /api/release — give up an attempt, optionally leaving a hand-off note and a reason. reason "dead_end" also records a dead end for this model on the task. */
+export interface ReleaseRequest { attempt: AttemptId; handoff?: string; reason?: ReleaseReason }
+export interface ReleaseResponse extends WithNotices { ok: true }
 
 /** POST /api/propose */
 export interface ProposeRequest {
@@ -261,7 +320,17 @@ export interface ProposeRequest {
   body?: string;
   evidence?: string;
 }
-export interface ProposeResponse { proposal: ProposalId; decided?: { accepted: boolean; by: "head" | "vote" } }
+/**
+ * A new_task proposal whose title matches an open task or open proposal under the same parent
+ * (normalized words equal, numbers equal exactly) is not created: the server answers with
+ * duplicateOf, and when the proposer may vote it records an approving vote on the existing
+ * proposal instead (proposal = that id).
+ */
+export interface ProposeResponse extends WithNotices {
+  proposal: ProposalId;
+  decided?: { accepted: boolean; by: "head" | "vote" | "lead" };
+  duplicateOf?: { proposal?: ProposalId; task?: TaskId };
+}
 
 /** POST /api/vote */
 export interface VoteRequest { proposal: ProposalId; approve: boolean }
@@ -269,8 +338,8 @@ export interface VoteResponse { proposal: ProposalId; decided?: { accepted: bool
 
 // ---------------------------------------------------------------- head-only (signed by cfg.head)
 
-/** POST /api/head/post */
-export interface HeadPostRequest { title: string; body: string; parent: TaskId | null; points?: number }
+/** POST /api/head/post (and POST /api/lead/post, where parent must lie inside an area the agent leads). */
+export interface HeadPostRequest { title: string; body: string; parent: TaskId | null; points?: number; paths?: string[] }
 export interface HeadPostResponse { task: TaskId }
 
 /** POST /api/head/decide */
@@ -288,6 +357,15 @@ export interface HeadBanResponse { ok: true }
 /** POST /api/head/note — the head leaves a note on a task (shown to agents with their assignment, like any note). */
 export interface HeadNoteRequest { task: TaskId; kind?: NoteKind; text: string }
 export interface HeadNoteResponse { note: NoteState }
+
+/** POST /api/head/lead — grant or revoke an area lead. area must be an existing task. */
+export interface HeadLeadRequest { agent: AgentId; area: TaskId; grant: boolean }
+export interface HeadLeadResponse { ok: true; leads: AgentId[] }
+
+// ---------------------------------------------------------------- area leads (signed by an agent holding a lead)
+// POST /api/lead/post   HeadPostRequest -> HeadPostResponse  (parent inside a led area; by: "lead")
+// POST /api/lead/decide HeadDecideRequest -> HeadDecideResponse (proposal.task inside a led area)
+// Leads cannot change rules, ban, close tasks outside their area, or grant leads.
 
 /** POST /api/head/close — withdraw a task (or mark it solved/impossible by fiat). */
 export interface HeadCloseRequest { task: TaskId; status: "withdrawn" | "impossible" | "solved"; reason?: string }
