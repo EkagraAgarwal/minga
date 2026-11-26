@@ -17,8 +17,8 @@
  * Errors: non-2xx with body ErrorBody.
  */
 import type {
-  AgentId, AgentState, AttemptId, AttemptState, Claim, Leaderboard, MingaEvent, NoteKind, NoteState,
-  ProposalId, ProposalKind, ProposalState, Role, Rules, SubmissionId, SubmissionState, TaskId, TaskState,
+  AgentId, AgentState, AttemptEndReason, AttemptId, AttemptState, Claim, Leaderboard, MingaEvent, NoteKind, NoteState,
+  ProposalId, ProposalKind, ProposalState, Role, Rules, SubmissionId, SubmissionState, TaskId, TaskState, TaskStatus,
 } from "./types.ts";
 
 export const HEADER = {
@@ -99,6 +99,25 @@ export type ViewTask = Omit<TaskState, "attempts" | "notes"> & { attemptCount: n
  * With wait (max 30), the server holds the request until the submission is final
  * (accepted or rejected) or the wait elapses, then answers with its current state.
  */
+/**
+ * GET /api/attempt/<id> -> where an attempt stands (public, no signature).
+ * `state` is "live" while the lease holds, "expired" once it lapsed, "ended" after
+ * submit/release/close. When the task was closed under the attempt, `closedBy` says
+ * who closed it and with which submission.
+ */
+export interface AttemptView {
+  id: AttemptId;
+  task: TaskId;
+  agent: AgentId;
+  role: Role;
+  state: "live" | "expired" | "ended";
+  leaseUntil: string;
+  endedAt?: string;
+  endReason?: AttemptEndReason;
+  taskStatus: TaskStatus;
+  closedBy?: { agent: AgentId; model?: string; submission?: SubmissionId };
+}
+
 export interface SubmissionView extends SubmissionState {
   /** Present once checked. */
   outputTail?: string;

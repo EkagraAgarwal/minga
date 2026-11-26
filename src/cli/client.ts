@@ -7,7 +7,7 @@
  * for Node.
  */
 import type {
-  BeatRequest, BeatResponse, EventsResponse, HeadBanRequest, HeadBanResponse, HeadCloseRequest,
+  AttemptView, BeatRequest, BeatResponse, EventsResponse, HeadBanRequest, HeadBanResponse, HeadCloseRequest,
   HeadCloseResponse, HeadDecideRequest, HeadDecideResponse, HeadNoteRequest, HeadNoteResponse,
   HeadPostRequest, HeadPostResponse, HeadRuleRequest, HeadRuleResponse, JoinRequest, JoinResponse,
   LeaderboardResponse, NextRequest,
@@ -46,6 +46,7 @@ export interface Client {
   tasks(): Promise<TasksResponse>;
   /** GET /api/submission/<id>?wait=<seconds>. Long-polls at most 30 s per call. */
   submission(id: string, waitSeconds?: number): Promise<SubmissionView>;
+  attempt(id: string): Promise<AttemptView>;
 
   // signed agent verbs
   join(body: JoinRequest): Promise<JoinResponse>;
@@ -114,6 +115,7 @@ export function createClient(baseUrl: string, keys: KeyPair, fetchImpl: FetchLik
     },
     leaderboard: () => send<LeaderboardResponse>("GET", "/api/leaderboard"),
     tasks: () => send<TasksResponse>("GET", "/api/tasks"),
+    attempt: (id) => send<AttemptView>("GET", `/api/attempt/${encodeURIComponent(id)}`),
     submission: (id, waitSeconds = 0) => {
       const wait = Math.max(0, Math.min(30, Math.floor(waitSeconds)));
       const query = wait > 0 ? `?wait=${wait}` : "";

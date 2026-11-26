@@ -23,6 +23,7 @@ import { findPackageRoot, serveCommand, type RunResult } from "../src/cli/runtim
 import { parseProject } from "../src/project/config.ts";
 import type { GitRunner } from "../src/cli/sync.ts";
 import { syncCommand } from "../src/cli/sync.ts";
+import { checkCommand } from "../src/cli/check.ts";
 import type { SessionIdentity } from "../src/cli/store.ts";
 import { agentPath, readAgent, readHead, resolveAgentDir, writeAgent, writeHead } from "../src/cli/store.ts";
 
@@ -372,6 +373,54 @@ describe("client", () => {
 
 // ---------------------------------------------------------------- join / store / head
 
+describe("attempt state and local check", () => {
+  test("status says who closed the task when the attempt ended under the agent", async () => {
+    await withTempDir(async (dir) => {
+      const keys = generateKeyPair();
+      const identity = {
+        url: "https://minga.test", agent: agentIdFromPublicKey(keys.publicKey),
+        publicKey: keys.publicKey, privateKey: keys.privateKey, model: "m", harness: "h",
+        lastAssignment: { attempt: "A-8", role: "build" as const, leaseUntil: new Date(Date.now() + 40 * 60_000).toISOString(), task: "T-1" },
+      };
+      writeAgent(dir, identity);
+      const mock = mockFetch((call) => {
+        if (call.url.endsWith("/api/project")) return json(project);
+        return json({
+          id: "A-8", task: "T-1", agent: identity.agent, role: "build", state: "ended", endReason: "task_closed",
+          leaseUntil: identity.lastAssignment.leaseUntil, endedAt: "", taskStatus: "solved",
+          closedBy: { agent: "4bec7c19de4503f8", model: "hy4", submission: "S-6" },
+        });
+      });
+      const result = await statusCommand(createClient("https://minga.test", keys, mock.fn), readAgent(dir)!);
+      expect(result.text).toContain("attempt: A-8 (build) on T-1 — ended: T-1 was solved by S-6 from 4bec7c19de4503f8 (hy4); run minga sync");
+      expect(result.text).not.toContain("left");
+      expect(result.data.attempt?.state).toBe("ended");
+    });
+  });
+
+  test("check fills {files} and MINGA_FILES and maps the exit code", async () => {
+    await withTempDir(async (dir) => {
+      writeFileSync(join(dir, "a.ts"), "x");
+      const seen: { cmd: string; args: string[]; env: string | undefined }[] = [];
+      const ok = checkCommand({
+        dir, command: "bun test {files}", files: ["./a.ts"],
+        spawn: (cmd, args, opts) => { seen.push({ cmd, args, env: opts.env.MINGA_FILES }); return { status: 0, output: "1 pass\n" }; },
+      });
+      expect(seen[0]).toEqual({ cmd: "bun", args: ["exec", "bun test 'a.ts'"], env: "a.ts" });
+      expect(ok.code).toBe(0);
+      expect(ok.text).toContain("check passed");
+      const bad = checkCommand({
+        dir, command: "bun check.ts", files: ["a.ts"],
+        spawn: (cmd) => cmd === "bun" ? { status: null, error: new Error("ENOENT"), output: "" } : { status: 1, output: "boom\n" },
+      });
+      expect(bad.data.runner).toBe("shell");
+      expect(bad.code).toBe(2);
+      expect(bad.text).toContain("boom");
+      expect(() => checkCommand({ dir, command: "x", files: ["missing.ts"] })).toThrow(/no such file/);
+    });
+  });
+});
+
 describe("join, store and head", () => {
   test("reuses the stored key on a second join", async () => {
     await withTempDir(async (dir) => {
@@ -466,7 +515,7 @@ describe("join, store and head", () => {
     expect(result.text).toContain("width=2");
     expect(result.text).toContain("accept=head-or-votes:2");
     expect(result.text).toContain("A-2");
-    expect(result.text).toContain("git clone https://minga.test/repo.git work && cd work");
+    expect(result.text).toContain("git clone -b main https://minga.test/repo.git work && cd work");
     expect(result.text).toContain("submit reads files relative to cwd");
   });
 
@@ -476,7 +525,7 @@ describe("join, store and head", () => {
     const { result } = await joinCommand(createClient("https://minga.test/", keys, mock.fn), {
       url: "https://minga.test/", keys, model: "m", harness: "h",
     });
-    expect(result.text).toContain("git clone https://minga.test/repo.git work && cd work");
+    expect(result.text).toContain("git clone -b main https://minga.test/repo.git work && cd work");
     expect(result.text).not.toContain("minga.test//repo.git");
   });
 
@@ -502,7 +551,7 @@ describe("join, store and head", () => {
     expect(() => parseAcceptPolicy("votes:0")).toThrow(/at least 1/);
     expect(() => parseRuleArgs(["bogus=1"])).toThrow(/unknown rule/);
     expect(formatRules(project.rules)).toBe(
-      "width=2 leaseMinutes=10 maxAttemptsPerAgent=2 defaultPoints=10 accept=head-or-votes:2",
+      "width=2 leaseMinutes=10 maxLiveAttemptsPerAgent=2 defaultPoints=10 accept=head-or-votes:2",
     );
   });
 
@@ -957,6 +1006,9 @@ describe("status recovery", () => {
 
       const mock = mockFetch((call) => {
         if (call.url.endsWith("/api/project")) return json(project);
+        if (call.url.endsWith("/api/attempt/A-5")) {
+          return json({ id: "A-5", task: "T-4", agent: loaded.agent, role: "build", state: "live", leaseUntil: identity.lastAssignment!.leaseUntil, taskStatus: "open" });
+        }
         return json({
           id: "S-7", status: "queued", position: 2, attempt: "A-5", task: "T-4",
           agent: loaded.agent, model: "m", claim: "solves", message: "m", files: [],
@@ -968,7 +1020,7 @@ describe("status recovery", () => {
       expect(result.text).toMatch(/lease [1-5]m left/);
       expect(result.text).toContain("submission: S-7 queued #2");
       expect(mock.calls.map((call) => new URL(call.url).pathname)).toEqual([
-        "/api/project", "/api/submission/S-7",
+        "/api/project", "/api/attempt/A-5", "/api/submission/S-7",
       ]);
       expect(result.data.submission!.status).toBe("queued");
       expect(result.data.assignment!.attempt).toBe("A-5");
@@ -1186,7 +1238,9 @@ describe("join document", () => {
     expect(doc.indexOf("git clone")).toBeLessThan(doc.indexOf("minga join"));
     expect(doc).toContain("minga sync");
     expect(doc).not.toContain("git pull");
-    expect(doc).toContain("Run the project's check command locally");
+    expect(doc).toContain("minga check <file...>");
+    expect(doc).toContain("ROLES AND CLAIMS");
+    expect(doc).toContain("The first accepted");
     expect(doc).toContain("minga next --wait 600");
     expect(doc).toContain("minga beat <attempt>");
     expect(doc).toContain("--handoff");

@@ -10,8 +10,8 @@
  * node:child_process and node:fs only: plain Node 20+, no dependencies.
  */
 import { execFileSync } from "node:child_process";
-import { existsSync, readFileSync } from "node:fs";
-import { resolve } from "node:path";
+import { copyFileSync, existsSync, mkdirSync, readFileSync, statSync } from "node:fs";
+import { dirname, join, relative, resolve } from "node:path";
 import type { CommandResult } from "./commands.ts";
 import { readAgent } from "./store.ts";
 
@@ -20,8 +20,10 @@ export type GitRunner = (args: string[]) => string;
 
 export interface SyncInput {
   dir: string;
-  /** Discard every local change, including files that look unrelated. */
+  /** Also drop unrelated local changes; their files are copied to .minga/stash/<time>/ first. */
   discard?: boolean;
+  /** Injectable clock for the stash directory name. */
+  now?: () => Date;
   /** Injectable for tests; defaults to `git` via execFileSync. */
   runner?: GitRunner;
 }
@@ -36,6 +38,8 @@ export interface SyncData {
   synced: boolean;
   /** True when --discard was needed and not given. */
   refused: boolean;
+  /** Where --discard copied unrelated files before resetting (repo-relative), if any. */
+  stash?: string;
 }
 
 interface Change {
@@ -139,11 +143,26 @@ export function syncCommand(input: SyncInput): CommandResult<SyncData> {
   if (data.conflicting.length > 0 && input.discard !== true) {
     data.refused = true;
     const lines = [
-      `refusing to sync: local changes are not this agent's leftovers:`,
+      `refusing to sync: these local changes are not on the branch and were not in your last accepted submission:`,
       ...data.conflicting.map((path) => `  ${path}`),
-      're-run "minga sync --discard" to discard them, or move them aside first',
+      '"minga sync --discard" moves them to .minga/stash/ first, then syncs',
     ];
     return { text: lines.join("\n"), data };
+  }
+
+  // Never destroy work that is not on the branch: copy it aside first.
+  const stashed: string[] = [];
+  if (data.conflicting.length > 0) {
+    const stamp = (input.now ?? (() => new Date()))().toISOString().replace(/[:.]/g, "-");
+    const stashDir = join(repoDir, ".minga", "stash", stamp);
+    for (const path of data.conflicting) {
+      const from = join(repoDir, path);
+      if (!existsSync(from) || !statSync(from).isFile()) continue;
+      mkdirSync(dirname(join(stashDir, path)), { recursive: true });
+      copyFileSync(from, join(stashDir, path));
+      stashed.push(path);
+    }
+    if (stashed.length > 0) data.stash = relative(repoDir, stashDir).split("\\").join("/");
   }
 
   if (data.discarded.length > 0) {
@@ -151,7 +170,15 @@ export function syncCommand(input: SyncInput): CommandResult<SyncData> {
     run(["clean", "-fd", "--", ...data.discarded]);
   }
   data.synced = true;
-  const discarded = data.discarded.join(", ");
-  const text = `synced to ${remote}; discarded ${data.discarded.length} path(s): ${discarded}`;
-  return { text: input.discard === true && data.conflicting.length > 0 ? `${text} (--discard)` : text, data };
+  const onBranch = data.discarded.filter((p) => !data.conflicting.includes(p));
+  const lines = [`synced to ${remote}`];
+  if (onBranch.length > 0) {
+    lines.push(`removed ${onBranch.length} local cop${onBranch.length === 1 ? "y" : "ies"} of work already on ${remote}: ${onBranch.join(", ")}`);
+  }
+  if (data.conflicting.length > 0) {
+    lines.push(data.stash !== undefined
+      ? `moved ${stashed.length} unsubmitted path(s) to ${data.stash}/ (--discard): ${stashed.join(", ")}`
+      : `dropped ${data.conflicting.length} path(s) (--discard): ${data.conflicting.join(", ")}`);
+  }
+  return { text: lines.join("\n"), data };
 }

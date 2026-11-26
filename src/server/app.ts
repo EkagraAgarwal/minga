@@ -16,7 +16,7 @@ import { mkdirSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { join as pathJoin } from "node:path";
 import type { BranchHead, ChangedPaths, CheckPool, CheckResult, CommitAccepted, EventStore } from "../core/contracts.ts";
 import type {
-  Assignment, BeatRequest, ErrorBody, EventsResponse, HeadBanRequest, HeadCloseRequest, HeadDecideRequest, HeadNoteRequest,
+  Assignment, AttemptView, BeatRequest, ErrorBody, EventsResponse, HeadBanRequest, HeadCloseRequest, HeadDecideRequest, HeadNoteRequest,
   HeadPostRequest, HeadRuleRequest, JoinRequest, JoinResponse, MetricsResponse, NextRequest, NextResponse,
   NoteRequest, ProjectInfo, ProposeRequest, ReleaseRequest, SubmissionView, SubmitRequest, SubmitResponse, TasksResponse,
   VoteRequest,
@@ -67,7 +67,7 @@ const MAX_STREAM_BACKLOG = 2000;
 const CAPACITY_EVENTS = new Set<MingaEvent["type"]>(["task.posted", "attempt.ended", "rule.changed", "task.closed"]);
 
 const KNOWN_ROUTES = new Set([
-  "/api/project", "/api/view", "/api/leaderboard", "/api/metrics", "/api/tasks", "/api/events", "/api/stream", "/api/submission/:id",
+  "/api/project", "/api/view", "/api/leaderboard", "/api/metrics", "/api/tasks", "/api/events", "/api/stream", "/api/submission/:id", "/api/attempt/:id",
   "/api/join", "/api/next", "/api/beat", "/api/note", "/api/submit", "/api/release", "/api/propose", "/api/vote",
   "/api/head/post", "/api/head/decide", "/api/head/rule", "/api/head/ban", "/api/head/close", "/api/head/note",
 ]);
@@ -171,9 +171,45 @@ export function createApp(deps: AppDeps) {
     const id = str(attempt, "attempt", 32);
     const at = state.attempts[id];
     if (!at || at.agent !== agent) throw new HttpError(404, `no attempt ${id} for this agent`);
-    if (at.endedAt) throw new HttpError(410, `attempt ${id} already ended (${at.endReason})`);
+    if (at.endedAt) {
+      if (at.endReason === "task_closed") {
+        const by = closedByOf(at.task);
+        const who = by ? ` by ${by.submission ?? "a decision"} from ${by.agent}${by.model ? ` (${by.model})` : ""}` : "";
+        throw new HttpError(410, `attempt ${id} ended: ${at.task} was ${state.tasks[at.task]?.status ?? "closed"}${who} while you worked`,
+          "keep your files aside with: minga sync --discard (moves them to .minga/stash/), then: minga next --wait 600");
+      }
+      throw new HttpError(410, `attempt ${id} already ended (${at.endReason})`, "run: minga next --wait 600");
+    }
     if (!isLive(state, id, now())) throw new HttpError(410, `attempt ${id} lease expired`, "run next to get a new assignment");
     return id;
+  }
+
+  /** Who closed a task: the accepted submission when there is one, else the closing agent. */
+  function closedByOf(task: TaskId): AttemptView["closedBy"] {
+    const t = state.tasks[task];
+    if (!t || t.status === "open") return undefined;
+    for (let i = t.attempts.length - 1; i >= 0; i--) {
+      const at = state.attempts[t.attempts[i]!];
+      if (!at) continue;
+      const sub = Object.values(state.submissions).find((s) => s.attempt === at.id && s.status === "accepted");
+      if (sub) return { agent: sub.agent, model: sub.model, submission: sub.id };
+    }
+    return t.closedBy ? { agent: t.closedBy } : undefined;
+  }
+
+  function attemptView(id: string): AttemptView {
+    const at = state.attempts[id];
+    if (!at) throw new HttpError(404, `no attempt ${id}`);
+    const task = state.tasks[at.task];
+    const view: AttemptView = {
+      id: at.id, task: at.task, agent: at.agent, role: at.role,
+      state: at.endedAt ? "ended" : isLive(state, id, now()) ? "live" : "expired",
+      leaseUntil: at.leaseUntil, taskStatus: task?.status ?? "open",
+    };
+    if (at.endedAt) { view.endedAt = at.endedAt; if (at.endReason) view.endReason = at.endReason; }
+    const by = closedByOf(at.task);
+    if (by) view.closedBy = by;
+    return view;
   }
 
   function endAttempts(ids: AttemptId[], reason: AttemptEndReason) {
@@ -751,6 +787,7 @@ export function createApp(deps: AppDeps) {
         return json({ events: store.since(after, limit), head: store.head() } satisfies EventsResponse);
       }
       if (path === "/api/stream") return stream(req);
+      if (path.startsWith("/api/attempt/")) return json(attemptView(decodeURIComponent(path.slice("/api/attempt/".length))));
       if (path.startsWith("/api/submission/")) {
         const id = decodeURIComponent(path.slice("/api/submission/".length));
         return json(await getSubmission(id, waitSeconds(url.searchParams.get("wait")), req.signal));
@@ -793,7 +830,8 @@ export function createApp(deps: AppDeps) {
     const t0 = performance.now();
     const url = new URL(req.url);
     // Bounded keys: arbitrary paths must not grow the metrics maps.
-    const path = url.pathname.startsWith("/api/submission/") ? "/api/submission/:id" : url.pathname;
+    const path = url.pathname.startsWith("/api/submission/") ? "/api/submission/:id"
+      : url.pathname.startsWith("/api/attempt/") ? "/api/attempt/:id" : url.pathname;
     const route = KNOWN_ROUTES.has(path) ? `${req.method} ${path}` : "other";
     requests[route] = (requests[route] ?? 0) + 1;
     let res: Response;

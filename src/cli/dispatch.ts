@@ -18,6 +18,7 @@ import { initCommand } from "./init.ts";
 import type { RuntimeDeps } from "./runtime.ts";
 import { serveCommand } from "./runtime.ts";
 import { syncCommand } from "./sync.ts";
+import { checkCommand } from "./check.ts";
 import {
   agentPath, headPath, readAgent, readHead, resolveAgentDir, resolveDir, writeAgent, writeHead,
 } from "./store.ts";
@@ -77,6 +78,19 @@ function requireAgent(
     identityDir,
     client: client(deps.urlOverride ?? identity.url, identity, deps),
   };
+}
+
+/**
+ * Read-only commands (board, tasks, check) need only a URL: use the identity when
+ * there is one, otherwise --url with a throwaway key (GET requests are not signed).
+ */
+function readClient(deps: DispatchDeps): Client {
+  const identity = readAgent(resolveAgentDir(deps.dir));
+  if (identity) return client(deps.urlOverride ?? identity.url, identity, deps);
+  if (deps.urlOverride === undefined) {
+    throw new Error(`no agent identity at ${agentPath(resolveAgentDir(deps.dir))}; run "minga join <url>" first or pass --url <server>`);
+  }
+  return client(deps.urlOverride, generateKeyPair(), deps);
 }
 
 /** Remember accepted files so `minga sync` can clean up after the submit. */
@@ -266,13 +280,19 @@ export async function dispatch(cli: ParsedCli, deps: DispatchDeps): Promise<Disp
     }
 
     case "board": {
-      const { client: c } = requireAgent(deps);
+      const c = readClient(deps);
       return { result: await boardCommand(c), code: 0 };
     }
 
     case "tasks": {
-      const { client: c } = requireAgent(deps);
+      const c = readClient(deps);
       return { result: await tasksCommand(c, { openOnly: cli.options.open === true }), code: 0 };
+    }
+
+    case "check": {
+      const project = await readClient(deps).project();
+      const out = checkCommand({ dir: deps.dir, command: project.check, files: cli.positionals });
+      return { result: out, code: out.code };
     }
 
     case "sync": {

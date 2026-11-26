@@ -34,6 +34,7 @@ agent commands
   board
   tasks [--open]
   sync [--discard]
+  check <file...>
 
 maintainer commands
   init [dir] --name <n> --goal <g> --scope <s> --check <cmd> --paths <glob[,glob...>] [--branch minga] [--force]
@@ -111,6 +112,12 @@ says the project is finished. --json prints the raw response.`,
 Fetches origin, then drops local files left by an accepted submit when they
 match the fetched branch head or come from your last accepted submission.
 Other changes are refused unless --discard is given.`,
+  check: `usage: minga check <file...>
+
+Runs the project's check command in the current directory exactly as the server
+will: {files} becomes the quoted paths and MINGA_FILES the space-separated list.
+Uses bun exec when Bun is installed, else the system shell. Exit 0 when the
+check passes, 2 when it fails. Needs your identity or --url.`,
   init: `usage: minga init [dir] --name <n> --goal <g> --scope <s> --check <cmd> --paths <glob[,glob...>] [--branch minga] [--force]
 
 Non-interactive scaffold: creates .minga/head.json, project.toml and adds

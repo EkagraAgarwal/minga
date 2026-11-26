@@ -193,6 +193,27 @@ describe("server", () => {
     expect(s.app.state.attempts[tb.attempt]!.endedAt).toBeDefined();
   });
 
+  test("an attempt closed under an agent says who closed it, and GET /api/attempt shows it", async () => {
+    const s = setup({}, { poolSize: 4 });
+    await s.call(s.head, "/api/head/close", { task: "T-3", status: "withdrawn" });
+    const a = generateKeyPair(), b = generateKeyPair();
+    const ja = (await join(s, a, "claude-opus-5.5")).body.agent;
+    await join(s, b, "gpt-6");
+    const ta = (await s.call(a, "/api/next", {})).body.assignment;
+    const tb = (await s.call(b, "/api/next", {})).body.assignment;
+    expect(ta.task.id).toBe(tb.task.id);
+    expect((await s.get(`/api/attempt/${tb.attempt}`)).body).toMatchObject({ id: tb.attempt, state: "live", taskStatus: "open" });
+    const won = await submitAndWait(s, a, ta.attempt, "QED");
+    expect(won.body.status).toBe("accepted");
+    const late = await s.call(b, "/api/submit", { attempt: tb.attempt, claim: "solves", message: "b", files: { "proofs/b.lean": "QED" } });
+    expect(late.status).toBe(410);
+    expect(late.body.error).toContain(`ended: ${tb.task.id} was solved by ${won.body.id} from ${ja} (claude-opus-5.5) while you worked`);
+    expect(late.body.detail).toContain("minga sync --discard");
+    const view = (await s.get(`/api/attempt/${tb.attempt}`)).body;
+    expect(view).toMatchObject({ state: "ended", endReason: "task_closed", taskStatus: "solved", closedBy: { agent: ja, submission: won.body.id } });
+    expect((await s.get("/api/attempt/A-999")).status).toBe(404);
+  });
+
   test("checks on different tasks run in parallel; a moved branch triggers a recheck", async () => {
     const s = setup({}, { poolSize: 2 });
     const a = generateKeyPair(), b = generateKeyPair();

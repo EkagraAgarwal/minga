@@ -9,7 +9,7 @@ import { readFileSync } from "node:fs";
 import { isAbsolute, relative, resolve, sep } from "node:path";
 import { parseArgs } from "node:util";
 import type {
-  Assignment, BeatResponse, JoinResponse, LeaderboardResponse, NextResponse, NoteResponse,
+  Assignment, AttemptView, BeatResponse, JoinResponse, LeaderboardResponse, NextResponse, NoteResponse,
   ProposeResponse, ProjectInfo, ReleaseResponse, SubmitResponse, SubmissionView, VoteResponse,
   HeadDecideResponse, HeadNoteResponse, HeadRuleResponse, TasksResponse,
 } from "../core/protocol.ts";
@@ -17,6 +17,16 @@ import type {
   AcceptPolicy, AgentId, Claim, NoteKind, ProposalId, ProposalKind, Rules, TaskId,
 } from "../core/types.ts";
 import { NOTE_KINDS } from "../core/types.ts";
+import type { Role } from "../core/types.ts";
+
+/** What each role asks of an agent. Any role may submit --claim solves. */
+export const ROLE_HINTS: Record<Role, string> = {
+  build: "write the most direct working solution",
+  explore: "try a different approach from the others on this task; note what you learn",
+  attack: "hunt for edge cases, wrong specs or counterexamples; refute with evidence, or solve it robustly",
+  distill: "read the notes and existing attempts, then submit the simplest correct version",
+  plan: "split the task into smaller ones with minga propose task --under <task>",
+};
 import type { KeyPair } from "../identity/keys.ts";
 import { agentIdFromPublicKey, formatHeadKey, generateKeyPair } from "../identity/keys.ts";
 import type { Client } from "./client.ts";
@@ -106,6 +116,7 @@ const COMMAND_OPTIONS: Record<string, OptionSet> = {
   sync: {
     discard: { type: "boolean" },
   },
+  check: {},
   mcp: {},
 };
 
@@ -226,7 +237,7 @@ export function formatRules(rules: Rules): string {
   return [
     `width=${rules.width}`,
     `leaseMinutes=${rules.leaseMinutes}`,
-    `maxAttemptsPerAgent=${rules.maxAttemptsPerAgent}`,
+    `maxLiveAttemptsPerAgent=${rules.maxAttemptsPerAgent}`,
     `defaultPoints=${rules.defaultPoints}`,
     `accept=${formatAcceptPolicy(rules.accept)}`,
   ].join(" ");
@@ -342,7 +353,7 @@ export async function joinCommand(client: Client, input: JoinInput): Promise<Joi
     `scope: ${response.project.scope}`,
     `rules: ${formatRules(response.project.rules)}`,
     "",
-    `get the code: git clone ${input.url.replace(/\/+$/, "")}/repo.git work && cd work`,
+    `get the code: git clone -b ${response.project.branch ?? "main"} ${input.url.replace(/\/+$/, "")}/repo.git work && cd work`,
     "run minga from inside that checkout; submit reads files relative to cwd",
   ];
   if (response.live.length > 0) lines.push(`live attempts from before: ${response.live.join(", ")}`);
@@ -365,7 +376,7 @@ function formatAssignment(a: Assignment, headAgent?: AgentId): string {
     headAgent !== undefined && agent === headAgent ? "head: " : "";
   const lines = [
     `attempt   ${a.attempt}`,
-    `role      ${a.role}`,
+    `role      ${a.role} (${ROLE_HINTS[a.role]})`,
     `lease     ${a.leaseUntil}`,
     ...(a.head ? [`head ${a.head.slice(0, 7)} (minga sync if your checkout is older)`] : []),
     `task      ${a.task.id}  ${a.task.title}  (${a.task.points} points)`,
@@ -384,7 +395,7 @@ function formatAssignment(a: Assignment, headAgent?: AgentId): string {
     }
   }
   if (a.others.length > 0) {
-    lines.push("others on this task:");
+    lines.push(`others on this task (the first accepted solve closes it for everyone; submit as soon as minga check passes):`);
     for (const other of a.others) {
       const approach = other.approach.length > 0 ? ` — ${other.approach}` : "";
       lines.push(`  ${other.attempt} ${other.agent} ${other.model} ${other.role}${approach}`);
@@ -720,6 +731,8 @@ export interface StatusData {
   assignment?: SessionIdentity["lastAssignment"];
   /** Last submission from `submit`, checked live on `status`. */
   submission?: SubmissionView;
+  /** Where the last attempt stands on the server (GET /api/attempt). */
+  attempt?: AttemptView;
 }
 
 /** Minutes left on a lease, for an agent that lost context. */
@@ -744,9 +757,16 @@ export async function statusCommand(client: Client, identity: SessionIdentity): 
 
   const assignment = identity.lastAssignment;
   if (assignment) {
-    lines.push(`attempt: ${assignment.attempt} (${assignment.role}) on ${assignment.task} — ` +
-      `lease ${leaseText(assignment.leaseUntil)}`);
     data.assignment = assignment;
+    let view: AttemptView | undefined;
+    try { view = await client.attempt(assignment.attempt); } catch { view = undefined; }
+    const head = `attempt: ${assignment.attempt} (${assignment.role}) on ${assignment.task}`;
+    if (view === undefined) {
+      lines.push(`${head} — lease ${leaseText(assignment.leaseUntil)} (server state unavailable)`);
+    } else {
+      data.attempt = view;
+      lines.push(`${head} — ${attemptText(view)}`);
+    }
   }
 
   if (identity.lastSubmission) {
@@ -761,6 +781,18 @@ export async function statusCommand(client: Client, identity: SessionIdentity): 
   }
 
   return { text: lines.join("\n"), data };
+}
+
+/** One line on where an attempt stands, from GET /api/attempt. */
+export function attemptText(view: AttemptView): string {
+  if (view.state === "live") return `live, lease ${leaseText(view.leaseUntil)}`;
+  if (view.state === "expired") return "lease expired; run minga next --wait 600 for a new assignment";
+  const by = view.closedBy;
+  if (view.endReason === "task_closed") {
+    const who = by ? ` by ${by.submission ?? "a decision"} from ${by.agent}${by.model ? ` (${by.model})` : ""}` : "";
+    return `ended: ${view.task} was ${view.taskStatus}${who}; run minga sync, then minga next --wait 600`;
+  }
+  return `ended (${view.endReason ?? "closed"}); run minga sync, then minga next --wait 600`;
 }
 
 export async function boardCommand(client: Client): Promise<CommandResult<LeaderboardResponse>> {

@@ -85,13 +85,13 @@ describe("MCP protocol", () => {
     expect(await handler(JSON.stringify({ jsonrpc: "2.0", id: 3, method: "notifications/initialized" }))).toBeNull();
   });
 
-  test("tools/list exposes all fourteen tools with JSON Schema inputs", async () => {
+  test("tools/list exposes all fifteen tools with JSON Schema inputs", async () => {
     const handler = createMcpHandler({ dir: process.cwd(), execute: canned() });
     const reply = decode(await handler(rpc(4, "tools/list")));
     expect(reply.result.tools.map((t: { name: string }) => t.name)).toEqual([
       "minga_join", "minga_next", "minga_beat", "minga_note", "minga_submit", "minga_result",
       "minga_release", "minga_propose_task", "minga_propose_impossible", "minga_vote",
-      "minga_status", "minga_board", "minga_tasks", "minga_sync",
+      "minga_status", "minga_board", "minga_tasks", "minga_check", "minga_sync",
     ]);
     for (const tool of reply.result.tools) {
       expect(typeof tool.description).toBe("string");
@@ -99,7 +99,7 @@ describe("MCP protocol", () => {
       expect(tool.inputSchema.type).toBe("object");
       expect(typeof tool.inputSchema.properties).toBe("object");
     }
-    expect(MCP_TOOLS.length).toBe(14);
+    expect(MCP_TOOLS.length).toBe(15);
 
     const joined = reply.result.tools.find((t: { name: string }) => t.name === "minga_join");
     const next = reply.result.tools.find((t: { name: string }) => t.name === "minga_next");

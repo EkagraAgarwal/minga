@@ -181,6 +181,15 @@ export const MCP_TOOLS: McpTool[] = [
     },
   },
   {
+    name: "minga_check",
+    description: "Run the project's check command locally on the files you will submit, exactly as the server will. ok means submit now; a failure includes the output tail.",
+    inputSchema: {
+      type: "object",
+      properties: { files: { type: "array", items: { type: "string" }, description: "Repo-relative paths you will submit." } },
+      required: ["files"],
+    },
+  },
+  {
     name: "minga_sync",
     description: "After an accepted submit: fetch origin and clean up files left in the worktree. Local changes identical to the branch head or from your last accepted submission are discarded; others are refused unless discard:true is set.",
     inputSchema: {
@@ -330,6 +339,11 @@ export function toolToCli(
     case "minga_tasks":
       command = "tasks";
       if (args.open === true) options.open = true;
+      break;
+    case "minga_check":
+      command = "check";
+      if (!Array.isArray(args.files) || args.files.some((f) => typeof f !== "string")) throw new Error("files must be an array of paths");
+      positionals = args.files as string[];
       break;
     case "minga_sync":
       command = "sync";
