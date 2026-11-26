@@ -160,26 +160,35 @@ const MESSAGES = [
   "checked small cases", "rewrite with decidable equality",
 ];
 
-const TOP_AREA_TITLES = [
-  "Circuit lower bounds", "Proof complexity", "Barriers", "Combinatorial core",
-  "Reductions library", "Oracle constructions",
+// Each area owns a distinct pool of sub-areas, so no two branches share a label.
+const AREAS = [
+  { name: "Circuit lower bounds", subs: ["Switching lemmas", "Monotone circuits", "Depth hierarchy", "Gate elimination"] },
+  { name: "Proof complexity", subs: ["Resolution width", "Cutting planes", "Nullstellensatz", "Proof size separations"] },
+  { name: "Barriers", subs: ["Relativization", "Natural proofs", "Algebrization", "Entropy obstructions"] },
+  { name: "Algebraic methods", subs: ["Polynomial method", "Approximating polynomials", "Rank arguments", "Combinatorial Nullstellensatz"] },
+  { name: "Communication complexity", subs: ["Discrepancy bounds", "Information complexity", "Protocol compression", "Lower bound templates"] },
+  { name: "Derandomization", subs: ["Pseudorandom generators", "Hardness versus randomness", "Extractor constructions", "Hitting sets"] },
 ] as const;
 
-const SUB_AREA_TITLES = [
-  "Switching and shrinkage", "Width lower bounds", "Relativization desk",
-  "Set systems and entropy", "Probabilistic method", "Polynomial method",
-  "Decision tree bounds", "Lean infrastructure", "Finite structures",
-  "Communication games", "Contractions and minors", "Parameterized bounds",
-] as const;
-
-const LEAF_TITLES = [
-  "Razborov approximation step", "Sunflower lemma (Erdos-Rado)", "Hastad switching lemma",
-  "Karchmer-Wigderson depth game", "SAT <=p 3-SAT", "3-SAT <=p CLIQUE",
-  "Andreev function bound", "Resolution width gap", "Monotone circuit bound",
-  "Shrinkage exponent", "Backdoor set search", "CLIQUE <=p VERTEX-COVER",
-  "Oracle B with P^B != NP^B", "Relativization check", "Contractions and minors",
-  "Entropy bound on set families", "Decision tree to formula", "Polynomial method step",
-] as const;
+// Templates take a parameter, so every generated leaf title is unique without a "(variant N)" suffix.
+const LEAF_TEMPLATES: ReadonlyArray<(n: number) => string> = [
+  n => `Formalize Håstad's switching lemma for depth-${3 + ((n - 1) % 3)} width ${n + 2}`,
+  n => `Bound Razborov approximators for CLIQUE_${n + 2}`,
+  n => `Prove the sunflower lemma for ${n + 3}-uniform families`,
+  n => `Separate monotone circuits for CLIQUE_${n + 2}`,
+  n => `Establish a resolution width lower bound of ${n + 4}`,
+  n => `Derive shrinkage exponent ${(n % 5) + 1} for depth-3 formulas`,
+  n => `Reduce SAT to 3-SAT on ${n + 6} variables`,
+  n => `Construct oracle B separating P^B from NP^B at length ${n + 4}`,
+  n => `Verify natural-proofs barrier instance ${n + 1} in Lean`,
+  n => `Bound Andreev's function on ${n + 7} inputs`,
+  n => `Prove backdoor set detection for width ${n + 2}`,
+  n => `Refine the Karchmer–Wigderson game for depth ${n + 3}`,
+];
+const leafTitle = (index: number): string => {
+  const t = LEAF_TEMPLATES[index % LEAF_TEMPLATES.length]!;
+  return t(Math.floor(index / LEAF_TEMPLATES.length) + 1);
+};
 
 // ---------------------------------------------------------------- seeding
 
@@ -317,22 +326,20 @@ function seed(): void {
   const subCount = Math.min(areaCount * subPerArea, Math.max(0, total - areaCount - 1));
   const areas: TaskState[] = [];
   for (let i = 0; i < areaCount; i += 1) {
-    const a = addTask(TOP_AREA_TITLES[i] ?? "Area " + (i + 1), "Branch point. Leaves below carry the work.", null, "open", 0, int(120, 400));
+    const a = addTask(AREAS[i]?.name ?? "Area " + (i + 1), "Branch point. Leaves below carry the work.", null, "open", 0, int(120, 400));
     areas.push(a);
   }
   const subs: TaskState[] = [];
   for (let i = 0; i < subCount; i += 1) {
-    const area = areas[i % areas.length]!;
-    const name = SUB_AREA_TITLES[i % SUB_AREA_TITLES.length] ?? "Subarea";
-    const part = 1 + Math.floor(i / SUB_AREA_TITLES.length);
-    const title = part === 1 ? name : name + " · " + part;
-    subs.push(addTask(title, "Grouping of related leaves.", area.id, "open", 0, int(90, 320)));
+    const slot = i % areas.length;
+    const area = areas[slot]!;
+    const name = AREAS[slot]?.subs[Math.floor(i / areas.length)] ?? "Subarea";
+    subs.push(addTask(name, "Grouping of related leaves.", area.id, "open", 0, int(90, 320)));
   }
   const leaves = total - areaCount - subCount;
   for (let i = 0; i < leaves; i += 1) {
     const parent = subs.length ? subs[i % subs.length]! : areas[i % areas.length]!;
-    const base = LEAF_TITLES[i % LEAF_TITLES.length] ?? "Lemma " + (i + 1);
-    const title = i < LEAF_TITLES.length ? base : base + " (variant " + (1 + Math.floor(i / LEAF_TITLES.length)) + ")";
+    const title = leafTitle(i);
     const roll = rnd();
     const status: TaskStatus = roll < 0.06 ? "solved" : roll < 0.1 ? "refuted" : roll < 0.13 ? "impossible" : roll < 0.16 ? "withdrawn" : "open";
     const t = addTask(title, "Prove or refute the statement with machine-checked steps in Proofs/**.", parent.id, status, int(10, 80), int(10, 300));
@@ -797,7 +804,7 @@ function actionJoin(): boolean {
 
 function actionPost(): boolean {
   const parent = pick(Object.values(db.tasks));
-  const title = "Refinement of " + (pick(LEAF_TITLES) ?? "lemma");
+  const title = "New task: " + leafTitle(int(0, 500));
   const t = addTask(title, "Posted from the dev fixture.", parent ? parent.id : null, "open", rules.defaultPoints, 0);
   emit("task.posted", HEAD, { task: t.id, title: t.title, body: t.body, parent: t.parent, points: t.points, by: "head" });
   return true;

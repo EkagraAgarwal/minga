@@ -91,13 +91,14 @@ button.textbtn:hover{color:var(--ink)}
 .nlist li .role{font-family:var(--sans)}
 .nhead{font-size:12px; color:var(--ink-2); margin:10px 0 3px}
 
-.qlist{position:relative; height:180px; overflow-y:auto; border-top:1px solid var(--rule); border-bottom:1px solid var(--rule); scrollbar-width:thin}
+.qlist{position:relative; max-height:240px; overflow-y:auto; border-top:1px solid var(--rule); border-bottom:1px solid var(--rule); scrollbar-width:thin}
 .qlist .spacer{width:1px}
-.qrow{position:absolute; left:0; right:0; height:20px; display:grid; grid-template-columns:56px 48px minmax(0,1fr) 58px 72px; gap:8px; align-items:center; font:400 12px/20px var(--mono); font-variant-numeric:tabular-nums}
+.qrow{position:absolute; top:0; left:0; right:0; height:20px; display:grid; grid-template-columns:56px 48px minmax(0,1fr) 58px 72px; gap:8px; align-items:center; font:400 12px/20px var(--mono); font-variant-numeric:tabular-nums}
 .qrow .who,.qrow .task{overflow:hidden; text-overflow:ellipsis; white-space:nowrap}
 .qrow.checking{color:var(--accent)}
 .qrow .claim{color:var(--ink-2); font-variant-caps:all-small-caps; letter-spacing:.04em}
 .qrow.more{color:var(--ink-3); font-family:var(--sans); font-size:12px}
+.qlist .qempty{font:400 12px/20px var(--sans); color:var(--ink-3)}
 .loglist{list-style:none; margin:8px 0 0; padding:0; max-height:200px; overflow-y:auto; border-top:1px solid var(--rule); scrollbar-width:thin}
 .logline{display:grid; grid-template-columns:72px 62px 76px minmax(0,1fr); gap:8px; font:400 12px/1.7 var(--mono); font-variant-numeric:tabular-nums; color:var(--ink); overflow-wrap:anywhere}
 .logline time{color:var(--ink-3)}
@@ -253,8 +254,11 @@ td.mono{font:400 12px/1.5 var(--mono); font-variant-numeric:tabular-nums}
   const clamp = (x, lo, hi) => x < lo ? lo : x > hi ? hi : x;
   const TAU = Math.PI * 2;
   const ROW_H = 22;
-  const HISTORY = 60;
-  const MAX_QUEUE_ROWS = 50;
+  const SAMPLE_MS = 5000;          // one sample every 5 s
+  const HISTORY = 60;              // 60 samples = the last 5 minutes
+  const MIN_SAMPLES = 3;           // fewer samples leave the spark space empty
+  const MAX_QUEUE_ROWS = 12;       // 12 rows x 20px = the 240px strip cap
+  const X_COUNT = 268;             // fixed, right-aligned child-count column
   // Only fonts from the design spec are ever handed to the canvas.
   const FONT_SANS = '"IBM Plex Sans"';
   const FONT_MONO = '"IBM Plex Mono"';
@@ -363,6 +367,60 @@ td.mono{font:400 12px/1.5 var(--mono); font-variant-numeric:tabular-nums}
   const familyGlyph = modelName => hash(S(modelName)) % 6;
   const numId = id => N(S(id).replace(/^T-/, ""));
 
+  // Pure formatting helpers. Exposed on the test hook so layout rules can be
+  // checked without a browser; each one is also used by a renderer below.
+  function clipText(text, maxWidth, measure) {
+    const full = S(text);
+    if (measure(full) <= maxWidth) return full;
+    if (maxWidth <= 0) return "";
+    const ell = "…";
+    let lo = 0, hi = full.length;
+    while (lo < hi) {
+      const mid = Math.ceil((lo + hi) / 2);
+      if (measure(full.slice(0, mid) + ell) <= maxWidth) lo = mid; else hi = mid - 1;
+    }
+    return lo > 0 ? full.slice(0, lo) + ell : ell;
+  }
+  function sparkGeometry(a) {
+    if (!Array.isArray(a) || a.length < MIN_SAMPLES) return { points: "", y1: 7, y2: 7 };
+    let min = Infinity, max = -Infinity;
+    for (const v of a) { if (v < min) min = v; if (v > max) max = v; }
+    const span = Math.max(1, max - min);
+    const yOf = v => 13 - Math.round((v - min) / span * 12);
+    const points = a.map((v, k) => k + "," + yOf(v)).join(" ");
+    const y = yOf(a[a.length - 1]);
+    return { points, y1: y - 2, y2: y + 2 };
+  }
+  function queueLayout(count) {
+    const n = Math.max(0, N(count));
+    const shown = Math.min(n, MAX_QUEUE_ROWS);
+    const extra = n - shown;
+    return { shown, extra, rows: shown + (extra > 0 ? 1 : 0) };
+  }
+  function busiestOpenLeaf(tasks, liveByTask) {
+    let best = null, bestCount = -1;
+    for (const t of tasks || []) {
+      if (!t || t.status !== "open" || (t.children || []).length > 0) continue;
+      const list = (liveByTask && liveByTask.get(t.id)) || [];
+      if (list.length > bestCount) { best = t; bestCount = list.length; }
+    }
+    return best;
+  }
+  function logObject(type, d, actor, task) {
+    switch (type) {
+      case "attempt.beat":
+      case "attempt.ended": return S(task) + " · " + S(d.attempt);
+      case "note.added": return S(task) + " " + S(d.kind);
+      case "submission.checked": return S(task) + " " + (d.ok ? "accepted" : "rejected");
+      case "task.closed": return S(task) + " " + S(d.status);
+      case "attempt.started": return S(task) + " " + S(d.role);
+      case "proposal.decided": return S(d.proposal) + " " + (d.accepted ? "accepted" : "rejected");
+      case "agent.joined": return S(d.model) + " · " + S(d.harness);
+      case "rule.changed": return Object.keys(d.rules || {}).join(" ");
+      default: return S(task || d.proposal || d.submission || d.agent || actor || "");
+    }
+  }
+
   function reindex() {
     agentById = new Map(model.agents.map(a => [a.id, a]));
     taskById = new Map(model.tasks.map(t => [t.id, t]));
@@ -407,15 +465,20 @@ td.mono{font:400 12px/1.5 var(--mono); font-variant-numeric:tabular-nums}
       N(t.accepted), N(t.openTasks), eventTimes.length,
     ];
   }
-  function pushSample(first) {
+  function pushSample() {
     const vals = sampleValues();
     for (let i = 0; i < vals.length; i += 1) {
       const key = "s" + i;
       const a = samples[key] || (samples[key] = []);
-      if (first) while (a.length < HISTORY) a.push(vals[i]);
-      else { a.push(vals[i]); if (a.length > HISTORY) a.shift(); }
+      a.push(vals[i]);
+      if (a.length > HISTORY) a.shift();
     }
   }
+  function maybeSample() {
+    const at = Date.now();
+    if (at - lastSample >= SAMPLE_MS) { pushSample(); lastSample = at; }
+  }
+  const sampleLengths = () => Object.keys(samples).sort().map(k => samples[k].length);
 
   function applyView(view) {
     if (!view || !view.project || !Array.isArray(view.tasks)) return;
@@ -429,8 +492,8 @@ td.mono{font:400 12px/1.5 var(--mono); font-variant-numeric:tabular-nums}
     $("joinUrl").textContent = location.origin + "/join";
     $("headAgent").textContent = S(view.project.headAgent) || "not set";
     eventTimes = [];
-    pushSample(Object.keys(samples).length === 0);
-    lastSample = Date.now();
+    // Seed once, and never let later view resyncs reset the sampling clock.
+    if (Object.keys(samples).length === 0) { pushSample(); lastSample = Date.now(); }
     if (!selectedTask || !model.tasks.some(t => t.id === selectedTask)) selectedTask = null;
     reindex();
     renderLogAll();
@@ -468,16 +531,11 @@ td.mono{font:400 12px/1.5 var(--mono); font-variant-numeric:tabular-nums}
 
   function logEvent(e) {
     const d = e.data || {};
-    let object = S(d.task || d.agent || d.proposal || d.submission || e.actor || "");
+    // Beat/released events carry only an attempt id; resolve its task before formatting.
+    const task = S(d.task) || S(attemptById.get(S(d.attempt))?.task || "");
+    const object = logObject(e.type, d, e.actor, task);
     let verb = VERBS[e.type] || S(e.type).split(".")[1] || "event";
     if (e.type === "submission.checked") verb = d.ok ? "accepted" : "rejected";
-    if (e.type === "note.added") object = S(d.task) + " " + S(d.kind);
-    else if (e.type === "submission.checked") object = S(d.task) + " " + (d.ok ? "accepted" : "rejected");
-    else if (e.type === "task.closed") object = S(d.task) + " " + S(d.status);
-    else if (e.type === "attempt.started") object = S(d.task) + " " + S(d.role);
-    else if (e.type === "proposal.decided") object = S(d.proposal) + " " + (d.accepted ? "accepted" : "rejected");
-    else if (e.type === "agent.joined") object = S(d.model) + " " + S(d.harness);
-    else if (e.type === "rule.changed") object = Object.keys(d.rules || {}).join(" ");
     logLines.unshift({ at: S(e.at), actor: S(e.actor), verb, object, fresh: true });
     if (logLines.length > 200) logLines.pop();
     logCount += 1;
@@ -645,8 +703,7 @@ td.mono{font:400 12px/1.5 var(--mono); font-variant-numeric:tabular-nums}
     logEvent(e);
     eventTimes.push(Date.now());
     if (eventTimes.length > 600) eventTimes.shift();
-    const at = Date.now();
-    if (at - lastSample > 10000) { pushSample(false); lastSample = at; }
+    maybeSample();
   }
 
   function flush() {
@@ -781,12 +838,20 @@ td.mono{font:400 12px/1.5 var(--mono); font-variant-numeric:tabular-nums}
       const t = row.task;
       if (row.kind === "area") {
         const x = 12 + row.depth * 18;
+        const count = String((t.children || []).length);
+        pctx.font = ID_FONT;
+        const countWidth = pctx.measureText(count).width;
         pctx.font = AREA_FONT;
+        const maxWidth = Math.max(24, X_COUNT - 10 - countWidth - x);
+        const label = clipText((collapsed.has(t.id) ? "+  " : "-  ") + S(t.title), maxWidth, w => pctx.measureText(w).width);
         pctx.fillStyle = C["--ink-2"];
-        pctx.fillText((collapsed.has(t.id) ? "+  " : "-  ") + S(t.title), x, y);
+        pctx.textAlign = "left";
+        pctx.fillText(label, x, y);
         pctx.font = ID_FONT;
         pctx.fillStyle = C["--ink-3"];
-        pctx.fillText(String((t.children || []).length), Math.max(x + 160, xTitle + 40), y);
+        pctx.textAlign = "right";
+        pctx.fillText(count, X_COUNT, y);
+        pctx.textAlign = "left";
       } else {
         const p = row.parentIndex;
         if (p >= 0 && p !== i - 1) {
@@ -887,18 +952,12 @@ td.mono{font:400 12px/1.5 var(--mono); font-variant-numeric:tabular-nums}
     $("serverTime").textContent = clock(model.now);
     $("seq").textContent = String(lastSeq);
     const series = [0, 1, 2, 3, 4, 5].map(i => samples["s" + i] || []);
+    const names = ["Agents", "Attempts", "Queue", "Accepted", "Open", "Events"];
     for (let i = 0; i < series.length; i += 1) {
-      const a = series[i];
-      if (a.length < 2) continue;
-      let min = Infinity, max = -Infinity;
-      for (const v of a) { if (v < min) min = v; if (v > max) max = v; }
-      const span = Math.max(1, max - min);
-      const points = a.map((v, k) => k + "," + (13 - Math.round((v - min) / span * 12))).join(" ");
-      $("sp" + ["Agents", "Attempts", "Queue", "Accepted", "Open", "Events"][i]).setAttribute("points", points);
-      const last = a[a.length - 1];
-      const y = 13 - Math.round((last - min) / span * 12);
-      $("lp" + ["Agents", "Attempts", "Queue", "Accepted", "Open", "Events"][i]).setAttribute("y1", String(y - 2));
-      $("lp" + ["Agents", "Attempts", "Queue", "Accepted", "Open", "Events"][i]).setAttribute("y2", String(y + 2));
+      const g = sparkGeometry(series[i]);
+      $("sp" + names[i]).setAttribute("points", g.points);
+      $("lp" + names[i]).setAttribute("y1", String(g.y1));
+      $("lp" + names[i]).setAttribute("y2", String(g.y2));
     }
   }
 
@@ -908,11 +967,9 @@ td.mono{font:400 12px/1.5 var(--mono); font-variant-numeric:tabular-nums}
     const list = $("qlist");
     const holder = document.createDocumentFragment ? document.createDocumentFragment() : document.createElement("div");
     const rowH = 20;
-    const viewH = 180;
-    const shown = Math.min(pendingSubs.length, MAX_QUEUE_ROWS);
-    const extra = pendingSubs.length - shown;
-    const total = shown + (extra > 0 ? 1 : 0);
-    $("qspacer").style.height = Math.max(0, total * rowH - viewH) + "px";
+    const { shown, extra, rows: rowTotal } = queueLayout(pendingSubs.length);
+    $("qspacer").style.height = rowTotal * rowH + "px";
+    if (rowTotal === 0) holder.appendChild(node("div", "qempty", "queue empty"));
     for (let i = 0; i < shown; i += 1) {
       const s = pendingSubs[i];
       if (!s) continue;
@@ -1036,8 +1093,8 @@ td.mono{font:400 12px/1.5 var(--mono); font-variant-numeric:tabular-nums}
     if (!model) return;
     dirtyNote = false;
     const holder = document.createDocumentFragment ? document.createDocumentFragment() : document.createElement("div");
-    const row = hover >= 0 ? rows[hover] : (focusRow >= 0 ? rows[focusRow] : rows[0]);
-    const t = row ? row.task : null;
+    const row = hover >= 0 ? rows[hover] : (focusRow >= 0 ? rows[focusRow] : null);
+    const t = row ? row.task : busiestOpenLeaf(model.tasks, liveByTask);
     selectedTask = t ? t.id : null;
     const box = $("marginNote");
     const title = $("noteTitle");
@@ -1250,6 +1307,7 @@ td.mono{font:400 12px/1.5 var(--mono); font-variant-numeric:tabular-nums}
     function frame(now) {
       requestAnimationFrame(frame);
       if (!model) return;
+      maybeSample(); // keep the 5 s cadence even when the event stream is quiet
       if (reduce) { if (needDraw) { draw(0); needDraw = false; } return; }
       if (needDraw || (now - lastFrame > 50 && (model.totals.liveAttempts > 0))) {
         lastFrame = now;
@@ -1272,6 +1330,7 @@ td.mono{font:400 12px/1.5 var(--mono); font-variant-numeric:tabular-nums}
       get collapsedCount() { return collapsed.size; },
       get queueCount() { return pendingSubs.length; },
       get maxScrollRows() { return Math.ceil(H / ROW_H); },
+      get sampleLengths() { return sampleLengths(); },
     };
   }
 
@@ -1279,6 +1338,7 @@ td.mono{font:400 12px/1.5 var(--mono); font-variant-numeric:tabular-nums}
   const hook = globalThis.__MINGA_UI_TEST__;
   if (typeof hook === "function") hook({
     applyView, queueEvent, flush, renderNow, reindex, buildRows, renderTables, renderQueue, renderNote, renderReadouts, ctx, plate,
+    clipText, sparkGeometry, queueLayout, busiestOpenLeaf, logObject, pushSample, sampleLengths,
   });
   else boot();
 })();

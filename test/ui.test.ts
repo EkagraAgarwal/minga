@@ -499,15 +499,15 @@ describe("visual review fixes", () => {
     } finally { m.restore(); }
   });
 
-  test("the queue is populated from view.submissions and caps at 50 rows", () => {
+  test("the queue is populated from view.submissions and caps at 12 rows", () => {
     const m = mountScript();
     try {
       m.hooks.applyView(bigView(120, 60));
       m.hooks.flush();
       expect(m.g.window.__minga.queueCount).toBe(60);
       const children = m.byId.get("qlist")!.children;
-      expect(children.filter((n: FakeNode) => n.className.startsWith("qrow") && !n.className.includes("more"))).toHaveLength(50);
-      expect(children.find((n: FakeNode) => n.className.includes("more"))!.textContent).toBe("+10 more");
+      expect(children.filter((n: FakeNode) => n.className.startsWith("qrow") && !n.className.includes("more"))).toHaveLength(12);
+      expect(children.find((n: FakeNode) => n.className.includes("more"))!.textContent).toBe("+48 more");
       expect(children.some((n: FakeNode) => n.className.includes("checking"))).toBe(true);
       const readout = m.byId.get("rQueue")!.textContent;
       expect(readout).toContain("queued");
@@ -575,6 +575,142 @@ describe("visual review fixes", () => {
       expect(lines.filter((n: FakeNode) => n.className.includes("fresh"))).toHaveLength(1);
       while (m.frames.length) { const cb = m.frames.shift() as (t: number) => void; cb(16); }
       expect(m.byId.get("logList")!.children.filter((n: FakeNode) => n.className.includes("fresh"))).toHaveLength(0);
+    } finally { m.restore(); }
+  });
+});
+
+// ------------------------------------------------------------------ final polish (pure helpers)
+
+describe("final polish", () => {
+  test("sparkline geometry is empty until three samples, then draws a bounded series", () => {
+    const m = mountScript();
+    try {
+      expect(m.hooks.sparkGeometry([]).points).toBe("");
+      expect(m.hooks.sparkGeometry([4, 4]).points).toBe("");
+      expect(m.hooks.sparkGeometry([4, 4]).y1).toBe(7);
+      expect(m.hooks.sparkGeometry([4, 4]).y2).toBe(7);
+      const g = m.hooks.sparkGeometry([4, 5, 9]);
+      const points = String(g.points).split(" ");
+      expect(points).toHaveLength(3);
+      for (const p of points) {
+        const y = Number(p.split(",")[1]);
+        expect(y).toBeGreaterThanOrEqual(1);
+        expect(y).toBeLessThanOrEqual(13);
+      }
+      expect(String(m.hooks.sparkGeometry([1, 2, 3, 4, 5, 6]).points).split(" ")).toHaveLength(6);
+    } finally { m.restore(); }
+  });
+
+  test("the first sample lands on load and each series holds at most 60 samples", () => {
+    const m = mountScript();
+    try {
+      m.hooks.applyView(bigView(4, 0));
+      m.hooks.flush();
+      expect(m.hooks.sampleLengths()).toEqual([1, 1, 1, 1, 1, 1]);
+      m.hooks.renderReadouts();
+      expect(m.byId.get("spAgents")!.getAttribute("points")).toBe("");
+      for (let i = 0; i < 70; i += 1) m.hooks.pushSample();
+      expect(m.hooks.sampleLengths()).toEqual([60, 60, 60, 60, 60, 60]);
+      m.hooks.renderReadouts();
+      expect(String(m.byId.get("spAgents")!.getAttribute("points")).split(" ")).toHaveLength(60);
+      expect(script).toContain("SAMPLE_MS = 5000");
+    } finally { m.restore(); }
+  });
+
+  test("queue layout fits at most 12 rows and an empty queue shows a hint", () => {
+    const m = mountScript();
+    try {
+      expect(m.hooks.queueLayout(0)).toEqual({ shown: 0, extra: 0, rows: 0 });
+      expect(m.hooks.queueLayout(8)).toEqual({ shown: 8, extra: 0, rows: 8 });
+      expect(m.hooks.queueLayout(60)).toEqual({ shown: 12, extra: 48, rows: 13 });
+      m.hooks.applyView(bigView(4, 0));
+      m.hooks.flush();
+      const kids = m.byId.get("qlist")!.children;
+      expect(kids.filter((n: FakeNode) => n.className === "qempty")).toHaveLength(1);
+      expect(kids.find((n: FakeNode) => n.className === "qempty")!.textContent).toBe("queue empty");
+      expect(kids.some((n: FakeNode) => n.className.startsWith("qrow"))).toBe(false);
+      expect(html).toContain(".qlist .qempty{font:400 12px/20px var(--sans); color:var(--ink-3)}");
+    } finally { m.restore(); }
+  });
+
+  test("area labels clip with an ellipsis before a fixed right-aligned count column", () => {
+    const m = mountScript();
+    try {
+      const measure = (s: string) => s.length * 10;
+      expect(m.hooks.clipText("Short", 100, measure)).toBe("Short");
+      const clipped = m.hooks.clipText("Contractions and minors (variant 3)", 100, measure);
+      expect(String(clipped).endsWith("…")).toBe(true);
+      expect(measure(String(clipped))).toBeLessThanOrEqual(100);
+      expect(script).toContain("measureText");
+      expect(script).toContain('textAlign = "right"');
+      expect(script).toContain("X_COUNT = 268");
+    } finally { m.restore(); }
+  });
+
+  test("the margin note falls back to the busiest open leaf when nothing is hovered", () => {
+    const m = mountScript();
+    try {
+      const tasks = [
+        { id: "T-1", title: "root", status: "open", children: ["T-2"] },
+        { id: "T-2", title: "leaf one", status: "open", children: [] },
+        { id: "T-3", title: "leaf two", status: "open", children: [] },
+        { id: "T-4", title: "closed leaf", status: "solved", children: [] },
+      ];
+      const live = new Map<string, AnyRec[]>([
+        ["T-2", [{ id: "A-1" }]], ["T-3", [{ id: "A-2" }, { id: "A-3" }]],
+      ]);
+      expect(m.hooks.busiestOpenLeaf(tasks, live).id).toBe("T-3");
+      expect(m.hooks.busiestOpenLeaf([tasks[0], tasks[3]], new Map())).toBeNull();
+
+      const at = new Date().toISOString();
+      const future = new Date(Date.now() + 600000).toISOString();
+      const attempt = (id: string, task: string): AnyRec => ({
+        id, task, agent: "aa", role: "build", approach: "x", model: "m",
+        startedAt: at, leaseUntil: future, lastBeatAt: at,
+      });
+      const task = (id: string, title: string, parent: string | null, children: string[]): AnyRec => ({
+        id, title, body: "body", parent, children, status: "open", points: 1,
+        postedAt: at, attemptCount: 0, noteCount: 0, liveCount: 0,
+      });
+      m.hooks.applyView({
+        project: { name: "t", goal: "g", scope: "", check: "", paths: [], headAgent: "head", rules: { width: 6 } },
+        seq: 3, now: at,
+        totals: {
+          agents: 1, activeAgents: 1, tasks: 3, openTasks: 3, liveAttempts: 3,
+          queuedSubmissions: 0, checkingSubmissions: 0, submissions: 0, accepted: 0, notes: 0, events: 3,
+        },
+        tasks: [task("T-1", "root area", null, ["T-2", "T-3"]), task("T-2", "quiet leaf", "T-1", []), task("T-3", "busy leaf", "T-1", [])],
+        attempts: [attempt("A-1", "T-2"), attempt("A-2", "T-3"), attempt("A-3", "T-3")],
+        agents: [], notes: [], submissions: [], proposals: [],
+        leaderboard: { agents: [], models: [] },
+      });
+      m.hooks.flush();
+      expect(m.byId.get("noteTitle")!.textContent).toBe("busy leaf");
+    } finally { m.restore(); }
+  });
+
+  test("beat and released lines show task and attempt, joined shows model and harness", () => {
+    const m = mountScript();
+    try {
+      expect(m.hooks.logObject("attempt.beat", { attempt: "A-912" }, "abcdef", "T-184")).toBe("T-184 · A-912");
+      expect(m.hooks.logObject("attempt.ended", { attempt: "A-912", reason: "released" }, "abcdef", "T-184")).toBe("T-184 · A-912");
+      expect(m.hooks.logObject("agent.joined", { model: "hy4-flash", harness: "opencode" }, "abcdef", "")).toBe("hy4-flash · opencode");
+
+      const view = bigView(4, 0);
+      view.attempts = [{
+        id: "A-7", task: "T-7", agent: "abcdef", role: "build", approach: "x", model: "m",
+        startedAt: view.now, leaseUntil: new Date(Date.now() + 600000).toISOString(), lastBeatAt: view.now,
+      }];
+      m.hooks.applyView(view);
+      m.hooks.flush();
+      m.hooks.queueEvent({
+        seq: 10, at: view.now, type: "attempt.beat", actor: "abcdef",
+        data: { attempt: "A-7", leaseUntil: new Date(Date.now() + 600000).toISOString(), model: "m" },
+      });
+      m.hooks.flush();
+      const line = m.byId.get("logList")!.children[0]!;
+      expect(line.children[3]!.textContent).toBe("T-7 · A-7");
+      expect(line.children[0]!.textContent).toMatch(/^\d\d:\d\d:\d\d$/);
     } finally { m.restore(); }
   });
 });
@@ -682,7 +818,7 @@ describe("dev server", () => {
     const top = tasks.filter(t => depth(t) === 0);
     const knownAreas = new Set([
       "Circuit lower bounds", "Proof complexity", "Barriers",
-      "Combinatorial core", "Reductions library", "Oracle constructions",
+      "Algebraic methods", "Communication complexity", "Derandomization",
     ]);
     expect(top.length).toBeGreaterThanOrEqual(3);
     expect(top.length).toBeLessThanOrEqual(6);
@@ -696,6 +832,12 @@ describe("dev server", () => {
     const leaves = tasks.filter(t => depth(t) === 2);
     expect(leaves.length).toBeGreaterThan(40);
     expect(new Set(leaves.map(t => t.parent)).size).toBe(subs.length);
+    for (const t of tasks) expect(t.title).not.toMatch(/\(variant \d+\)/i);
+    expect(subs.some(s => ["Switching lemmas", "Relativization", "Polynomial method"].includes(s.title))).toBe(true);
+    const titles = leaves.map(t => String(t.title));
+    expect(new Set(titles).size).toBe(titles.length);
+    expect(titles.some(t => t.includes("Formalize Håstad"))).toBe(true);
+    expect(titles.some(t => t.includes("Razborov approximators"))).toBe(true);
   });
 
   test("streams real event shapes with ascending seq, honoring ?after and Last-Event-ID", async () => {
