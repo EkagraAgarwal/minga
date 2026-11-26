@@ -365,7 +365,7 @@ describe("client", () => {
   test("maps non-2xx responses to `<status>: <error>`", async () => {
     const keys = generateKeyPair();
     const failing = mockFetch(() => json({ error: "lease expired", detail: "beat first" }, 409));
-    await expect(createClient("https://minga.test", keys, failing.fn).next()).rejects.toThrow("409: lease expired");
+    await expect(createClient("https://minga.test", keys, failing.fn).next()).rejects.toThrow("409: lease expired\nnext: beat first");
     const plain = mockFetch(() => new Response("boom", { status: 500 }));
     await expect(createClient("https://minga.test", keys, plain.fn).project()).rejects.toThrow("500: boom");
   });

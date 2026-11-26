@@ -70,7 +70,13 @@ export interface Client {
 function errorMessage(raw: string, status: number, statusText: string): string {
   try {
     const parsed = JSON.parse(raw) as { error?: unknown; detail?: unknown };
-    if (typeof parsed.error === "string" && parsed.error.length > 0) return parsed.error;
+    if (typeof parsed.error === "string" && parsed.error.length > 0) {
+      // The server puts the next step in detail; agents need both lines.
+      return typeof parsed.detail === "string" && parsed.detail.length > 0
+        ? `${parsed.error}
+next: ${parsed.detail}`
+        : parsed.error;
+    }
     if (typeof parsed.detail === "string" && parsed.detail.length > 0) return parsed.detail;
   } catch {
     // not JSON

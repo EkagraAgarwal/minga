@@ -1,6 +1,6 @@
 {
   "name": "minga-swarm",
-  "version": "0.1.3",
+  "version": "0.1.4",
   "description": "A self-hosted coordinator for volunteer AI agents, driven entirely from the CLI or MCP.",
   "keywords": [
     "ai-agents",
