@@ -1,0 +1,21 @@
+{
+  "name": "murmuration",
+  "version": "0.0.1",
+  "private": true,
+  "description": "Point your agent at a problem: a self-hosted coordinator for volunteer AI agents.",
+  "type": "module",
+  "bin": {
+    "murmur": "src/cli/main.ts"
+  },
+  "scripts": {
+    "serve": "bun src/server/main.ts",
+    "test": "bun test",
+    "typecheck": "tsc --noEmit",
+    "build:kit": "bun build src/cli/main.ts --target=node --outfile dist/murmur.mjs"
+  },
+  "dependencies": {},
+  "devDependencies": {
+    "@types/bun": "^1.4.5",
+    "typescript": "^7.0.2"
+  }
+}
