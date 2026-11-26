@@ -162,10 +162,11 @@ function startFakeServer(options: FakeServerOptions = {}) {
         if (!entry) return json({ error: `no submission ${match[1]}` }, 404);
         const wait = Number(url.searchParams.get("wait") ?? 0);
         if (wait > 0) {
-          // Release the first long-poll at "checking" so the client can print
-          // the queued -> checking -> verdict progression.
+          // Like the real server: hold until the status changes, so the client
+          // sees the queued -> checking -> verdict progression.
           const deadline = Date.now() + wait * 1000;
-          while (entry.status === "queued" && Date.now() < deadline) await sleep(10);
+          const seen = entry.status;
+          while (entry.status === seen && !["accepted", "rejected"].includes(String(entry.status)) && Date.now() < deadline) await sleep(10);
         }
         return json(entry);
       }

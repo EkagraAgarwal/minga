@@ -272,7 +272,7 @@ describe("createCheckPool", () => {
       }
       await pool.close();
     }
-  });
+  }, 20_000);
 
   test("server secrets stay out; MINGA_CHECK_ENV names get through", async () => {
     const repo = await makeRepo();

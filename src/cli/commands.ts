@@ -523,6 +523,8 @@ export async function waitForSubmission(
     }
     // The final block below is the only place that reports the verdict.
     if (isFinal(view.status)) return view;
+    // A server that answers at once without news must not turn this into a busy loop.
+    if (!changed) await new Promise((resolve) => setTimeout(resolve, 250));
   }
   throw new Error(`submission ${id} has no verdict yet; check it with "minga result ${id}"`);
 }
