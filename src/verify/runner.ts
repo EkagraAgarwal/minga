@@ -6,14 +6,27 @@
  * attached to each slot worktree once, at creation time, and every run only
  * touches that slot (`checkout --detach --force <base>`, `clean -ffdx` with
  * `keep` exclusions, then the submitted files). Build caches placed under a
- * `keep` path survive between runs in the same slot.
+ * `keep` path survive between runs in the same slot. NOTE: those keep paths
+ * stay writable for every check, persist across submissions, and can be
+ * poisoned by one check for the next one; only trusted build caches belong
+ * there.
  *
- * The command runs through Bun Shell (`bun exec "<command>"`) so quoting and
- * builtins behave the same on Windows and POSIX. `{files}` is replaced with the
- * submitted repo-relative paths, each single-quoted POSIX-style.
+ * An optional holdout overlay is copied over the submitted files after they
+ * are written. Overlay files are never committed: the next run's
+ * `checkout --force` resets overlay files that overwrote tracked files and
+ * `clean -ffdx` removes the rest.
+ *
+ * Without a sandbox the command runs through Bun Shell (`bun exec "<command>"`)
+ * so quoting and builtins behave the same on Windows and POSIX. With
+ * `sandbox.mode === "docker"` it runs in a throwaway container instead: only
+ * the slot is mounted at /work, its `.git` is hidden behind a read-only empty
+ * mount of the same type, and the container gets neither the host's git
+ * metadata nor its environment. `{files}` is replaced with the submitted
+ * repo-relative paths, each single-quoted POSIX-style.
  */
+import { randomBytes } from "node:crypto";
 import { existsSync } from "node:fs";
-import { mkdir, rm, writeFile } from "node:fs/promises";
+import { copyFile, lstat, mkdir, readFile, readdir, rm, writeFile } from "node:fs/promises";
 import { dirname, join, normalize, resolve } from "node:path";
 import type {
   CheckInput,
@@ -22,8 +35,14 @@ import type {
   CheckResult,
   CreateCheckPool,
 } from "../core/contracts.ts";
+import type { Sandbox } from "../core/types.ts";
 
 const DEFAULT_MAX_OUTPUT = 8000;
+const DOCKER_PROBE_MS = 15_000;
+const DOCKER_PULL_MS = 300_000;
+const DOCKER_REPROBE_MS = 60_000;
+
+type DockerSandbox = Extract<Sandbox, { mode: "docker" }>;
 
 interface GitResult {
   code: number;
@@ -34,6 +53,20 @@ interface GitResult {
 interface KillableProcess {
   readonly pid: number;
   kill(exitCode?: number | NodeJS.Signals): void;
+}
+
+/** The part of Bun's Subprocess this module uses (Bun.spawn is overloaded). */
+interface SpawnedProcess extends KillableProcess {
+  readonly stdout: ReadableStream<Uint8Array> | undefined;
+  readonly stderr: ReadableStream<Uint8Array> | undefined;
+  readonly exited: Promise<number>;
+}
+
+interface ProcessOutput {
+  code: number;
+  timedOut: boolean;
+  stdout: Uint8Array;
+  stderr: Uint8Array;
 }
 
 /**
@@ -60,6 +93,21 @@ function processEnv(extra: Record<string, string> = {}): Record<string, string> 
     if (value !== undefined && allow.has(key)) env[key] = value;
   }
   return { ...env, ...extra };
+}
+
+/**
+ * Environment passed with `docker run -e`: MINGA_FILES, the names explicitly
+ * listed in MINGA_CHECK_ENV, and HOME=/tmp. The container has its own PATH and
+ * toolchain; the host's PATH/HOME (and every other host variable) stay out.
+ */
+function dockerEnv(mingaFiles: string): Record<string, string> {
+  const env: Record<string, string> = { MINGA_FILES: mingaFiles, HOME: "/tmp" };
+  for (const name of (process.env.MINGA_CHECK_ENV ?? "").split(",").map((s) => s.trim()).filter(Boolean)) {
+    if (name === "HOME" || name === "MINGA_FILES") continue;
+    const value = process.env[name];
+    if (value !== undefined) env[name] = value;
+  }
+  return env;
 }
 
 /** Runs git in `cwd`, without a shell. */
@@ -95,6 +143,11 @@ function shellQuote(path: string): string {
   return `'${path.replaceAll("'", "'\\''")}'`;
 }
 
+/** Single-line, bounded text for a fail-closed reason. */
+function oneLine(value: string): string {
+  return value.replace(/\s*\r?\n\s*/g, " ").replace(/\s{2,}/g, " ").trim().slice(0, 400);
+}
+
 /** Remove a directory, retrying briefly: Windows can keep handles open for a moment. */
 async function removeDir(dir: string): Promise<void> {
   for (let attempt = 0; attempt < 5; attempt++) {
@@ -121,6 +174,23 @@ async function isHealthyWorktree(path: string): Promise<boolean> {
     return result.code === 0 && samePath(result.stdout.trim(), path);
   } catch {
     return false;
+  }
+}
+
+/** Recursively copy an overlay, skipping symlinks so nothing outside it is read. */
+async function copyOverlay(from: string, to: string): Promise<void> {
+  const entries = await readdir(from, { withFileTypes: true });
+  for (const entry of entries) {
+    if (entry.isSymbolicLink()) continue;
+    const src = join(from, entry.name);
+    const dst = join(to, entry.name);
+    if (entry.isDirectory()) {
+      await mkdir(dst, { recursive: true });
+      await copyOverlay(src, dst);
+    } else if (entry.isFile()) {
+      await mkdir(dirname(dst), { recursive: true });
+      await copyFile(src, dst);
+    }
   }
 }
 
@@ -187,6 +257,99 @@ async function killPosixTree(pid: number, seen = new Set<number>(), depth = 0): 
   try { process.kill(pid, "SIGKILL"); } catch { /* already gone */ }
 }
 
+/**
+ * Spawn without a shell, drain both pipes, kill the whole process tree on
+ * timeout, and call `onTimeout` first (used to remove a timed-out container).
+ */
+async function runProcess(
+  argv: string[],
+  timeoutMs: number,
+  opts: { cwd?: string; env?: Record<string, string>; onTimeout?: () => void } = {},
+): Promise<ProcessOutput> {
+  let proc: SpawnedProcess;
+  try {
+    proc = Bun.spawn(argv, {
+      cwd: opts.cwd,
+      stdin: "ignore",
+      stdout: "pipe",
+      stderr: "pipe",
+      ...(opts.env === undefined ? {} : { env: opts.env }),
+      // POSIX: detached makes the child a process-group leader.
+      ...(process.platform === "win32" ? {} : { detached: true }),
+    }) as SpawnedProcess;
+  } catch (err) {
+    const message = err instanceof Error ? err.message : String(err);
+    return { code: -1, timedOut: false, stdout: new Uint8Array(0), stderr: Buffer.from(message, "utf8") };
+  }
+
+  const stdoutPromise = readAll(proc.stdout);
+  const stderrPromise = readAll(proc.stderr);
+  let timedOut = false;
+  let timer: ReturnType<typeof setTimeout> | undefined;
+  try {
+    await new Promise<void>((resolveExit) => {
+      timer = setTimeout(() => {
+        timedOut = true;
+        try { opts.onTimeout?.(); } catch { /* cleanup is best effort */ }
+        void killProcessTree(proc).then(resolveExit, resolveExit);
+      }, Math.max(1, Math.round(timeoutMs)));
+      void proc.exited.then(() => resolveExit(), () => resolveExit());
+    });
+  } finally {
+    if (timer !== undefined) clearTimeout(timer);
+  }
+
+  const [rawExitCode, stdout, stderr] = await Promise.all([
+    proc.exited.catch(() => -1), stdoutPromise, stderrPromise,
+  ]);
+  return {
+    code: Number.isFinite(rawExitCode) ? rawExitCode : -1,
+    timedOut,
+    stdout,
+    stderr,
+  };
+}
+
+/** Short text form of `runProcess`, for docker probes and cleanup commands. */
+async function runCommand(argv: string[], timeoutMs: number): Promise<GitResult> {
+  const out = await runProcess(argv, timeoutMs);
+  const decoder = new TextDecoder();
+  return {
+    code: out.code,
+    stdout: decoder.decode(out.stdout),
+    stderr: decoder.decode(out.stderr),
+  };
+}
+
+/** Was the slot's `.git` pointer changed by the check? `null` means a directory. */
+async function gitPointerChanged(slotPath: string, original: string | null): Promise<boolean> {
+  const gitPath = join(slotPath, ".git");
+  try {
+    const stat = await lstat(gitPath);
+    if (original === null) return !stat.isDirectory() || stat.isSymbolicLink();
+    if (!stat.isFile() || stat.isSymbolicLink()) return true;
+    return (await readFile(gitPath, "utf8")) !== original;
+  } catch {
+    return true;
+  }
+}
+
+/** Restore a tampered `.git` pointer so the next host git command is safe. */
+async function restoreGitPointer(slotPath: string, original: string | null): Promise<void> {
+  const gitPath = join(slotPath, ".git");
+  try {
+    const stat = await lstat(gitPath);
+    const wrongType = original === null
+      ? !stat.isDirectory() || stat.isSymbolicLink()
+      : !stat.isFile() || stat.isSymbolicLink();
+    if (wrongType) await rm(gitPath, { recursive: true, force: true });
+    if (original === null) await mkdir(gitPath, { recursive: true });
+    else await writeFile(gitPath, original, "utf8");
+  } catch {
+    // Best effort: the slot is recreated from scratch if it is unusable.
+  }
+}
+
 // -------------------------------------------------------------------- pool
 
 interface Slot {
@@ -220,8 +383,21 @@ export const createCheckPool: CreateCheckPool = async (opts: CheckPoolOptions): 
   if (!Number.isInteger(opts.size) || opts.size < 1) throw new Error("check pool size must be an integer >= 1");
 
   const repoDir = resolve(opts.repoDir);
-  const dir = opts.dir ?? join(repoDir, ".minga", "worktrees");
-  await mkdir(resolve(dir), { recursive: true });
+  const dir = resolve(opts.dir ?? join(repoDir, ".minga", "worktrees"));
+  await mkdir(dir, { recursive: true });
+
+  // Test hook only: not part of the CheckPoolOptions contract.
+  const dockerBin = (opts as unknown as { dockerBin?: string }).dockerBin ?? "docker";
+  const sandbox = opts.sandbox ?? ({ mode: "none" } as Sandbox);
+  const docker: DockerSandbox | null = sandbox.mode === "docker" ? sandbox : null;
+  const emptyDir = join(dir, ".empty");
+  const emptyFile = join(dir, ".emptyfile");
+  if (docker !== null) {
+    // Mounted read-only over the slot's /work/.git: an empty directory when
+    // .git is a directory, an empty file when .git is a worktree gitdir pointer.
+    await mkdir(emptyDir, { recursive: true });
+    await writeFile(emptyFile, "", "utf8");
+  }
 
   const headResult = await git(repoDir, ["rev-parse", "--verify", "HEAD"]);
   if (headResult.code !== 0) throw new Error(`cannot create a check pool: ${repoDir} has no HEAD commit`);
@@ -229,8 +405,45 @@ export const createCheckPool: CreateCheckPool = async (opts: CheckPoolOptions): 
 
   const slots: Slot[] = [];
   for (let index = 0; index < opts.size; index++) {
-    slots.push(await prepareSlot(repoDir, resolve(dir), index, initial));
+    slots.push(await prepareSlot(repoDir, dir, index, initial));
   }
+
+  // Docker availability is probed once at creation and at most once every
+  // 60 s afterwards (so starting Docker later recovers). A failed probe never
+  // leads to an unsandboxed run.
+  let probeAt = 0;
+  let probe: { ok: boolean; reason: string } = { ok: false, reason: "not probed yet" };
+  let probing: Promise<{ ok: boolean; reason: string }> | null = null;
+
+  const doProbe = async (): Promise<{ ok: boolean; reason: string }> => {
+    const version = await runCommand([dockerBin, "version", "--format", "{{.Server.Version}}"], DOCKER_PROBE_MS);
+    if (version.code !== 0) {
+      return { ok: false, reason: oneLine(version.stderr || version.stdout || `exit ${version.code}`) };
+    }
+    const inspect = await runCommand([dockerBin, "image", "inspect", docker!.image], DOCKER_PROBE_MS);
+    if (inspect.code !== 0) {
+      const pull = await runCommand([dockerBin, "pull", docker!.image], DOCKER_PULL_MS);
+      if (pull.code !== 0) {
+        return { ok: false, reason: oneLine(pull.stderr || pull.stdout || `exit ${pull.code}`) };
+      }
+    }
+    return { ok: true, reason: "" };
+  };
+
+  const ensureProbe = (): Promise<{ ok: boolean; reason: string }> => {
+    if (probing !== null) return probing;
+    if (probe.ok || Date.now() - probeAt < DOCKER_REPROBE_MS) return Promise.resolve(probe);
+    probing = doProbe().then((result) => {
+      probe = result;
+      probeAt = Date.now();
+      return result;
+    }).finally(() => {
+      probing = null;
+    });
+    return probing;
+  };
+
+  if (docker !== null) await ensureProbe();
 
   const queue: Waiter[] = [];
   const active = new Set<Promise<void>>();
@@ -247,6 +460,24 @@ export const createCheckPool: CreateCheckPool = async (opts: CheckPoolOptions): 
       busyCount++;
       waiter.grant(slot);
     }
+  };
+
+  const enqueue = (input: CheckInput, resolve: (result: CheckResult) => void, reject: (error: unknown) => void): void => {
+    queue.push({
+      reject,
+      grant(slot) {
+        const work = execute(slot, input)
+          .then(resolve, reject)
+          .finally(() => {
+            slot.busy = false;
+            busyCount--;
+            active.delete(work);
+            dispatch();
+          });
+        active.add(work);
+      },
+    });
+    dispatch();
   };
 
   const execute = async (slot: Slot, input: CheckInput): Promise<CheckResult> => {
@@ -271,52 +502,92 @@ export const createCheckPool: CreateCheckPool = async (opts: CheckPoolOptions): 
       await writeFile(target, input.files[relPath] ?? "", "utf8");
     }
 
-    const filesArg = paths.map(shellQuote).join(" ");
-    const finalCommand = input.command.replaceAll("{files}", () => filesArg);
-
-    const started = performance.now();
-    const proc = Bun.spawn([process.execPath, "exec", finalCommand], {
-      cwd: slot.path,
-      stdin: "ignore",
-      stdout: "pipe",
-      stderr: "pipe",
-      env: processEnv({ MINGA_FILES: paths.join(" ") }),
-      // POSIX: setsid() makes the child its own process-group leader, so a
-      // single negative-pid kill reaches grandchildren too.
-      ...(process.platform === "win32" ? {} : { detached: true }),
-    });
-
-    // Drain the pipes immediately so the child can never block on a full buffer.
-    const stdoutPromise = readAll(proc.stdout);
-    const stderrPromise = readAll(proc.stderr);
-
-    let timedOut = false;
-    let timer: ReturnType<typeof setTimeout> | undefined;
-    try {
-      await new Promise<void>((resolveExit) => {
-        timer = setTimeout(() => {
-          timedOut = true;
-          // Kill first, then release the wait: descendants must be gone when
-          // the result is reported.
-          void killProcessTree(proc).then(resolveExit, resolveExit);
-        }, Math.max(1, Math.round(input.timeoutSeconds * 1000)));
-        void proc.exited.then(() => resolveExit());
-      });
-    } finally {
-      if (timer !== undefined) clearTimeout(timer);
+    if (input.overlayDir !== undefined) {
+      await copyOverlay(resolve(input.overlayDir), slot.path);
     }
 
-    const [rawExitCode, stdout, stderr] = await Promise.all([proc.exited, stdoutPromise, stderrPromise]);
-    const exitCode = Number.isFinite(rawExitCode) ? rawExitCode : -1;
+    const filesArg = paths.map(shellQuote).join(" ");
+    const finalCommand = input.command.replaceAll("{files}", () => filesArg);
+    const timeoutMs = Math.max(1, Math.round(input.timeoutSeconds * 1000));
+    const started = performance.now();
+
+    // A slot worktree's .git is a FILE (a gitdir pointer), otherwise a
+    // directory. Remember its exact original state so it can be verified after
+    // every run, sandboxed or not.
+    const gitPath = join(slot.path, ".git");
+    const gitStat = await lstat(gitPath);
+    const gitIsFile = !gitStat.isDirectory() && !gitStat.isSymbolicLink();
+    const gitOriginal = gitIsFile ? await readFile(gitPath, "utf8") : null;
+
+    let out: ProcessOutput;
+    if (docker !== null) {
+      // The mount type must match: an empty file over a gitdir pointer file,
+      // an empty directory over a .git directory. Mounting it read-only hides
+      // git metadata from the check; the main repository's .git is never
+      // mounted at all.
+      const mountSource = gitIsFile ? emptyFile : emptyDir;
+      // On Windows pass the absolute slot path as-is: Docker Desktop accepts
+      // e.g. D:\x\y:/work.
+      const slotAbs = resolve(slot.path);
+
+      const name = `minga-check-${randomBytes(8).toString("hex")}`;
+      const argv = [
+        dockerBin, "run", "--rm", "--name", name,
+        "--network", docker.network,
+        "--memory", docker.memory,
+        "--cpus", String(docker.cpus),
+        "--pids-limit", String(docker.pids),
+        "--cap-drop", "ALL",
+        "--security-opt", "no-new-privileges",
+        "--read-only",
+        "--tmpfs", "/tmp:rw,exec,size=512m",
+        "-v", `${slotAbs}:/work`,
+        "-v", `${mountSource}:/work/.git:ro`,
+        "-w", "/work",
+      ];
+      if (process.platform !== "win32" && typeof process.getuid === "function" && typeof process.getgid === "function") {
+        argv.push("--user", `${process.getuid()}:${process.getgid()}`);
+      }
+      for (const [key, value] of Object.entries(dockerEnv(paths.join(" ")))) {
+        argv.push("-e", `${key}=${value}`);
+      }
+      argv.push(docker.image, "sh", "-c", finalCommand);
+
+      out = await runProcess(argv, timeoutMs, {
+        cwd: slot.path,
+        onTimeout: () => { void runCommand([dockerBin, "rm", "-f", name], DOCKER_PROBE_MS); },
+      });
+    } else {
+      out = await runProcess([process.execPath, "exec", finalCommand], timeoutMs, {
+        cwd: slot.path,
+        env: processEnv({ MINGA_FILES: paths.join(" ") }),
+      });
+    }
+
+    // Even with a read-only mount, verify the pointer on the host before any
+    // later checkout/clean can act on it. Hooks/config for worktrees live in
+    // the main repo, which is never mounted; this guards the pointer itself.
+    if (await gitPointerChanged(slot.path, gitOriginal)) {
+      await restoreGitPointer(slot.path, gitOriginal);
+      return {
+        ok: false,
+        exitCode: -1,
+        timedOut: out.timedOut,
+        outputTail: "the check tampered with .git",
+        durationMs: Math.round(performance.now() - started),
+      };
+    }
+
+    const exitCode = Number.isFinite(out.code) ? out.code : -1;
     const durationMs = Math.round(performance.now() - started);
 
-    const combined = concatBytes(stdout, stderr);
+    const combined = concatBytes(out.stdout, out.stderr);
     const tail = combined.length > maxOutput ? combined.subarray(combined.length - maxOutput) : combined;
 
     return {
-      ok: exitCode === 0 && !timedOut,
+      ok: exitCode === 0 && !out.timedOut,
       exitCode,
-      timedOut,
+      timedOut: out.timedOut,
       outputTail: new TextDecoder().decode(tail),
       durationMs,
     };
@@ -327,21 +598,23 @@ export const createCheckPool: CreateCheckPool = async (opts: CheckPoolOptions): 
       reject(new Error("check pool is closed"));
       return;
     }
-    queue.push({
-      reject,
-      grant(slot) {
-        const work = execute(slot, input)
-          .then(resolve, reject)
-          .finally(() => {
-            slot.busy = false;
-            busyCount--;
-            active.delete(work);
-            dispatch();
+    if (docker !== null) {
+      void ensureProbe().then((result) => {
+        if (!result.ok) {
+          resolve({
+            ok: false,
+            exitCode: -1,
+            timedOut: false,
+            outputTail: `sandbox: docker is not available on the server (${result.reason}); the check did not run`,
+            durationMs: 0,
           });
-        active.add(work);
-      },
-    });
-    dispatch();
+          return;
+        }
+        enqueue(input, resolve, reject);
+      }, reject);
+      return;
+    }
+    enqueue(input, resolve, reject);
   });
 
   const close = async (): Promise<void> => {

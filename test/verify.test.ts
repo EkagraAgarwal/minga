@@ -1,9 +1,9 @@
 import { afterAll, describe, expect, test } from "bun:test";
 import { existsSync } from "node:fs";
-import { mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
+import { mkdir, mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { branchHead, changedPaths, commitAccepted } from "../src/verify/gitops.ts";
+import { branchHead, changedPaths, commitAccepted, readFileAt } from "../src/verify/gitops.ts";
 import { createCheckPool } from "../src/verify/runner.ts";
 
 // --------------------------------------------------------------- test helpers
@@ -385,6 +385,50 @@ describe("createCheckPool", () => {
     expect(existsSync(join(repo, "submitted.txt"))).toBe(false);
     expect(await worktreeCount(repo)).toBe(1);
   });
+
+  test("overlay copies nested files, overwrites submitted ones, and is gone next run", async () => {
+    const repo = await makeRepo();
+    const base = await git(repo, ["rev-parse", "HEAD"]);
+    const overlay = await makeDir();
+    await mkdir(join(overlay, "deep", "holdouts"), { recursive: true });
+    await writeFile(join(overlay, "submitted.txt"), "from overlay\n");
+    await writeFile(join(overlay, "README.md"), "overlaid tracked file\n");
+    await writeFile(join(overlay, "deep", "holdouts", "secret.txt"), "hidden test\n");
+
+    const pool = await createCheckPool({ repoDir: repo, size: 1, keep: [] });
+    try {
+      const first = await pool.run({
+        base,
+        files: { "submitted.txt": "from submit\n" },
+        overlayDir: overlay,
+        timeoutSeconds: 30,
+        command: `bun -e "${[
+          "const fs=require('fs');",
+          "if(fs.readFileSync('submitted.txt','utf8')!=='from overlay'+String.fromCharCode(10))process.exit(1);",
+          "if(fs.readFileSync('README.md','utf8')!=='overlaid tracked file'+String.fromCharCode(10))process.exit(2);",
+          "if(fs.readFileSync('deep/holdouts/secret.txt','utf8')!=='hidden test'+String.fromCharCode(10))process.exit(3);",
+        ].join("")}"`,
+      });
+      expect(first.ok).toBe(true);
+
+      // No overlay passed: the untracked copies are cleaned and the tracked
+      // file overwritten by the overlay is restored by checkout --force.
+      const second = await pool.run({
+        base,
+        files: {},
+        timeoutSeconds: 30,
+        command: `bun -e "${[
+          "const fs=require('fs');",
+          "if(fs.existsSync('submitted.txt'))process.exit(1);",
+          "if(fs.existsSync('deep'))process.exit(2);",
+          "if(fs.readFileSync('README.md','utf8')!=='hello'+String.fromCharCode(10))process.exit(3);",
+        ].join("")}"`,
+      });
+      expect(second.ok).toBe(true);
+    } finally {
+      await pool.close();
+    }
+  });
 });
 
 // -------------------------------------------------------------- git plumbing
@@ -606,5 +650,27 @@ describe("read-only git helpers", () => {
     const to = await branchHead(repo, "main");
     expect(await changedPaths(repo, from, to)).toEqual(["new.txt"]);
     expect(await changedPaths(repo, to, to)).toEqual([]);
+  });
+
+  test("readFileAt reads a path at a commit, returns null when absent", async () => {
+    const repo = await makeRepo();
+    const first = await branchHead(repo, "main");
+    expect(await readFileAt(repo, first, "README.md")).toBe("hello\n");
+    expect(await readFileAt(repo, first, "missing.txt")).toBe(null);
+
+    await writeFile(join(repo, "later.txt"), "new in later commit\n");
+    await git(repo, ["add", "later.txt"]);
+    await git(repo, ["commit", "-m", "later"]);
+    const later = await branchHead(repo, "main");
+    expect(await readFileAt(repo, later, "later.txt")).toBe("new in later commit\n");
+    expect(await readFileAt(repo, first, "later.txt")).toBe(null);
+
+    // git calls a path that exists on disk but not in the commit a miss too.
+    await rm(join(repo, "README.md"));
+    await git(repo, ["add", "-A"]);
+    await git(repo, ["commit", "-m", "remove readme"]);
+    const removed = await branchHead(repo, "main");
+    await writeFile(join(repo, "README.md"), "on disk only\n");
+    expect(await readFileAt(repo, removed, "README.md")).toBe(null);
   });
 });

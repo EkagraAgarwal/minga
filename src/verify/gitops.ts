@@ -20,6 +20,7 @@ import type {
   CommitAccepted,
   CommitInput,
   CommitOutcome,
+  ReadFileAt,
 } from "../core/contracts.ts";
 
 interface GitResult {
@@ -198,6 +199,21 @@ export const branchHead: BranchHead = async (repoDir, branch) => {
 export const changedPaths: ChangedPaths = async (repoDir, from, to) => {
   const output = await git(repoDir, ["diff", "--name-only", `${from}..${to}`]);
   return output.split(/\r?\n/).map((line) => line.trim()).filter(Boolean);
+};
+
+/**
+ * Content of a path at a commit, as UTF-8 text. A missing object is not an
+ * error (git exits 128 with "does not exist" / "exists on disk, but not in");
+ * every other failure is thrown so callers cannot mistake it for "absent".
+ */
+export const readFileAt: ReadFileAt = async (repoDir, commit, path) => {
+  const result = await gitRaw(repoDir, ["cat-file", "-p", `${commit}:${path}`]);
+  if (result.code !== 0) {
+    const detail = result.stderr || result.stdout;
+    if (result.code === 128 || /does not exist|exists on disk, but not in/.test(detail)) return null;
+    throw new Error(`git cat-file -p ${commit}:${path} failed (exit ${result.code}): ${detail.trim()}`);
+  }
+  return result.stdout;
 };
 
 // ------------------------------------------------------------------- commit
