@@ -45,6 +45,16 @@ describe("lab notebook index.html", () => {
     expect(html).toContain("background:var(--paper)");
   });
 
+  test("carries the safety strip and review queue hooks", () => {
+    for (const id of ["safetyLine", "reviewBlock", "reviewList", "reviewPanel"]) expect(html).toContain(`id="${id}"`);
+    expect(script).toContain('"/api/reviews"');
+    expect(script).toContain('"/api/review/" + encodeURIComponent(wanted)');
+    expect(script).toContain('"submission.passed"');
+    expect(script).toContain('"submission.reviewed"');
+    expect(html).toContain(".diffbox{overflow-x:auto");
+    expect(script).toContain("minga head review ");
+  });
+
   test("contains none of the forbidden visual patterns", () => {
     for (const word of ["gradient", "box-shadow", "backdrop-filter", "blur", "Inter", "glass", "glow"]) {
       expect(html).not.toContain(word);
@@ -824,6 +834,171 @@ describe("visual review fixes", () => {
   });
 });
 
+// ------------------------------------------------------------------ safety and review
+
+function safetyView(): AnyRec {
+  const v = bigView(2, 0);
+  v.project.check = "lake build";
+  v.project.safety = {
+    protect: ["project.toml", "src/core/**", "src/server/**", "test/**"],
+    gates: {
+      maxFiles: 8, maxChangedLines: 1200,
+      forbid: [{ pattern: "axiom", reason: "no new axioms" }],
+      warn: [{ pattern: "sorry" }, { pattern: "set_option" }],
+    },
+    review: { mode: "head-or-votes", votes: 2 },
+    holdout: true, sandbox: "docker",
+  };
+  const at = new Date().toISOString();
+  v.submissions = [
+    {
+      id: "S-r1", attempt: "A-1", task: "T-7", agent: "abcdef", model: "hy4-flash", claim: "solves",
+      message: "m", files: ["A.lean"], bytes: 10, status: "review", queuedAt: at, passedAt: at,
+      runs: 1, points: 0, warnings: ["warn: sorry"], reviews: [
+        { agent: "aa0001", approve: true, at },
+      ],
+    },
+    {
+      id: "S-r2", attempt: "A-2", task: "T-7", agent: "abcdef", model: "hy4-flash", claim: "solves",
+      message: "m", files: ["B.lean"], bytes: 10, status: "rejected", queuedAt: at, checkedAt: at,
+      runs: 1, points: 0, ok: false, gate: ["forbid: axiom"],
+    },
+  ];
+  return v;
+}
+
+function withFetch(m: AnyRec, handler: (url: string) => AnyRec): () => void {
+  const g = m.g as AnyRec;
+  const had = Object.prototype.hasOwnProperty.call(g, "fetch");
+  const saved = g.fetch;
+  g.fetch = async (url: string) => ({ ok: true, json: async () => handler(String(url)) });
+  return () => { if (had) g.fetch = saved; else delete g.fetch; };
+}
+
+describe("safety and review", () => {
+  test("safety strip renders from project.safety and is absent on 0.2 servers", () => {
+    const m = mountScript();
+    try {
+      expect(m.hooks.safetyLine({ check: "lake build" })).toBeNull();
+      expect(m.hooks.safetyLine(safetyView().project)).toBe(
+        "gate: lake build · protect 4 paths · 3 gates · holdout · docker sandbox · review: head-or-votes:2",
+      );
+      m.hooks.applyView(safetyView());
+      m.hooks.flush();
+      expect(m.byId.get("safetyLine")!.hidden).toBe(false);
+      expect(m.byId.get("safetyLine")!.textContent).toContain("protect 4 paths");
+      expect(m.byId.get("reviewBlock")!.hidden).toBe(false);
+    } finally { m.restore(); }
+  });
+
+  test("vote counts, rejection reasons, diff lines and the CLI hint are pure helpers", () => {
+    const m = mountScript();
+    try {
+      expect(m.hooks.voteCounts([{ approve: true }, { approve: false }, { approve: true }])).toEqual({ approvals: 2, rejections: 1 });
+      expect(m.hooks.voteCounts(undefined)).toEqual({ approvals: 0, rejections: 0 });
+      expect(m.hooks.checkedReason({ gate: ["forbid: axiom"] })).toBe("gate: forbid: axiom");
+      expect(m.hooks.checkedReason({ holdout: "failed" })).toBe("holdout failed");
+      expect(m.hooks.checkedReason({ review: { approved: false, reason: "too broad" } })).toBe("rejected in review: too broad");
+      expect(m.hooks.checkedReason({ ok: false })).toBe("");
+      const lines = m.hooks.diffLines("--- a/A.lean\n+++ b/A.lean\n@@ -1 +1 @@\n-old\n+new");
+      expect(lines.map((l: AnyRec) => l.kind)).toEqual(["meta", "meta", "meta", "del", "add"]);
+      expect(lines[4].text).toBe("+new");
+      expect(m.hooks.reviewHint("S-17")).toBe('minga head review S-17 approve|reject -m "<why>"');
+      expect(m.hooks.reviewMode({ mode: "votes", votes: 3 })).toBe("votes");
+      expect(m.hooks.policyLabel({ mode: "votes", votes: 3 })).toBe("votes:3");
+    } finally { m.restore(); }
+  });
+
+  test("passed, reviewed and checked events update review state without a re-render storm", async () => {
+    const m = mountScript();
+    const restoreFetch = withFetch(m, () => ({ reviews: [], policy: { mode: "head-or-votes", votes: 2 } }));
+    try {
+      m.hooks.applyView(safetyView());
+      m.hooks.flush();
+      const at = new Date().toISOString();
+      m.hooks.queueEvent({
+        seq: 20, at, type: "submission.passed", actor: "abcdef",
+        data: {
+          submission: "S-r3", attempt: "A-3", task: "T-7", agent: "abcdef", base: "abc",
+          durationMs: 100, outputTail: "lake build: ok", warnings: ["warn: sorry"], holdout: "passed",
+        },
+      });
+      m.hooks.flush();
+      expect(m.g.window.__minga.reviewCount).toBe(1);
+      expect(m.byId.get("qlist")!.textContent).not.toContain("S-r3");
+      m.hooks.queueEvent({
+        seq: 21, at, type: "submission.reviewed", actor: "aa0001",
+        data: { submission: "S-r3", agent: "aa0001", approve: true, reason: "looks good" },
+      });
+      m.hooks.flush();
+      expect(m.byId.get("reviewList")!.textContent).toContain("+1/-0");
+      m.hooks.queueEvent({
+        seq: 22, at, type: "submission.checked", actor: "server",
+        data: {
+          submission: "S-r3", attempt: "A-3", task: "T-7", agent: "abcdef", model: "hy4-flash",
+          claim: "solves", files: [], ok: false, exitCode: 1, timedOut: false, outputTail: "",
+          durationMs: 100, points: 0, review: { approved: false, by: "head", reason: "out of scope" },
+        },
+      });
+      m.hooks.flush();
+      await Bun.sleep(10);
+      expect(m.g.window.__minga.reviewCount).toBe(0);
+      const log = m.byId.get("logList")!.textContent;
+      expect(log).toContain("to review");
+      expect(log).toContain("rejected in review: out of scope");
+      m.hooks.queueEvent({
+        seq: 23, at, type: "submission.checked", actor: "server",
+        data: {
+          submission: "S-r2", attempt: "A-2", task: "T-7", agent: "abcdef", model: "hy4-flash",
+          claim: "solves", files: [], ok: false, exitCode: 1, timedOut: false, outputTail: "",
+          durationMs: 100, points: 0, gate: ["forbid: axiom"],
+        },
+      });
+      m.hooks.flush();
+      expect(m.byId.get("logList")!.textContent).toContain("gate: forbid: axiom");
+    } finally { restoreFetch(); m.restore(); }
+  });
+
+  test("the review list is oldest first and a row loads a read-only diff panel", async () => {
+    const m = mountScript();
+    const at = new Date().toISOString();
+    const older = new Date(Date.now() - 120000).toISOString();
+    const newer = new Date(Date.now() - 60000).toISOString();
+    const summary = (id: string, title: string, passedAt: string) => ({
+      submission: id, task: "T-7", taskTitle: title, agent: "abcdef", model: "hy4-flash", claim: "solves",
+      message: "m", files: ["A.lean"], passedAt, warnings: ["warn: sorry"], approvals: 1, rejections: 0,
+      votes: [{ agent: "aa0001", approve: true, at }],
+    });
+    const restoreFetch = withFetch(m, url => url === "/api/reviews"
+      ? { reviews: [summary("S-new", "Newer task", newer), summary("S-old", "Older task", older)], policy: { mode: "head-or-votes", votes: 2 } }
+      : {
+        ...summary("S-old", "Older task", older), status: "review", base: "abc",
+        diffs: [{ path: "A.lean", diff: "--- a/A.lean\n+++ b/A.lean\n-old\n+new", added: 1, removed: 1, created: false }],
+        outputTail: "lake build: ok\n", holdout: "passed",
+      });
+    try {
+      m.hooks.applyView(safetyView());
+      m.hooks.flush();
+      await m.hooks.loadReviews();
+      m.hooks.flush();
+      const list = m.byId.get("reviewList")!.textContent;
+      expect(list.indexOf("Older task")).toBeLessThan(list.indexOf("Newer task"));
+      expect(list).toContain("+1/-0");
+      expect(m.byId.get("reviewList")!.children).toHaveLength(2);
+      await m.hooks.openReview("S-old");
+      const panel = m.byId.get("reviewPanel")!;
+      expect(panel.hidden).toBe(false);
+      const text = panel.textContent;
+      expect(text).toContain("minga head review S-old approve|reject -m");
+      expect(text).toContain("lake build: ok");
+      expect(text).not.toContain("approve</button>");
+      const kinds = panel.children.flatMap((n: FakeNode) => n.children.map(c => c.className));
+      expect(kinds.some((k: string) => k.includes("diffline add"))).toBe(true);
+      expect(kinds.some((k: string) => k.includes("diffline del"))).toBe(true);
+    } finally { restoreFetch(); m.restore(); }
+  });
+});
+
 // ------------------------------------------------------------------ final polish (pure helpers)
 
 describe("final polish", () => {
@@ -1050,6 +1225,37 @@ describe("dev server", () => {
     expect(Array.isArray(leaderboard.models)).toBe(true);
   });
 
+  test("serves safety, review lists and review details with fake diffs", async () => {
+    const view = await fetch(origin + "/api/view").then(r => r.json()) as AnyRec;
+    const safety = (view.project as AnyRec).safety as AnyRec;
+    expect(safety.review).toEqual({ mode: "head-or-votes", votes: 2 });
+    expect(safety.holdout).toBe(true);
+    expect(safety.sandbox).toBe("docker");
+    expect(safety.protect.length).toBeGreaterThan(0);
+    const reviews = await fetch(origin + "/api/reviews").then(r => r.json()) as AnyRec;
+    expect(reviews.policy).toEqual(safety.review);
+    expect(Array.isArray(reviews.reviews)).toBe(true);
+    for (const r of reviews.reviews as AnyRec[]) {
+      for (const k of ["submission", "taskTitle", "model", "files", "passedAt", "warnings", "approvals", "rejections", "votes"]) {
+        expect(k in r).toBe(true);
+      }
+    }
+    const id = (view.submissions as AnyRec[])[0]?.id ?? "S-1";
+    const res = await fetch(origin + "/api/review/" + encodeURIComponent(String(id)));
+    expect(res.status).toBe(200);
+    const detail = await res.json() as AnyRec;
+    expect(detail.submission).toBe(id);
+    expect(typeof detail.status).toBe("string");
+    expect(typeof detail.base).toBe("string");
+    expect(typeof detail.outputTail).toBe("string");
+    expect((detail.diffs as AnyRec[]).length).toBeGreaterThan(0);
+    for (const d of detail.diffs as AnyRec[]) {
+      for (const k of ["path", "diff", "added", "removed", "created"]) expect(k in d).toBe(true);
+      expect(d.diff).toContain("+");
+    }
+    expect((await fetch(origin + "/api/review/S-missing")).status).toBe(404);
+  });
+
   test("seeds area-like names with two area levels and spread leaves", async () => {
     const res = await fetch(origin + "/api/view");
     const body = await res.json() as AnyRec;
@@ -1232,6 +1438,37 @@ describe("dev server flags", () => {
     expect(own.some(s => s.id === closed.closedSubmission && s.status === "accepted")).toBe(true);
     expect(own.some(s => s.status === "rejected")).toBe(true);
   }, 15000);
+
+  test("simulates review passes, votes and details", async () => {
+    const dev = await startDev(["--agents", "20", "--tasks", "20", "--rate", "20"]);
+    try {
+      const controller = new AbortController();
+      const res = await fetch(dev.origin + "/api/stream?after=" + dev.seq, { signal: controller.signal });
+      expect(res.status).toBe(200);
+      const reader = res.body!.getReader();
+      const decoder = new TextDecoder();
+      const types = new Set<string>();
+      let seen = new Set<string>();
+      let text = "";
+      const deadline = Date.now() + 15000;
+      while (Date.now() < deadline && !(types.has("submission.passed") && types.has("submission.reviewed"))) {
+        const chunk = await reader.read();
+        if (chunk.done) break;
+        text += decoder.decode(chunk.value);
+        for (const m of text.matchAll(/id: (\d+)\nevent: ([\w.]+)\ndata: (\{[^\n]*\})/g)) {
+          if (seen.has(m[1]!)) continue;
+          seen.add(m[1]!);
+          types.add(m[2]!);
+        }
+      }
+      await reader.cancel();
+      controller.abort();
+      expect(types.has("submission.passed")).toBe(true);
+      expect(types.has("submission.reviewed")).toBe(true);
+      const reviews = await fetch(dev.origin + "/api/reviews").then(r => r.json()) as AnyRec;
+      expect(reviews.policy.votes).toBe(2);
+    } finally { await dev.stop(); }
+  }, 25000);
 
   test("coordination stats agree with notify lags and stay bounded", async () => {
     for (const dev of [counted!, finished!]) {

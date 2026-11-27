@@ -7,6 +7,8 @@
  * Serves:
  *   GET /             src/ui/index.html
  *   GET /api/view     ViewResponse (v2 snapshot, with coordination and leads)
+ *   GET /api/reviews  ReviewsResponse (submissions waiting in review, oldest first)
+ *   GET /api/review/<S-n>  ReviewDetail (diff, warnings, check output tail)
  *   GET /api/events?after=<seq>&limit=<n>  ascending event history
  *   GET /api/stream   text/event-stream of real MingaEvent shapes, seq ascending
  *   GET /join         plain text join document
@@ -19,10 +21,12 @@ import { join } from "node:path";
 import type {
   Actor, AgentId, AgentState, AttemptEndReason, AttemptId, AttemptState, Claim, CoordinationStats, DecidedBy,
   EventType, Leaderboard, LeaderRow, MingaEvent, ModelRow, NoteId, NoteKind, NoteState,
-  ProposalId, ProposalKind, ProposalState, Role, Rules, SubmissionId, SubmissionState,
+  ProposalId, ProposalKind, ProposalState, ReviewPolicy, Role, Rules, SubmissionId, SubmissionState,
   TaskId, TaskState, TaskStatus,
 } from "../core/types.ts";
-import type { ProjectInfo, ViewResponse, ViewTask } from "../core/protocol.ts";
+import type {
+  ProjectInfo, ProjectSafety, ReviewDetail, ReviewSummary, ReviewsResponse, ViewResponse, ViewTask,
+} from "../core/protocol.ts";
 import { NOTE_KINDS, ROLES } from "../core/types.ts";
 
 // ---------------------------------------------------------------- flags
@@ -74,6 +78,24 @@ const rules: Rules = {
   defaultPoints: 20,
 };
 
+const reviewPolicy: Extract<ReviewPolicy, { mode: "head-or-votes" }> = { mode: "head-or-votes", votes: 2 };
+
+const safety: ProjectSafety = {
+  protect: ["project.toml", "src/core/**", "src/server/**", "test/**"],
+  gates: {
+    maxFiles: 8,
+    maxChangedLines: 1200,
+    forbid: [{ pattern: "axiom\\s+", paths: ["Proofs/**"], reason: "no new axioms" }],
+    warn: [
+      { pattern: "set_option maxHeartbeats 0", reason: "disabled heartbeat budget" },
+      { pattern: "\\bsorry\\b", reason: "placeholder left in the proof" },
+    ],
+  },
+  review: reviewPolicy,
+  holdout: true,
+  sandbox: "docker",
+};
+
 const project: ProjectInfo = {
   name: "pnp-lean",
   goal: "Settle P vs NP with Lean-checked lemmas",
@@ -82,6 +104,7 @@ const project: ProjectInfo = {
   paths: ["Proofs/**", "*.lean"],
   headAgent: HEAD,
   rules,
+  safety,
 };
 
 interface Counters { task: number; attempt: number; note: number; submission: number; proposal: number }
@@ -171,6 +194,17 @@ const MESSAGES = [
   "close the induction step", "add explicit witnesses", "trim the auxiliary lemma",
   "checked small cases", "rewrite with decidable equality",
 ];
+
+const GATE_REASONS = [
+  "forbid: no new axioms in Proofs/**", "forbid: touched src/core/**", "maxChangedLines exceeded (1200)",
+];
+const WARN_REASONS = ["warn: heartbeat budget disabled", "warn: sorry left in a lemma", "warn: 7 files changed"];
+const APPROVE_REASONS = ["scope and proof look sound", "small, checkable diff", "agree with the check and holdout"];
+const REJECT_REASONS = ["changes a protected path", "proof step is hand-waved", "reviewer asked for a smaller diff"];
+const MAX_REVIEW = 8;
+
+interface ReviewFixture { base: string; diffs: ReviewDetail["diffs"]; outputTail: string }
+const reviewFixtures = new Map<SubmissionId, ReviewFixture>();
 
 // Each area owns a distinct pool of sub-areas, so no two branches share a label.
 const AREAS = [
@@ -349,6 +383,80 @@ function closeWithSubmission(
   agent.submissions += 1;
   if (s.ok) { agent.accepted += 1; agent.points += s.points; }
   return s;
+}
+
+// ---------------------------------------------------------------- review fixtures
+
+function makeReviewFixture(s: SubmissionState): ReviewFixture {
+  const n = Number(String(s.id).slice(2)) || 1;
+  const createdPath = "Proofs/Lemmas/lemma-" + n + ".lean";
+  const main = [
+    "diff --git a/Proofs/Main.lean b/Proofs/Main.lean",
+    "--- a/Proofs/Main.lean",
+    "+++ b/Proofs/Main.lean",
+    "@@ -18,6 +18,9 @@ theorem main (n : Nat) :",
+    "   have h₁ := step n",
+    "-  exact old_bound h₁",
+    "+  have h₂ := refine_bound h₁",
+    "+  exact h₂.trans (bound_succ n)",
+    "+",
+    "    done",
+    "@@ -41,3 +44,6 @@ lemma tail :",
+    "-  simp [h]",
+    "+  simp [h, step]",
+    "+  all_goals omega",
+  ].join("\n");
+  const created = [
+    "diff --git a/" + createdPath + " b/" + createdPath,
+    "new file mode 100644",
+    "--- /dev/null",
+    "+++ b/" + createdPath,
+    "@@ -0,0 +1,6 @@",
+    "+lemma step_bound (n : Nat) :",
+    "+  step n ≤ n + 1 := by",
+    "+  induction n with",
+    "+  | zero => simp",
+    "+  | succ n ih => omega",
+    "+",
+  ].join("\n");
+  return {
+    base: hex(7),
+    diffs: [
+      { path: "Proofs/Main.lean", diff: main, added: 5, removed: 2, created: false },
+      { path: createdPath, diff: created, added: 6, removed: 0, created: true },
+    ],
+    outputTail: "lake build: ok\nholdout: 3 checks passed\n",
+  };
+}
+
+function reviewEntries(): SubmissionState[] {
+  return submissionOrder.map(id => db.submissions[id])
+    .filter((s): s is SubmissionState => !!s && s.status === "review");
+}
+
+function reviewSummaries(): ReviewSummary[] {
+  return reviewEntries().map(reviewFields).sort((a, b) => Date.parse(a.passedAt) - Date.parse(b.passedAt));
+}
+
+function reviewFields(s: SubmissionState): ReviewSummary {
+  const task = db.tasks[s.task];
+  const votes = Array.isArray(s.reviews) ? s.reviews : [];
+  let approvals = 0, rejections = 0;
+  for (const v of votes) { if (v.approve) approvals += 1; else rejections += 1; }
+  return {
+    submission: s.id, task: s.task, taskTitle: task ? task.title : s.task,
+    agent: s.agent, model: s.model, claim: s.claim, message: s.message,
+    files: s.files.slice(), passedAt: s.passedAt || s.queuedAt,
+    warnings: (s.warnings || []).slice(), approvals, rejections, votes: votes.slice(),
+  };
+}
+
+function reviewDetail(s: SubmissionState): ReviewDetail {
+  const fixture = reviewFixtures.get(s.id) || makeReviewFixture(s);
+  return {
+    ...reviewFields(s), status: s.status, base: fixture.base, diffs: fixture.diffs,
+    outputTail: fixture.outputTail, holdout: s.holdout,
+  };
 }
 
 function seed(): void {
@@ -655,6 +763,7 @@ function buildView(): ViewResponse {
     }
   }
   const pending = pendingIds.map(id => db.submissions[id]).filter((s): s is SubmissionState => !!s && (s.status === "queued" || s.status === "checking"));
+  const reviewing = reviewEntries().slice(0, 100);
   const proposals = proposalIds.map(id => db.proposals[id]).filter((p): p is ProposalState => !!p)
     .filter(p => !p.decided).concat(proposalIds.map(id => db.proposals[id]).filter((p): p is ProposalState => !!p && !!p.decided).slice(0, 50));
 
@@ -687,7 +796,7 @@ function buildView(): ViewResponse {
     attempts: liveAttempts,
     agents,
     notes,
-    submissions: pending.concat(finished),
+    submissions: pending.concat(reviewing).concat(finished),
     proposals,
     leaderboard: computeLeaderboard(),
   };
@@ -894,6 +1003,35 @@ function actionSubmit(): boolean {
   return true;
 }
 
+function emitChecked(s: SubmissionState, ok: boolean, outputTail: string, extra: Record<string, unknown> = {}): void {
+  emit("submission.checked", s.agent, {
+    submission: s.id, attempt: s.attempt, task: s.task, agent: s.agent, model: s.model,
+    claim: s.claim, files: s.files, base: s.base ?? "", ok, exitCode: s.exitCode,
+    timedOut: false, outputTail, durationMs: s.durationMs,
+    commit: s.commit, points: s.points,
+    ...extra,
+  });
+}
+
+function closeTaskForSubmission(s: SubmissionState): void {
+  const task = db.tasks[s.task];
+  if (!task || s.claim === "progress" || task.status !== "open") return;
+  const status: TaskStatus = s.claim === "refutes" ? "refuted" : "solved";
+  task.status = status;
+  task.closedAt = nowIso();
+  task.closedBy = s.agent;
+  task.closedSubmission = s.id;
+  emit("task.closed", "server", { task: task.id, status, agent: s.agent, submission: s.id });
+  const others = liveOn(task.id).filter(a => a.id !== s.attempt).slice(0, 4);
+  for (const other of others) {
+    endAttempt(other, "task_closed");
+    const lag = 0.3 + rnd() * 5;
+    notifyLags.push(lag);
+    other.notifiedAt = nowIso();
+    emit("attempt.notified", "server", { attempt: other.id, agent: other.agent, via: "beat" });
+  }
+}
+
 function runPipeline(): void {
   const now = Date.now();
   for (let i = pipeline.length - 1; i >= 0; i -= 1) {
@@ -907,46 +1045,116 @@ function runPipeline(): void {
       emit("submission.started", s.agent, { submission: s.id, base: s.base, round: s.runs });
       s.runs += 1;
     } else if (s.status === "checking" && now >= p.checkAt) {
-      const ok = rnd() < 0.42;
       const task = db.tasks[s.task];
       const agent = db.agents[s.agent];
-      s.status = ok ? "accepted" : "rejected";
       s.checkedAt = nowIso();
-      s.ok = ok;
-      s.exitCode = ok ? 0 : 1;
       s.timedOut = false;
       s.durationMs = int(900, 8000);
+      const warnings = rnd() < 0.4 ? [pick(WARN_REASONS) ?? WARN_REASONS[0]!] : [];
+      s.warnings = warnings;
+      const drop = () => {
+        const where = pendingIds.indexOf(s.id);
+        if (where >= 0) pendingIds.splice(where, 1);
+        pipeline.splice(i, 1);
+      };
+      // A gate rejection never runs the check; the reason travels in the checked event.
+      if (rnd() < 0.09) {
+        const gate = [pick(GATE_REASONS) ?? GATE_REASONS[0]!];
+        s.status = "rejected"; s.ok = false; s.exitCode = 1; s.gate = gate; s.points = 0;
+        emitChecked(s, false, "gate: " + gate[0] + "\n", { gate, warnings });
+        drop();
+        continue;
+      }
+      const ok = rnd() < 0.42;
+      s.status = ok ? "accepted" : "rejected";
+      s.ok = ok;
+      s.exitCode = ok ? 0 : 1;
       const outputTail = ok ? "lake build: ok\n" : "error: unsolved goals\n";
       s.points = ok && task ? task.points : 0;
       if (ok) { s.commit = hex(7); if (agent) { agent.accepted += 1; agent.points += s.points; } }
       if (agent) agent.submissions += 1;
-      emit("submission.checked", s.agent, {
-        submission: s.id, attempt: s.attempt, task: s.task, agent: s.agent, model: s.model,
-        claim: s.claim, files: s.files, base: s.base ?? "", ok, exitCode: s.exitCode,
-        timedOut: false, outputTail, durationMs: s.durationMs,
-        commit: s.commit, points: s.points,
-      });
-      const where = pendingIds.indexOf(s.id);
-      if (where >= 0) pendingIds.splice(where, 1);
-      pipeline.splice(i, 1);
-      if (ok && task && s.claim !== "progress" && task.status === "open") {
-        const status: TaskStatus = s.claim === "refutes" ? "refuted" : "solved";
-        task.status = status;
-        task.closedAt = nowIso();
-        task.closedBy = s.agent;
-        task.closedSubmission = s.id;
-        emit("task.closed", "server", { task: task.id, status, agent: s.agent, submission: s.id });
-        const others = liveOn(task.id).filter(a => a.id !== s.attempt).slice(0, 4);
-        for (const other of others) {
-          endAttempt(other, "task_closed");
-          const lag = 0.3 + rnd() * 5;
-          notifyLags.push(lag);
-          other.notifiedAt = nowIso();
-          emit("attempt.notified", "server", { attempt: other.id, agent: other.agent, via: "beat" });
+      if (ok && rnd() < 0.5 && !FLAGS.finished && reviewEntries().length < MAX_REVIEW) {
+        if (rnd() < 0.15) {
+          // Server-only tests fail after the public check passed.
+          s.status = "rejected"; s.ok = false; s.exitCode = 1; s.holdout = "failed"; s.points = 0;
+          s.commit = undefined;
+          if (agent) { agent.accepted -= 1; agent.points -= task ? task.points : 0; }
+          emitChecked(s, false, outputTail + "holdout: 1 server-only test failed\n", { warnings, holdout: "failed" });
+          drop();
+          continue;
         }
+        s.status = "review";
+        s.holdout = "passed";
+        s.passedAt = nowIso();
+        reviewFixtures.set(s.id, makeReviewFixture(s));
+        emit("submission.passed", s.agent, {
+          submission: s.id, attempt: s.attempt, task: s.task, agent: s.agent,
+          base: s.base ?? "", durationMs: s.durationMs,
+          outputTail: reviewFixtures.get(s.id)!.outputTail, warnings, holdout: "passed",
+        });
+        drop();
+        continue;
       }
+      emitChecked(s, ok, outputTail, {
+        warnings, ...(ok ? { holdout: "passed" } : {}),
+      });
+      drop();
+      if (ok) closeTaskForSubmission(s);
     }
   }
+}
+
+function decideReview(s: SubmissionState, approved: boolean, by: "head" | "vote", reason: string): void {
+  if (s.status !== "review") return;
+  const task = db.tasks[s.task];
+  const agent = db.agents[s.agent];
+  s.status = approved ? "accepted" : "rejected";
+  s.checkedAt = nowIso();
+  s.ok = approved;
+  s.exitCode = approved ? 0 : 1;
+  s.review = { approved, by, reason };
+  s.points = approved && task ? task.points : 0;
+  if (approved) {
+    s.commit = hex(7);
+    if (agent) { agent.accepted += 1; agent.points += s.points; }
+  }
+  if (agent) agent.submissions += 1;
+  const fixture = reviewFixtures.get(s.id);
+  emitChecked(s, approved, fixture ? fixture.outputTail : "lake build: ok\n", {
+    warnings: s.warnings, holdout: s.holdout, review: s.review,
+  });
+  reviewFixtures.delete(s.id);
+  closeTaskForSubmission(s);
+}
+
+function actionReviewVote(): boolean {
+  const waiting = reviewEntries();
+  const s = pick(waiting);
+  if (!s) return false;
+  const voters = activeAgents().filter(a => a.id !== s.agent && !(s.reviews || []).some(v => v.agent === a.id));
+  const a = pick(voters);
+  if (!a) return false;
+  const approve = rnd() < 0.7;
+  const reason = pick(approve ? APPROVE_REASONS : REJECT_REASONS) ?? "";
+  const vote = { agent: a.id, approve, reason, at: nowIso() };
+  (s.reviews || (s.reviews = [])).push(vote);
+  emit("submission.reviewed", a.id, { submission: s.id, agent: a.id, approve, reason });
+  const approvals = (s.reviews || []).filter(v => v.approve).length;
+  const rejections = (s.reviews || []).length - approvals;
+  if (approvals >= reviewPolicy.votes) decideReview(s, true, "vote", "enough approvals");
+  else if (rejections >= reviewPolicy.votes) decideReview(s, false, "vote", "enough rejections");
+  return true;
+}
+
+function actionReviewDecide(): boolean {
+  const s = pick(reviewEntries());
+  if (!s) return false;
+  const approve = rnd() < 0.65;
+  const reason = approve ? "reviewed by head" : pick(REJECT_REASONS) ?? "rejected by head";
+  (s.reviews || (s.reviews = [])).push({ agent: HEAD, approve, reason, head: true, at: nowIso() });
+  emit("submission.reviewed", HEAD, { submission: s.id, agent: HEAD, approve, reason, head: true });
+  decideReview(s, approve, "head", reason);
+  return true;
 }
 
 function actionEnd(): boolean {
@@ -1084,20 +1292,27 @@ function step(): void {
   runPipeline();
   const roll = rnd();
   let done = false;
-  if (roll < 0.26) done = actionBeat();
-  else if (roll < 0.40) done = actionStart();
-  else if (roll < 0.52) done = actionNote();
-  else if (roll < 0.65) done = actionSubmit();
-  else if (roll < 0.71) done = actionEnd();
-  else if (roll < 0.77) done = actionPropose();
-  else if (roll < 0.83) done = actionVote();
-  else if (roll < 0.87) done = actionDecide();
-  else if (roll < 0.92) done = actionJoin();
-  else if (roll < 0.96) done = actionPost();
+  if (roll < 0.23) done = actionBeat();
+  else if (roll < 0.35) done = actionStart();
+  else if (roll < 0.46) done = actionNote();
+  else if (roll < 0.58) done = actionSubmit();
+  else if (roll < 0.63) done = actionEnd();
+  else if (roll < 0.68) done = actionPropose();
+  else if (roll < 0.73) done = actionVote();
+  else if (roll < 0.77) done = actionDecide();
+  else if (roll < 0.85) done = actionReviewVote();
+  else if (roll < 0.91) done = actionReviewDecide();
+  else if (roll < 0.94) done = actionJoin();
+  else if (roll < 0.97) done = actionPost();
   else if (roll < 0.98) done = actionBan();
   else if (roll < 0.99) done = actionLead();
   else done = actionRule();
   if (!done) actionBeat();
+  // Keep the public review strip small; the head settles the oldest overflow.
+  const waiting = reviewEntries();
+  for (const s of waiting.slice(0, Math.max(0, waiting.length - MAX_REVIEW))) {
+    decideReview(s, rnd() < 0.6, "head", "review queue cap");
+  }
   // Heartbeats keep the active-agent count near --agents over long runs.
   if (eventCounter % 3 === 0) {
     const a = pick(Object.values(db.agents));
@@ -1132,6 +1347,7 @@ coordinator's /kit/minga.mjs. This route exists so the UI link resolves.
 
 const server = Bun.serve({
   port: FLAGS.port,
+  hostname: "127.0.0.1",
   idleTimeout: 0,
   fetch(req) {
     const url = new URL(req.url);
@@ -1142,6 +1358,21 @@ const server = Bun.serve({
     }
     if (url.pathname === "/api/view") {
       return new Response(JSON.stringify(buildView()), {
+        headers: { "content-type": "application/json; charset=utf-8", "cache-control": "no-store" },
+      });
+    }
+    if (url.pathname === "/api/reviews") {
+      const body: ReviewsResponse = { reviews: reviewSummaries(), policy: reviewPolicy };
+      return new Response(JSON.stringify(body), {
+        headers: { "content-type": "application/json; charset=utf-8", "cache-control": "no-store" },
+      });
+    }
+    const reviewMatch = /^\/api\/review\/([^/]+)$/.exec(url.pathname);
+    if (reviewMatch) {
+      const id = decodeURIComponent(reviewMatch[1] ?? "");
+      const s = db.submissions[id];
+      if (!s) return new Response("no such submission\n", { status: 404, headers: { "content-type": "text/plain; charset=utf-8" } });
+      return new Response(JSON.stringify(reviewDetail(s)), {
         headers: { "content-type": "application/json; charset=utf-8", "cache-control": "no-store" },
       });
     }
@@ -1167,3 +1398,4 @@ console.log(`Minga lab notebook on http://localhost:${server.port}`);
 console.log(`  agents ${FLAGS.agents}  tasks ${FLAGS.tasks}  rate ${FLAGS.rate}/s${FLAGS.finished ? "  finished" : ""}`);
 console.log(`  view   http://localhost:${server.port}/api/view`);
 console.log(`  stream http://localhost:${server.port}/api/stream`);
+console.log(`  review http://localhost:${server.port}/api/reviews`);

@@ -55,6 +55,8 @@ button.textbtn:hover{color:var(--ink)}
 .finished{display:flex; flex-wrap:wrap; gap:4px 10px; font:500 13px/1.4 var(--sans); color:var(--accent); margin:10px 0 0}
 .finished[hidden]{display:none}
 .finished .note{font:400 12px/1.4 var(--sans); color:var(--ink-2)}
+.safety{font:400 12px/1.5 var(--mono); color:var(--ink-2); margin:10px 0 0; overflow-wrap:anywhere}
+.safety[hidden]{display:none}
 .join{text-align:left; min-width:260px}
 .join .line{display:flex; align-items:baseline; gap:10px; margin:4px 0 14px}
 .join .url{font-size:13px; color:var(--ink); overflow-wrap:anywhere}
@@ -108,7 +110,9 @@ button.textbtn:hover{color:var(--ink)}
 .qrow{position:absolute; top:0; left:0; right:0; height:20px; display:grid; grid-template-columns:56px 48px minmax(0,1fr) 58px 72px; gap:8px; align-items:center; font:400 12px/20px var(--mono); font-variant-numeric:tabular-nums}
 .qrow .who,.qrow .task{overflow:hidden; text-overflow:ellipsis; white-space:nowrap}
 .qrow.checking{color:var(--accent)}
+.qrow.review{color:var(--accent); font-weight:500; text-decoration:underline dotted; text-underline-offset:3px}
 .qrow .claim{color:var(--ink-2); font-variant-caps:all-small-caps; letter-spacing:.04em}
+.qrow .votes{color:var(--ink-2)}
 .qrow.more{color:var(--ink-3); font-family:var(--sans); font-size:12px}
 .qlist .qempty{font:400 12px/20px var(--sans); color:var(--ink-3)}
 .loglist{list-style:none; margin:8px 0 0; padding:0; max-height:200px; overflow-y:auto; border-top:1px solid var(--rule); scrollbar-width:thin}
@@ -117,6 +121,38 @@ button.textbtn:hover{color:var(--ink)}
 .logline .who,.logline .verb{color:var(--ink-2)}
 .logline.fresh{color:var(--accent); transition:color 1.2s linear}
 @media (prefers-reduced-motion: reduce){ .logline.fresh{transition:none} }
+
+.review-block{min-width:0}
+.review-block[hidden]{display:none}
+.reviewlist{min-width:0; max-height:260px; overflow-y:auto; border-top:1px solid var(--rule); border-bottom:1px solid var(--rule); scrollbar-width:thin}
+.reviewlist .qempty{font:400 12px/20px var(--sans); color:var(--ink-3); padding:4px 0}
+.rrow{
+  display:grid; grid-template-columns:58px minmax(0,2fr) minmax(0,2fr) 80px 64px; gap:8px;
+  align-items:baseline; width:100%; padding:5px 8px; background:none; border:0; border-bottom:1px solid var(--rule);
+  text-align:left; font:400 12px/1.5 var(--mono); font-variant-numeric:tabular-nums; color:var(--ink); cursor:pointer;
+}
+.rrow:last-child{border-bottom:0}
+.rrow:hover{color:var(--accent)}
+.rrow .rid{color:var(--accent)}
+.rrow .rtitle,.rrow .rfiles{overflow:hidden; text-overflow:ellipsis; white-space:nowrap; min-width:0}
+.rrow .rwarn{color:var(--ink-2)}
+.review-panel{min-width:0; width:100%; margin-top:14px}
+.review-panel[hidden]{display:none}
+.review-panel .phead{font:500 13px/1.4 var(--sans); color:var(--ink); margin:6px 0 4px; overflow-wrap:anywhere}
+.review-panel .pmeta{font:400 12px/1.5 var(--mono); color:var(--ink-2); overflow-wrap:anywhere}
+.review-panel .pwarn{font:400 12px/1.5 var(--mono); color:var(--accent); overflow-wrap:anywhere; margin:6px 0}
+.review-panel .tail{
+  max-height:160px; overflow:auto; white-space:pre-wrap; overflow-wrap:anywhere; scrollbar-width:thin;
+  font:400 12px/1.5 var(--mono); color:var(--ink-2); padding:6px 0; border-top:1px solid var(--rule);
+}
+.diffbox{overflow-x:auto; max-width:100%; border-top:1px solid var(--rule); border-bottom:1px solid var(--rule); scrollbar-width:thin}
+.difffile{font:500 12px/1.5 var(--mono); color:var(--ink); padding:6px 0 2px; overflow-wrap:anywhere}
+.diffline{font:400 12px/1.5 var(--mono); white-space:pre; width:max-content; min-width:100%; padding:0 4px}
+.diffline.add{color:var(--accent)}
+.diffline.del{color:var(--ink-2); text-decoration:line-through}
+.diffline.meta{color:var(--ink-3)}
+.hintline{display:flex; flex-wrap:wrap; align-items:baseline; gap:8px; margin:8px 0; font:400 12px/1.5 var(--mono); color:var(--ink-2)}
+.hintline code{overflow-wrap:anywhere; min-width:0}
 
 table{width:100%; border-collapse:collapse; table-layout:auto}
 caption{text-align:left; font:400 13px/1.4 var(--sans); color:var(--ink-2); padding:6px 0 10px}
@@ -158,6 +194,9 @@ td.mono{font:400 12px/1.5 var(--mono); font-variant-numeric:tabular-nums}
   .tables section{overflow-x:auto}
   .logline{grid-template-columns:64px 52px minmax(0,1fr)}
   .logline .verb{display:none}
+  .rrow{grid-template-columns:52px minmax(0,1fr) 64px}
+  .rrow .rfiles{display:none}
+  .review-panel .tail{max-height:120px}
 }
 </style>
 </head>
@@ -169,6 +208,7 @@ td.mono{font:400 12px/1.5 var(--mono); font-variant-numeric:tabular-nums}
       <h1 id="projectName">project</h1>
       <p class="goal" id="projectGoal"></p>
       <p class="finished" id="finishedLine" hidden></p>
+      <p class="safety mono" id="safetyLine" hidden></p>
     </div>
     <div class="join">
       <div class="label">join</div>
@@ -245,6 +285,13 @@ td.mono{font:400 12px/1.5 var(--mono); font-variant-numeric:tabular-nums}
     </section>
   </div>
 
+  <section class="block review-block" id="reviewBlock" aria-label="Review queue" hidden>
+    <h2 class="section"><span class="sc">Table 3</span> Review queue</h2>
+    <p class="caption note">Waiting submissions, oldest first. Read only: the head decides from the CLI.</p>
+    <div class="reviewlist" id="reviewList"></div>
+    <div class="review-panel" id="reviewPanel" hidden></div>
+  </section>
+
   <footer class="footer">
     <div class="status"><span id="conn" class="conn">connecting</span> <span class="mono" id="serverTime">--:--:--</span> seq <span class="mono" id="seq">0</span></div>
     <div class="theme"><span class="label">theme</span>
@@ -286,14 +333,15 @@ td.mono{font:400 12px/1.5 var(--mono); font-variant-numeric:tabular-nums}
   const EVENT_TYPES = [
     "agent.joined", "agent.banned", "task.posted", "task.closed", "attempt.started",
     "attempt.beat", "attempt.ended", "attempt.notified", "lead.granted", "lead.revoked",
-    "note.added", "submission.queued", "submission.started",
+    "note.added", "submission.queued", "submission.started", "submission.passed", "submission.reviewed",
     "submission.checked", "proposal.made", "proposal.voted", "proposal.decided", "rule.changed",
   ];
   const VERBS = {
     "agent.joined": "joined", "agent.banned": "banned", "task.posted": "posted", "task.closed": "closed",
     "attempt.started": "took", "attempt.beat": "beat", "attempt.ended": "released",
     "attempt.notified": "told", "lead.granted": "granted lead", "lead.revoked": "revoked lead", "note.added": "noted",
-    "submission.queued": "submitted", "submission.started": "submitted", "submission.checked": "accepted",
+    "submission.queued": "submitted", "submission.started": "submitted", "submission.passed": "passed check",
+    "submission.reviewed": "voted", "submission.checked": "accepted",
     "proposal.made": "proposed", "proposal.voted": "voted", "proposal.decided": "decided", "rule.changed": "changed",
   };
 
@@ -347,6 +395,12 @@ td.mono{font:400 12px/1.5 var(--mono); font-variant-numeric:tabular-nums}
   let lastSample = 0;
   let dirtyTable = true;
   let dirtyQueue = true;
+  let dirtyReview = true;
+  let reviewQueue = [];
+  let reviewPolicy = null;
+  let selectedReview = null;
+  let reviewFetching = false;
+  let reviewFetchAgain = false;
   let dirtyNote = true;
   let staticDirty = true;
   let needDraw = true;
@@ -464,6 +518,71 @@ td.mono{font:400 12px/1.5 var(--mono); font-variant-numeric:tabular-nums}
     const extra = n - shown;
     return { shown, extra, rows: shown + (extra > 0 ? 1 : 0) };
   }
+  function reviewMode(policy) {
+    return policy && typeof policy.mode === "string" ? policy.mode : "none";
+  }
+  function policyLabel(policy) {
+    const mode = reviewMode(policy);
+    return mode === "votes" || mode === "head-or-votes" ? mode + ":" + N(policy.votes) : mode;
+  }
+  function safetyLine(project) {
+    const safety = project && project.safety;
+    if (!safety) return null;
+    const parts = ["gate: " + (S(project.check) || "check")];
+    if (Array.isArray(safety.protect) && safety.protect.length) parts.push("protect " + safety.protect.length + " paths");
+    const gates = safety.gates || {};
+    const gateCount = (Array.isArray(gates.forbid) ? gates.forbid.length : 0) +
+      (Array.isArray(gates.warn) ? gates.warn.length : 0);
+    if (gateCount) parts.push(gateCount + " gates");
+    if (safety.holdout) parts.push("holdout");
+    if (safety.sandbox && S(safety.sandbox) !== "none") parts.push(S(safety.sandbox) + " sandbox");
+    if (reviewMode(safety.review) !== "none") parts.push("review: " + policyLabel(safety.review));
+    return parts.join(" · ");
+  }
+  function voteCounts(votes) {
+    let approvals = 0, rejections = 0;
+    for (const v of Array.isArray(votes) ? votes : []) {
+      if (!v) continue;
+      if (v.approve) approvals += 1; else rejections += 1;
+    }
+    return { approvals, rejections };
+  }
+  // One-line verdict reason for a rejected submission, from an event or a state.
+  function checkedReason(d) {
+    if (!d) return "";
+    if (Array.isArray(d.gate) && d.gate.length) return "gate: " + d.gate.join("; ");
+    if (d.holdout === "failed") return "holdout failed";
+    if (d.review && d.review.approved === false) {
+      return "rejected in review: " + (S(d.review.reason) || "no reason given");
+    }
+    if (d.stale) return "stale submission";
+    if (Array.isArray(d.warnings) && d.warnings.length) return "warnings: " + S(d.warnings[0]);
+    return "";
+  }
+  function diffLines(diff) {
+    const raw = String(diff == null ? "" : diff).split("\n");
+    if (raw.length && raw[raw.length - 1] === "") raw.pop();
+    const out = [];
+    for (let line of raw) {
+      line = line.replace(/\r$/, "");
+      let kind = "ctx";
+      if (/^\+\+\+|^---/.test(line)) kind = "meta";
+      else if (line.charAt(0) === "+") kind = "add";
+      else if (line.charAt(0) === "-") kind = "del";
+      else if (line.charAt(0) === "@") kind = "meta";
+      out.push({ kind, text: line });
+    }
+    return out;
+  }
+  function reviewHint(id) {
+    return 'minga head review ' + S(id) + ' approve|reject -m "<why>"';
+  }
+  function reviewVisible() {
+    if (!model) return false;
+    const policy = reviewPolicy || (model.project.safety && model.project.safety.review);
+    return reviewMode(policy) !== "none" ||
+      reviewQueue.length > 0 || model.submissions.some(s => S(s.status) === "review");
+  }
   function busiestOpenLeaf(tasks, liveByTask) {
     let best = null, bestCount = -1;
     for (const t of tasks || []) {
@@ -486,7 +605,13 @@ td.mono{font:400 12px/1.5 var(--mono); font-variant-numeric:tabular-nums}
         if (d.kind === "dead_end" || d.kind === "digest") return base + " " + S(d.text).slice(0, 72);
         return base;
       }
-      case "submission.checked": return S(task) + " " + (d.ok ? "accepted" : "rejected");
+      case "submission.checked": {
+        const verdict = d.ok ? "accepted" : "rejected";
+        const reason = d.ok ? "" : checkedReason(d);
+        return S(task) + " " + verdict + (reason ? " · " + reason : "");
+      }
+      case "submission.passed": return S(task) + " " + S(d.submission) + " to review";
+      case "submission.reviewed": return S(d.submission) + " " + (d.approve ? "approved" : "rejected") + " by " + shortId(d.agent, 6);
       case "task.closed": return S(task) + " " + S(d.status);
       case "attempt.started": return S(task) + " " + S(d.role);
       case "proposal.decided": return S(d.proposal) + " " + (d.accepted ? "accepted" : "rejected");
@@ -532,6 +657,7 @@ td.mono{font:400 12px/1.5 var(--mono); font-variant-numeric:tabular-nums}
     }
     dirtyTable = true;
     dirtyQueue = true;
+    dirtyReview = true;
     dirtyNote = true;
     staticDirty = true;
     needDraw = true;
@@ -571,6 +697,7 @@ td.mono{font:400 12px/1.5 var(--mono); font-variant-numeric:tabular-nums}
     $("projectGoal").textContent = S(view.project.goal);
     $("joinUrl").textContent = location.origin + "/join";
     $("headAgent").textContent = S(view.project.headAgent) || "not set";
+    renderSafety();
     eventTimes = [];
     // Seed once, and never let later view resyncs reset the sampling clock.
     if (Object.keys(samples).length === 0) { pushSample(); lastSample = Date.now(); }
@@ -758,14 +885,67 @@ td.mono{font:400 12px/1.5 var(--mono); font-variant-numeric:tabular-nums}
         dirtyQueue = true;
         break;
       }
+      case "submission.passed": {
+        const s = model.submissions.find(x => x.id === d.submission);
+        const warnings = Array.isArray(d.warnings) ? d.warnings.map(S) : [];
+        if (s) {
+          if (s.status === "queued") t.queuedSubmissions = Math.max(0, t.queuedSubmissions - 1);
+          if (s.status === "checking") { t.checkingSubmissions = Math.max(0, t.checkingSubmissions - 1); checking.delete(s.attempt); }
+          const where = pendingSubs.indexOf(s); if (where >= 0) pendingSubs.splice(where, 1);
+          s.status = "review";
+          s.passedAt = S(e.at);
+          s.warnings = warnings;
+          s.holdout = d.holdout === "passed" ? "passed" : undefined;
+        }
+        if (!reviewQueue.some(r => r.submission === d.submission)) {
+          const task = findTask(S(d.task));
+          reviewQueue.push({
+            submission: S(d.submission), task: S(d.task),
+            taskTitle: task ? S(task.title) : S(d.task),
+            agent: S(d.agent), model: s ? S(s.model) : "", claim: s ? S(s.claim) : "",
+            message: s ? S(s.message) : "", files: s && Array.isArray(s.files) ? s.files.slice() : [],
+            passedAt: S(e.at), warnings, approvals: 0, rejections: 0, votes: [],
+          });
+        }
+        reviewQueue.sort((a, b) => Date.parse(a.passedAt) - Date.parse(b.passedAt));
+        dirtyQueue = true;
+        dirtyReview = true;
+        scheduleReviewFetch();
+        break;
+      }
+      case "submission.reviewed": {
+        const s = model.submissions.find(x => x.id === d.submission);
+        const vote = { agent: S(d.agent), approve: !!d.approve, reason: S(d.reason), head: !!d.head, at: S(e.at) };
+        if (s) {
+          const votes = Array.isArray(s.reviews) ? s.reviews : (s.reviews = []);
+          votes.push(vote);
+          if (votes.length > 50) votes.shift();
+        }
+        const row = reviewQueue.find(r => r.submission === d.submission);
+        if (row) {
+          const votes = Array.isArray(row.votes) ? row.votes : (row.votes = []);
+          votes.push(vote);
+          if (d.approve) row.approvals = N(row.approvals) + 1; else row.rejections = N(row.rejections) + 1;
+        }
+        dirtyReview = true;
+        scheduleReviewFetch();
+        break;
+      }
       case "submission.checked": {
         const s = model.submissions.find(x => x.id === d.submission);
         if (s) {
           if (s.status === "queued") t.queuedSubmissions = Math.max(0, t.queuedSubmissions - 1);
           if (s.status === "checking") { t.checkingSubmissions = Math.max(0, t.checkingSubmissions - 1); checking.delete(s.attempt); }
+          if (s.status === "review") dirtyReview = true;
           const where = pendingSubs.indexOf(s); if (where >= 0) pendingSubs.splice(where, 1);
           s.status = d.ok ? "accepted" : "rejected";
           s.ok = !!d.ok; s.points = N(d.points); s.checkedAt = S(e.at);
+          s.gate = Array.isArray(d.gate) ? d.gate.map(S) : undefined;
+          s.warnings = Array.isArray(d.warnings) ? d.warnings.map(S) : undefined;
+          s.holdout = d.holdout === "failed" ? "failed" : d.holdout === "passed" ? "passed" : s.holdout;
+          s.review = d.review ? {
+            approved: !!d.review.approved, by: S(d.review.by) === "vote" ? "vote" : "head", reason: S(d.review.reason),
+          } : undefined;
           if (d.ok) t.accepted += 1;
           const a = agentById.get(s.agent);
           if (a) {
@@ -781,6 +961,8 @@ td.mono{font:400 12px/1.5 var(--mono); font-variant-numeric:tabular-nums}
           }
           dirtyTable = true;
         }
+        const at = reviewQueue.findIndex(r => r.submission === d.submission);
+        if (at >= 0) { reviewQueue.splice(at, 1); dirtyReview = true; scheduleReviewFetch(); }
         break;
       }
       case "proposal.made": {
@@ -1085,6 +1267,14 @@ td.mono{font:400 12px/1.5 var(--mono); font-variant-numeric:tabular-nums}
     el.replaceChildren(...kids);
   }
 
+  function renderSafety() {
+    const el = $("safetyLine");
+    const line = model ? safetyLine(model.project) : null;
+    if (!line) { el.hidden = true; el.replaceChildren(); return; }
+    el.hidden = false;
+    el.textContent = line;
+  }
+
   function coordItem(name, value) {
     const s = node("span", "citem");
     s.appendChild(node("span", "label", name + " "));
@@ -1156,14 +1346,16 @@ td.mono{font:400 12px/1.5 var(--mono); font-variant-numeric:tabular-nums}
     for (let i = 0; i < shown; i += 1) {
       const s = pendingSubs[i];
       if (!s) continue;
-      const row = node("div", "qrow" + (s.status === "checking" ? " checking" : ""));
+      const row = node("div", "qrow" + (s.status === "checking" ? " checking" : S(s.status) === "review" ? " review" : ""));
       row.style.transform = "translateY(" + (i * rowH) + "px)";
-      row.appendChild(node("span", "", s.id));
+      row.appendChild(node("span", "", S(s.status) === "review" ? "[review] " + s.id : s.id));
       row.appendChild(node("span", "task", S(s.task)));
       row.appendChild(node("span", "who", shortId(s.agent, 6)));
       row.appendChild(node("span", "claim", S(s.claim)));
       const elapsed = Math.max(0, Math.round((Date.now() - (Date.parse(s.queuedAt) || Date.now())) / 1000));
-      row.appendChild(node("span", "claim", s.status + " " + elapsed + "s"));
+      const votes = S(s.status) === "review" ? voteCounts(s.reviews) : null;
+      row.appendChild(node("span", votes ? "votes" : "claim",
+        s.status + " " + elapsed + "s" + (votes ? " +" + votes.approvals + "/-" + votes.rejections : "")));
       holder.appendChild(row);
     }
     if (extra > 0) {
@@ -1172,6 +1364,81 @@ td.mono{font:400 12px/1.5 var(--mono); font-variant-numeric:tabular-nums}
       holder.appendChild(more);
     }
     list.replaceChildren($("qspacer"), holder);
+  }
+
+  function renderReviewQueue() {
+    if (!model) return;
+    dirtyReview = false;
+    const visible = reviewVisible();
+    const block = $("reviewBlock");
+    block.hidden = !visible;
+    if (!visible) {
+      $("reviewList").replaceChildren();
+      $("reviewPanel").hidden = true;
+      return;
+    }
+    const holder = document.createDocumentFragment ? document.createDocumentFragment() : document.createElement("div");
+    if (!reviewQueue.length) holder.appendChild(node("div", "qempty", "no submissions waiting in review"));
+    for (const r of reviewQueue) {
+      const counts = voteCounts(r.votes);
+      const row = node("button", "rrow");
+      row.setAttribute("type", "button");
+      row.setAttribute("title", S(r.message));
+      row.addEventListener("click", () => openReview(S(r.submission)));
+      row.appendChild(node("span", "rid", "[review] " + S(r.submission)));
+      row.appendChild(node("span", "rtitle", S(r.taskTitle)));
+      row.appendChild(node("span", "rfiles", (Array.isArray(r.files) ? r.files : []).join(", ")));
+      row.appendChild(node("span", "rwarn", (Array.isArray(r.warnings) && r.warnings.length ? r.warnings.length + " warnings" : "—") + " · " + shortId(r.model, 12)));
+      row.appendChild(node("span", "votes", "+" + counts.approvals + "/-" + counts.rejections));
+      holder.appendChild(row);
+    }
+    $("reviewList").replaceChildren(holder);
+    if (selectedReview && !reviewQueue.some(r => r.submission === selectedReview)) {
+      selectedReview = null;
+      $("reviewPanel").hidden = true;
+    }
+  }
+
+  function renderReviewDetail(detail) {
+    if (!detail) return;
+    const panel = $("reviewPanel");
+    panel.hidden = false;
+    const holder = document.createDocumentFragment ? document.createDocumentFragment() : document.createElement("div");
+    holder.appendChild(node("div", "phead", "[review] " + S(detail.submission) + " · " + S(detail.taskTitle)));
+    const counts = voteCounts(detail.votes);
+    const meta = "task " + S(detail.task) + " · agent " + shortId(detail.agent, 8) + " · model " + S(detail.model) +
+      " · " + S(detail.status) + " · votes +" + counts.approvals + "/-" + counts.rejections +
+      (detail.holdout ? " · holdout " + S(detail.holdout) : "");
+    holder.appendChild(node("div", "pmeta", meta));
+    holder.appendChild(node("div", "pmeta", "files: " + (Array.isArray(detail.files) && detail.files.length ? detail.files.join(", ") : "—")));
+    if (S(detail.status) === "rejected") {
+      const reason = checkedReason(detail);
+      if (reason) holder.appendChild(node("div", "pwarn", reason));
+    }
+    if (Array.isArray(detail.warnings) && detail.warnings.length) {
+      holder.appendChild(node("div", "pwarn", "warnings: " + detail.warnings.map(S).join(" · ")));
+    }
+    if (Array.isArray(detail.votes) && detail.votes.length) {
+      holder.appendChild(node("div", "pmeta", "votes: " + detail.votes.map(v =>
+        shortId(v.agent, 6) + (v.approve ? " +" : " -") + (v.reason ? " " + S(v.reason) : "")).join(" · ")));
+    }
+    const hint = reviewHint(detail.submission);
+    const line = node("div", "hintline");
+    line.appendChild(node("code", "", hint));
+    const copy = node("button", "textbtn", "copy");
+    copy.setAttribute("type", "button");
+    copy.addEventListener("click", () => { try { navigator.clipboard.writeText(hint); } catch (_) { /* clipboard may be blocked */ } });
+    line.appendChild(copy);
+    holder.appendChild(line);
+    holder.appendChild(node("div", "label", "check output"));
+    holder.appendChild(node("div", "tail", S(detail.outputTail) || "—"));
+    for (const d of Array.isArray(detail.diffs) ? detail.diffs : []) {
+      holder.appendChild(node("div", "difffile", S(d.path) + "  +" + N(d.added) + " -" + N(d.removed) + (d.created ? "  created" : "")));
+      const box = node("div", "diffbox");
+      for (const dline of diffLines(d.diff)) box.appendChild(node("div", "diffline " + dline.kind, dline.text));
+      holder.appendChild(box);
+    }
+    panel.replaceChildren(holder);
   }
 
   function renderLogAll() {
@@ -1334,7 +1601,7 @@ td.mono{font:400 12px/1.5 var(--mono); font-variant-numeric:tabular-nums}
         kids.push(noteList(leads, x => node("li", "", x)));
       }
       let subs = (subsByTask.get(t.id) || []).filter(s =>
-        S(s.status) === "accepted" || S(s.status) === "rejected");
+        S(s.status) === "accepted" || S(s.status) === "rejected" || S(s.status) === "review");
       if (!subs.length && t.closedSubmission) {
         // The real view carries closedSubmission/closedBy but not a per-task
         // list; render the closing verdict from what is available.
@@ -1348,13 +1615,21 @@ td.mono{font:400 12px/1.5 var(--mono); font-variant-numeric:tabular-nums}
       if (subs.length) {
         kids.push(node("div", "nhead", "submission history"));
         kids.push(noteList(subs.slice(0, 6), s => {
-          const verdict = s.ok === true ? "accepted" : s.ok === false ? "rejected" : S(s.status);
+          const verdict = S(s.status) === "review" ? "in review"
+            : s.ok === true ? "accepted" : s.ok === false ? "rejected" : S(s.status);
           const li = node("li");
           li.appendChild(node("b", "", S(s.id) + "  "));
           li.appendChild(node("span", "who", shortId(s.agent, 6) + "  "));
           li.appendChild(node("span", "", S(s.model) + "  "));
           li.appendChild(node("span", "role", verdict + "  "));
           li.appendChild(node("span", "", N(s.points) + " points"));
+          if (S(s.status) === "review") {
+            const counts = voteCounts(s.reviews);
+            li.appendChild(node("span", "", "  +" + counts.approvals + "/-" + counts.rejections));
+          } else if (s.ok === false) {
+            const reason = checkedReason(s);
+            if (reason) li.appendChild(node("span", "role", "  " + reason));
+          }
           return li;
         }));
       }
@@ -1396,6 +1671,7 @@ td.mono{font:400 12px/1.5 var(--mono); font-variant-numeric:tabular-nums}
     renderCoordination();
     if (dirtyTable) renderTables();
     if (dirtyQueue) renderQueue();
+    if (dirtyReview) renderReviewQueue();
     appendLog(logCount);
     logCount = 0;
     if (dirtyNote) renderNote();
@@ -1433,6 +1709,55 @@ td.mono{font:400 12px/1.5 var(--mono); font-variant-numeric:tabular-nums}
     } finally {
       loading = false;
       if (loadAgain) { loadAgain = false; loadView(); }
+    }
+  }
+
+  // The review queue is a small separate read. It is refreshed on review events,
+  // never as part of the view resync, so a large snapshot stays cheap.
+  async function loadReviews() {
+    try {
+      const res = await fetch("/api/reviews", { cache: "no-store" });
+      if (!res.ok) return;
+      const body = await res.json();
+      const list = body && Array.isArray(body.reviews) ? body.reviews : [];
+      reviewQueue = list.slice().sort((a, b) => Date.parse(a.passedAt) - Date.parse(b.passedAt));
+      if (body && body.policy) reviewPolicy = body.policy;
+      else if (model && model.project.safety) reviewPolicy = model.project.safety.review;
+      dirtyReview = true;
+      if (reviewVisible()) renderReviewQueue();
+    } catch (err) {
+      console.error(err);
+    }
+  }
+
+  function scheduleReviewFetch() {
+    if (!model) return;
+    if (reviewFetching) { reviewFetchAgain = true; return; }
+    reviewFetching = true;
+    const done = () => {
+      reviewFetching = false;
+      if (reviewFetchAgain) { reviewFetchAgain = false; scheduleReviewFetch(); }
+    };
+    loadReviews().then(done, done);
+  }
+
+  async function openReview(id) {
+    const wanted = S(id);
+    selectedReview = wanted;
+    const panel = $("reviewPanel");
+    panel.hidden = false;
+    panel.replaceChildren(node("div", "pmeta", "loading " + wanted + " …"));
+    try {
+      const res = await fetch("/api/review/" + encodeURIComponent(wanted), { cache: "no-store" });
+      if (!res.ok) throw new Error("review " + res.status);
+      const detail = await res.json();
+      if (selectedReview === wanted) renderReviewDetail(detail);
+    } catch (err) {
+      if (selectedReview === wanted) {
+        panel.hidden = false;
+        panel.replaceChildren(node("div", "pwarn", "could not load " + wanted));
+      }
+      console.error(err);
     }
   }
 
@@ -1575,7 +1900,7 @@ td.mono{font:400 12px/1.5 var(--mono); font-variant-numeric:tabular-nums}
     requestAnimationFrame(frame);
     const resync = () => { loadView(); setTimeout(resync, 60000); };
     setTimeout(resync, 60000);
-    loadView().then(loadHistory).then(connectStream);
+    loadView().then(loadReviews).then(loadHistory).then(connectStream);
   }
 
   // Small read-only debug surface for layout checks in headless environments.
@@ -1586,6 +1911,7 @@ td.mono{font:400 12px/1.5 var(--mono); font-variant-numeric:tabular-nums}
       get leafCount() { return rows.reduce((n, r) => n + (r.kind === "leaf" ? 1 : 0), 0); },
       get collapsedCount() { return collapsed.size; },
       get queueCount() { return pendingSubs.length; },
+      get reviewCount() { return reviewQueue.length; },
       get maxScrollRows() { return Math.ceil(H / ROW_H); },
       get sampleLengths() { return sampleLengths(); },
     };
@@ -1597,6 +1923,8 @@ td.mono{font:400 12px/1.5 var(--mono); font-variant-numeric:tabular-nums}
     applyView, queueEvent, flush, renderNow, reindex, buildRows, renderTables, renderQueue, renderNote, renderReadouts, ctx, plate,
     clipText, sparkGeometry, queueLayout, busiestOpenLeaf, logObject, pushSample, sampleLengths,
     historyUrl, finishedSummary, renderFinished, renderCoordination, nudgeCoordination, logEvent, renderLogAll, resize, draw, readColors,
+    safetyLine, reviewMode, policyLabel, voteCounts, checkedReason, diffLines, reviewHint, reviewVisible,
+    renderSafety, renderReviewQueue, renderReviewDetail, loadReviews, openReview,
   });
   else boot();
 })();
