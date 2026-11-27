@@ -1,0 +1,71 @@
+name = "Coordination lab"
+goal = "Build a small dispatch ledger from text commands and report the outcome of each delivery."
+scope = "Implement only the declared src/*.ts modules. Coordinate interfaces and shared edits before submitting."
+check = "bun check.ts"
+paths = ["src/tokens.ts", "src/parse.ts", "src/ledger.ts", "src/summary.ts", "src/policy.ts", "src/dedupe.ts", "src/dispatch.ts", "src/report.ts"]
+# Replace this example public key with the output of minga head keygen in the host copy.
+head = "ed25519:AJgMIqPSQxxNWI5lOpDWCwXWKvx-xETgGyFU4nVZBtI"
+branch = "minga"
+check_timeout_seconds = 20
+
+[rules]
+width = 2
+lease_minutes = 10
+
+[[task]]
+key = "ledger"
+title = "Command ledger"
+body = "Area for decoding, applying and summarizing stock adjustments."
+
+[[task]]
+under = "ledger"
+title = "Tokenize a command line"
+body = "Export tokenize(line: string): string[] from src/tokens.ts. Split on runs of spaces or tabs, discard empty tokens, and preserve token case and punctuation. Blank lines yield no tokens."
+paths = ["src/tokens.ts"]
+
+[[task]]
+under = "ledger"
+title = "Parse stock adjustments"
+body = "Export parse(line: string): { sku: string; delta: number } from src/parse.ts. Import tokenize from ./tokens. Require exactly two tokens: a nonempty SKU and a signed base-10 integer (optional sign, digits required). Throw for malformed input or integers outside JavaScript's safe range."
+paths = ["src/parse.ts"]
+
+[[task]]
+under = "ledger"
+title = "Apply adjustments in order"
+body = "Export buildLedger(lines: readonly string[]): Map<string, number> from src/ledger.ts. Import parse from ./parse. Sum deltas by SKU, retain zero totals and preserve first occurrence order. Accept any SKU allowed by parse, including names that coincide with inherited object properties. Propagate parser errors."
+paths = ["src/ledger.ts"]
+
+[[task]]
+under = "ledger"
+title = "Summarize pending stock"
+body = "Export summarize(lines: readonly string[]): { sku: string; total: number }[] from src/summary.ts. Import buildLedger from ./ledger. Return positive totals only, sorted by descending total. Use check feedback to clarify the feed's ordering convention for ties."
+paths = ["src/summary.ts"]
+
+[[task]]
+key = "delivery"
+title = "Delivery and reporting"
+body = "Area for retry limits, duplicate detection and the final delivery report."
+
+[[task]]
+under = "delivery"
+title = "Define the retry policy"
+body = "Export canRetry(attempts: number, maxAttempts = 3): boolean from src/policy.ts. Attempts counts deliveries already made, starting at zero. Return true only when attempts is less than maxAttempts. Throw RangeError if either argument is negative or is not a safe integer. Preserve explicit zero. The duplicate-detection task also adds an export here. Coordinate this edit without replacing each other's exports."
+paths = ["src/policy.ts"]
+
+[[task]]
+under = "delivery"
+title = "Detect duplicate deliveries"
+body = "Add dedupeWindow = 3 as a named export to src/policy.ts, preserving the retry API. In src/dedupe.ts import that value and export isDuplicate(recent: readonly string[], id: string): boolean. Compare case-sensitive IDs against the last dedupeWindow entries only. The input is ordered oldest first."
+paths = ["src/dedupe.ts", "src/policy.ts"]
+
+[[task]]
+under = "delivery"
+title = "Classify delivery"
+body = "Export classify(recent: readonly string[], id: string, attempts: number): 'duplicate' | 'ready' | 'exhausted' from src/dispatch.ts. Import isDuplicate from ./dedupe and canRetry from ./policy. Duplicates take precedence. Otherwise return ready if a retry is allowed and exhausted if it is not."
+paths = ["src/dispatch.ts"]
+
+[[task]]
+under = "delivery"
+title = "Build the dispatch report"
+body = "Export report(lines: readonly string[], recent: readonly string[], attempts: ReadonlyMap<string, number>): { sku: string; total: number; status: 'duplicate' | 'ready' | 'exhausted' }[] from src/report.ts. Import summarize from ./summary and classify from ./dispatch. Preserve summary order and totals. Classify each SKU using its attempt count, defaulting absent counts to zero. Treat recent as a snapshot for the whole report."
+paths = ["src/report.ts"]
