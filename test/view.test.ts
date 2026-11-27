@@ -72,6 +72,14 @@ const checked = (id: number, ok: boolean): NewEvent => ({
     outputTail: "tail", durationMs: 1, points: ok ? 2 : 0,
   },
 });
+const passed = (id: number): NewEvent => ({
+  type: "submission.passed",
+  actor: "server",
+  data: {
+    submission: `S-${id}`, attempt: "A-1", task: "T-1", agent: "a1",
+    base: "b", durationMs: 1, outputTail: "tail", warnings: ["focused tests"],
+  },
+});
 
 describe("buildView", () => {
   test("tasks carry their declared paths and closing submission (the margin note shows them)", () => {
@@ -178,6 +186,37 @@ describe("buildView", () => {
     expect(out.submissions.map((s) => s.id)).toEqual(["S-2", "S-1"]);
     // The expired lease does not free the attempt while its submission is pending.
     expect(out.attempts.map((a) => a.id)).toEqual(["A-1"]);
+  });
+
+  test("includes submissions waiting in review alongside pending and finished ones", () => {
+    const ev = logger();
+    const state = replay(RULES, [
+      ev(join("a1")),
+      ev(post("T-1")),
+      ev(startAttempt("A-1", "T-1", "a1", "2026-01-01T00:05:00.000Z")),
+      ev(queued(1, "A-1")),
+      ev(queued(2, "A-1")),
+      ev(passed(1), "2026-01-01T00:02:00.000Z"),
+      ev({ type: "submission.reviewed", actor: "head", data: { submission: "S-1", agent: "head", approve: true, head: true } }, "2026-01-01T00:03:00.000Z"),
+      ev(checked(3, true), "2026-01-01T00:04:00.000Z"),
+    ]);
+    const before = structuredClone(state);
+    const out = view(state);
+
+    // Review work is visible like pending work; it does not add a pending count.
+    expect(out.submissions.map((s) => s.id)).toEqual(["S-3", "S-2", "S-1"]);
+    expect(out.submissions.find((s) => s.id === "S-1")).toMatchObject({
+      status: "review",
+      passedAt: "2026-01-01T00:02:00.000Z",
+      warnings: ["focused tests"],
+      reviews: [{ agent: "head", approve: true, head: true, at: "2026-01-01T00:03:00.000Z" }],
+    });
+    expect(out.totals.queuedSubmissions).toBe(1);
+    expect(out.totals.checkingSubmissions).toBe(0);
+    expect(out.totals.submissions).toBe(3);
+    // The pending S-2 keeps A-1 alive; the reviewed S-1 alone would not.
+    expect(out.attempts.map((a) => a.id)).toEqual(["A-1"]);
+    expect(state).toEqual(before);
   });
 
   test("keeps only the newest 100 notes and does not mutate state", () => {

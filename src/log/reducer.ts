@@ -13,7 +13,7 @@ import type {
 } from "../core/contracts.ts";
 import type {
   AgentState, AttemptState, LeaderRow, ModelRow, MingaEvent, NoteState, ProposalState,
-  Rules, State, StateIndex, SubmissionState, TaskState,
+  ReviewVote, Rules, State, StateIndex, SubmissionState, TaskState,
 } from "../core/types.ts";
 
 const PREFIX: Record<"task" | "attempt" | "note" | "submission" | "proposal", string> = {
@@ -391,11 +391,48 @@ export const reduce: Reduce = (state: State, event: MingaEvent): State => {
     case "submission.started": {
       const d = event.data;
       const submission = state.submissions[d.submission];
-      if (!submission || (submission.status !== "queued" && submission.status !== "checking")) break;
+      if (!submission || (submission.status !== "queued" && submission.status !== "checking" && submission.status !== "review")) break;
+      // An approved submission rechecked on a newer head moves back to pending.
+      // Its review metadata (votes, passedAt, warnings) is intentionally kept.
+      if (submission.status === "review") {
+        if (index.reviewSubmissions !== undefined) removeId(index.reviewSubmissions, d.submission);
+        if (!index.pendingSubmissions.includes(d.submission)) index.pendingSubmissions.push(d.submission);
+      }
       submission.status = "checking";
       submission.startedAt = at;
       submission.base = d.base;
       submission.runs += 1;
+      break;
+    }
+
+    case "submission.passed": {
+      const d = event.data;
+      const submission = state.submissions[d.submission];
+      if (submission) {
+        submission.status = "review";
+        submission.passedAt = at;
+        submission.passedSeq = event.seq;
+        submission.base = d.base;
+        submission.durationMs = d.durationMs;
+        if (d.warnings !== undefined) submission.warnings = [...d.warnings];
+        if (d.holdout !== undefined) submission.holdout = d.holdout;
+      }
+      // No longer pending; but review must NOT keep the attempt alive.
+      removeId(index.pendingSubmissions, d.submission);
+      // Older states/logs have no reviewSubmissions: create it lazily.
+      const review = (index.reviewSubmissions ??= []);
+      if (!review.includes(d.submission)) review.push(d.submission);
+      break;
+    }
+
+    case "submission.reviewed": {
+      const d = event.data;
+      const submission = state.submissions[d.submission];
+      if (!submission) break;
+      const vote: ReviewVote = { agent: d.agent, approve: d.approve, at };
+      if (d.reason !== undefined) vote.reason = d.reason;
+      if (d.head !== undefined) vote.head = d.head;
+      (submission.reviews ??= []).push(vote);
       break;
     }
 
@@ -415,6 +452,10 @@ export const reduce: Reduce = (state: State, event: MingaEvent): State => {
         existing.commit = d.commit;
         existing.points = d.points;
         if (d.base !== undefined) existing.base = d.base;
+        if (d.gate !== undefined) existing.gate = [...d.gate];
+        if (d.warnings !== undefined) existing.warnings = [...d.warnings];
+        if (d.holdout !== undefined) existing.holdout = d.holdout;
+        if (d.review !== undefined) existing.review = { ...d.review };
         removeId(index.pendingSubmissions, d.submission);
       } else {
         // v1 logs have no submission.queued event: synthesize the record.
@@ -442,9 +483,14 @@ export const reduce: Reduce = (state: State, event: MingaEvent): State => {
           points: d.points,
         };
         if (d.base !== undefined) submission.base = d.base;
+        if (d.gate !== undefined) submission.gate = [...d.gate];
+        if (d.warnings !== undefined) submission.warnings = [...d.warnings];
+        if (d.holdout !== undefined) submission.holdout = d.holdout;
+        if (d.review !== undefined) submission.review = { ...d.review };
         state.submissions[d.submission] = submission;
         removeId(index.pendingSubmissions, d.submission);
       }
+      if (index.reviewSubmissions !== undefined) removeId(index.reviewSubmissions, d.submission);
       state.counters.submission = Math.max(
         state.counters.submission,
         idNumber(d.submission),

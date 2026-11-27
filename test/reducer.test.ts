@@ -86,6 +86,62 @@ const started = (id: string, base = "abc123", round = 0, at = T0): NewEvent => (
   data: { submission: id, base, round },
 });
 
+/** 0.3 review events. */
+const passed = (
+  id: string,
+  opts: { warnings?: string[]; holdout?: "passed" } = {},
+): NewEvent => ({
+  type: "submission.passed",
+  actor: "server",
+  data: {
+    submission: id, attempt: "A-1", task: "T-1", agent: "aaa",
+    base: "deadbeef", durationMs: 50, outputTail: "check ok",
+    ...(opts.warnings !== undefined ? { warnings: opts.warnings } : {}),
+    ...(opts.holdout !== undefined ? { holdout: opts.holdout } : {}),
+  },
+});
+
+const reviewed = (
+  id: string,
+  voter: string,
+  approve: boolean,
+  opts: { reason?: string; head?: boolean } = {},
+): NewEvent => ({
+  type: "submission.reviewed",
+  actor: voter,
+  data: {
+    submission: id, agent: voter, approve,
+    ...(opts.reason !== undefined ? { reason: opts.reason } : {}),
+    ...(opts.head !== undefined ? { head: opts.head } : {}),
+  },
+});
+
+const finalized = (
+  id: string,
+  ok: boolean,
+  opts: {
+    commit?: string;
+    gate?: string[];
+    warnings?: string[];
+    holdout?: "passed" | "failed";
+    review?: { approved: boolean; by: "head" | "vote"; reason?: string };
+  } = {},
+): NewEvent => ({
+  type: "submission.checked",
+  actor: "server",
+  data: {
+    submission: id, attempt: "A-1", task: "T-1", agent: "aaa", model: "model-a",
+    claim: "solves", files: ["src/x.ts"], base: "deadbeef",
+    ok, exitCode: ok ? 0 : 1, timedOut: false, outputTail: "final tail",
+    durationMs: 77, points: ok ? 9 : 0,
+    ...(opts.commit !== undefined ? { commit: opts.commit } : {}),
+    ...(opts.gate !== undefined ? { gate: opts.gate } : {}),
+    ...(opts.warnings !== undefined ? { warnings: opts.warnings } : {}),
+    ...(opts.holdout !== undefined ? { holdout: opts.holdout } : {}),
+    ...(opts.review !== undefined ? { review: opts.review } : {}),
+  },
+});
+
 /** v1-style checked event (no prior queued event). */
 const submission = (
   id: string,
@@ -412,6 +468,228 @@ describe("submissions", () => {
     expect(agent.accepted).toBe(1);
     expect(agent.submissions).toBe(2);
     expect(state.counters.submission).toBe(7);
+  });
+});
+
+describe("review lifecycle (0.3)", () => {
+  const PASSED_AT = "2026-01-01T00:04:00.000Z";
+  const REVIEWED_AT = "2026-01-01T00:05:00.000Z";
+  const CHECKED_AT = "2026-01-01T00:06:00.000Z";
+
+  test("passed -> reviewed -> checked(ok, commit, review approved)", () => {
+    const ev = logger();
+    const state = initialState(RULES);
+    const fold = (event: NewEvent, at: string): MingaEvent => {
+      const stored = ev(event, at);
+      reduce(state, stored);
+      return stored;
+    };
+
+    fold(join("aaa"), T0);
+    fold(join("bbb"), T0);
+    fold(post("T-1"), T0);
+    fold(start("A-1", "T-1", "aaa"), T0);
+    fold(queued("S-1", "A-1", "aaa", "T-1"), "2026-01-01T00:01:00.000Z");
+    fold(started("S-1", "deadbeef"), "2026-01-01T00:02:00.000Z");
+    expect(state.index.pendingSubmissions).toEqual(["S-1"]);
+
+    const pass = fold(passed("S-1", { warnings: ["focused tests"], holdout: "passed" }), PASSED_AT);
+    const s = state.submissions["S-1"]!;
+    expect(s).toMatchObject({
+      status: "review",
+      passedAt: PASSED_AT,
+      passedSeq: pass.seq,
+      base: "deadbeef",
+      durationMs: 50,
+      warnings: ["focused tests"],
+      holdout: "passed",
+    });
+    expect(state.index.pendingSubmissions).toEqual([]);
+    expect(state.index.reviewSubmissions).toEqual(["S-1"]);
+
+    const vote = fold(reviewed("S-1", "bbb", true, { reason: "checked the diff" }), REVIEWED_AT);
+    fold(reviewed("S-1", "head", true, { head: true }), REVIEWED_AT);
+    expect(state.submissions["S-1"]!.reviews).toEqual([
+      { agent: "bbb", approve: true, reason: "checked the diff", at: vote.at },
+      { agent: "head", approve: true, head: true, at: REVIEWED_AT },
+    ]);
+
+    const check = fold(finalized("S-1", true, {
+      commit: "cafebabe",
+      gate: [],
+      warnings: ["focused tests"],
+      holdout: "passed",
+      review: { approved: true, by: "vote" },
+    }), CHECKED_AT);
+    expect(state.submissions["S-1"]).toMatchObject({
+      status: "accepted",
+      ok: true,
+      commit: "cafebabe",
+      checkedAt: CHECKED_AT,
+      checkedSeq: check.seq,
+      gate: [],
+      warnings: ["focused tests"],
+      holdout: "passed",
+      review: { approved: true, by: "vote" },
+      points: 9,
+    });
+    expect(state.index.pendingSubmissions).toEqual([]);
+    expect(state.index.reviewSubmissions).toEqual([]);
+    expect(state.index.failures).toEqual({});
+    // Counters keep their old meaning: one checked submission, one acceptance.
+    expect(state.agents["aaa"]).toMatchObject({ submissions: 1, accepted: 1, points: 9 });
+    expect(state.agents["bbb"]).toMatchObject({ submissions: 0, accepted: 0, points: 0 });
+  });
+
+  test("passed -> checked(ok=false, review rejected) counts a failure", () => {
+    const ev = logger();
+    const state = initialState(RULES);
+    for (const event of [
+      join("aaa"), post("T-1"), start("A-1", "T-1", "aaa"),
+      queued("S-1", "A-1", "aaa", "T-1"), started("S-1", "deadbeef"),
+      passed("S-1"),
+      reviewed("S-1", "bbb", false, { reason: "shortcut" }),
+      finalized("S-1", false, {
+        gate: ["focused tests"],
+        review: { approved: false, by: "vote", reason: "shortcut" },
+      }),
+    ]) reduce(state, ev(event, T0));
+
+    const s = state.submissions["S-1"]!;
+    expect(s).toMatchObject({
+      status: "rejected",
+      ok: false,
+      points: 0,
+      gate: ["focused tests"],
+      review: { approved: false, by: "vote", reason: "shortcut" },
+      reviews: [{ agent: "bbb", approve: false, reason: "shortcut", at: T0 }],
+    });
+    expect(s.commit).toBeUndefined();
+    expect(state.index.reviewSubmissions).toEqual([]);
+    expect(state.index.pendingSubmissions).toEqual([]);
+    expect(state.index.failures).toEqual({ aaa: { "T-1": 1 } });
+    expect(state.agents["aaa"]).toMatchObject({ submissions: 1, accepted: 0, points: 0 });
+  });
+
+  test("review submissions are not kept alive by the pending-submission index", () => {
+    const ev = logger();
+    const state = replay(RULES, [
+      ev(join("aaa")),
+      ev(post("T-1")),
+      ev(start("A-1", "T-1", "aaa", "2026-01-01T00:05:00.000Z")),
+      ev(queued("S-1", "A-1", "aaa", "T-1")),
+      ev(started("S-1")),
+      ev(passed("S-1"), "2026-01-01T00:03:00.000Z"),
+    ]);
+
+    const late = new Date("2026-01-01T01:00:00.000Z");
+    expect(state.submissions["S-1"]!.status).toBe("review");
+    expect(state.index.reviewSubmissions).toEqual(["S-1"]);
+    expect(state.index.pendingSubmissions).toEqual([]);
+    expect(isLive(state, "A-1", late)).toBe(false);
+    expect(liveAttempts(state, "T-1", late)).toEqual([]);
+    expect(agentLiveAttempts(state, "aaa", late)).toEqual([]);
+  });
+
+  test("a recheck started while in review moves the id back to pending and keeps the votes", () => {
+    const ev = logger();
+    const state = initialState(RULES);
+    const fold = (event: NewEvent, at: string): MingaEvent => {
+      const stored = ev(event, at);
+      reduce(state, stored);
+      return stored;
+    };
+
+    fold(join("aaa"), T0);
+    fold(post("T-1"), T0);
+    fold(start("A-1", "T-1", "aaa", "2026-01-01T00:05:00.000Z"), T0);
+    fold(queued("S-1", "A-1", "aaa", "T-1"), "2026-01-01T00:01:00.000Z");
+    fold(started("S-1", "oldhead"), "2026-01-01T00:01:30.000Z");
+    const pass = fold(passed("S-1", { warnings: ["focused tests"] }), "2026-01-01T00:02:00.000Z");
+    const vote = fold(reviewed("S-1", "bbb", true, { reason: "ok on old head" }), "2026-01-01T00:03:00.000Z");
+
+    const late = new Date("2026-01-01T01:00:00.000Z");
+    expect(state.submissions["S-1"]!.status).toBe("review");
+    expect(state.index.reviewSubmissions).toEqual(["S-1"]);
+    expect(state.index.pendingSubmissions).toEqual([]);
+    expect(isLive(state, "A-1", late)).toBe(false);
+
+    fold(started("S-1", "newhead", 1), "2026-01-01T00:04:00.000Z");
+
+    expect(state.submissions["S-1"]).toMatchObject({
+      status: "checking",
+      base: "newhead",
+      runs: 2,
+      startedAt: "2026-01-01T00:04:00.000Z",
+      passedAt: pass.at,
+      passedSeq: pass.seq,
+      warnings: ["focused tests"],
+      reviews: [{ agent: "bbb", approve: true, reason: "ok on old head", at: vote.at }],
+    });
+    expect(state.index.reviewSubmissions).toEqual([]);
+    expect(state.index.pendingSubmissions).toEqual(["S-1"]);
+    // Pending again: the expired lease no longer ends the attempt's liveness.
+    expect(isLive(state, "A-1", late)).toBe(true);
+  });
+});
+
+describe("0.2 log replay stays unchanged", () => {
+  test("a 0.2-style event sequence folds to the same state it always did", () => {
+    const ev = logger();
+    const state = replay(RULES, [
+      ev(join("aaa")),
+      ev(post("T-1")),
+      ev(start("A-1", "T-1", "aaa")),
+      ev(queued("S-1", "A-1", "aaa", "T-1"), "2026-01-01T00:01:00.000Z"),
+      ev(started("S-1", "deadbeef"), "2026-01-01T00:02:00.000Z"),
+      ev(finalized("S-1", true, { commit: "cafebabe" }), "2026-01-01T00:03:00.000Z"),
+      ev({ type: "attempt.ended", actor: "aaa", data: { attempt: "A-1", reason: "submitted" } }, "2026-01-01T00:03:00.000Z"),
+    ]);
+
+    expect(state).toEqual({
+      seq: 7,
+      rules: RULES,
+      agents: {
+        aaa: {
+          id: "aaa", publicKey: "pk-aaa", model: "model-a", harness: "harness-a",
+          joinedAt: T0, lastSeenAt: "2026-01-01T00:03:00.000Z", banned: false,
+          points: 9, accepted: 1, submissions: 1,
+        },
+      },
+      tasks: {
+        "T-1": {
+          id: "T-1", title: "title T-1", body: "body T-1", parent: null, children: [],
+          status: "open", points: 3, postedAt: T0, attempts: ["A-1"], notes: [],
+        },
+      },
+      attempts: {
+        "A-1": {
+          id: "A-1", task: "T-1", agent: "aaa", role: "build", approach: "try it",
+          model: "model-a", startedAt: T0, leaseUntil: "2026-01-01T00:10:00.000Z",
+          lastBeatAt: T0, endedAt: "2026-01-01T00:03:00.000Z", endReason: "submitted",
+        },
+      },
+      notes: {},
+      submissions: {
+        "S-1": {
+          id: "S-1", attempt: "A-1", task: "T-1", agent: "aaa", model: "model-a",
+          claim: "solves", message: "do it", files: ["src/x.ts"], bytes: 42,
+          status: "accepted", queuedAt: "2026-01-01T00:01:00.000Z",
+          startedAt: "2026-01-01T00:02:00.000Z", base: "deadbeef", runs: 1,
+          checkedAt: "2026-01-01T00:03:00.000Z", checkedSeq: 6,
+          ok: true, exitCode: 0, timedOut: false, durationMs: 77,
+          commit: "cafebabe", points: 9,
+        },
+      },
+      proposals: {},
+      leads: {},
+      counters: { task: 1, attempt: 1, note: 0, submission: 1, proposal: 0 },
+      index: {
+        openByAgent: {}, openByTask: {}, openAttempts: [], pendingSubmissions: [],
+        failures: {}, openQuestions: {}, digests: {}, deadEnds: {}, openByPath: {},
+        unnotified: {}, inbox: {}, leadAreas: {},
+      },
+    });
   });
 });
 

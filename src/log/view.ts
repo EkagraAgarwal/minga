@@ -135,6 +135,14 @@ export const buildView: BuildView = (input: ViewInput): ViewResponse => {
     submissions.push(submission);
     submissionIds.add(id);
   }
+  // Submitted work waiting for review is visible like pending work. The UI can
+  // count it from `submissions`; ViewResponse.totals stays unchanged.
+  for (const id of state.index?.reviewSubmissions ?? []) {
+    const submission = state.submissions[id];
+    if (!submission || submissionIds.has(id)) continue;
+    submissions.push(submission);
+    submissionIds.add(id);
+  }
   for (const submission of newest(
     state.counters.submission,
     "S",
