@@ -16,18 +16,21 @@ import { mkdirSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { join as pathJoin } from "node:path";
 import type { BranchHead, ChangedPaths, CheckPool, CheckResult, CommitAccepted, EventStore } from "../core/contracts.ts";
 import type {
-  Assignment, AttemptView, BeatNews, BeatRequest, ErrorBody, EventsResponse, HeadBanRequest, HeadCloseRequest, HeadDecideRequest, HeadNoteRequest,
+  Assignment, AttemptView, BeatNews, BeatRequest, ErrorBody, EventsResponse, HeadBanRequest, HeadCloseRequest, HeadDecideRequest, HeadLeadRequest, HeadNoteRequest,
   HeadPostRequest, HeadRuleRequest, JoinRequest, JoinResponse, MetricsResponse, NextRequest, NextResponse,
   NoteRequest, PathConflict, ProjectInfo, ProposeRequest, ReleaseRequest, SubmissionView, SubmitRequest, SubmitResponse, TasksResponse,
   VoteRequest,
 } from "../core/protocol.ts";
 import {
   CLOSED_STATUSES, NOTE_KINDS, RELEASE_REASONS, ROLES,
-  type AgentId, type AttemptEndReason, type AttemptId, type Claim, type MingaEvent, type NewEvent,
+  type AgentId, type AttemptEndReason, type AttemptId, type Claim, type DecidedBy, type MingaEvent, type NewEvent,
   type NoteId, type NoteState, type ProjectConfig, type ProposalId, type ReleaseReason, type Rules, type State, type SubmissionId, type SubmissionState, type TaskId,
 } from "../core/types.ts";
 import { agentIdFromPublicKey, parseHeadKey } from "../identity/keys.ts";
+import { createCoordinationTracker } from "../log/coordination.ts";
 import { agentLiveAttempts, computeLeaderboard, initialState, isLive, liveAttempts, nextId, reduce } from "../log/reducer.ts";
+import { findDuplicate } from "./dedupe.ts";
+import { leadAreaFor } from "./leads.ts";
 import { closedByOf, Notices } from "./notices.ts";
 import { buildView } from "../log/view.ts";
 import { pathAllowed, parseAcceptPolicy } from "../project/config.ts";
@@ -74,7 +77,8 @@ const CAPACITY_EVENTS = new Set<MingaEvent["type"]>(["task.posted", "attempt.end
 const KNOWN_ROUTES = new Set([
   "/api/project", "/api/view", "/api/leaderboard", "/api/metrics", "/api/tasks", "/api/events", "/api/stream", "/api/submission/:id", "/api/attempt/:id",
   "/api/join", "/api/next", "/api/beat", "/api/note", "/api/submit", "/api/release", "/api/propose", "/api/vote",
-  "/api/head/post", "/api/head/decide", "/api/head/rule", "/api/head/ban", "/api/head/close", "/api/head/note",
+  "/api/head/post", "/api/head/decide", "/api/head/rule", "/api/head/ban", "/api/head/close", "/api/head/note", "/api/head/lead",
+  "/api/lead/post", "/api/lead/decide",
 ]);
 
 type Waiter = { agent: AgentId; model: string; approach: string; finish: (a: Assignment | null | "done") => void };
@@ -105,12 +109,19 @@ export function createApp(deps: AppDeps) {
   const heldRequests = new WeakSet<AbortSignal>();
 
   // ---------------------------------------------------------------- state
+  // One coordination fold feeds both /api/metrics and /api/view. Replaying the log
+  // here means a restarted server reports the same stats as before it stopped.
+  const coordination = createCoordinationTracker();
   const state: State = initialState(structuredClone(cfg.rules));
-  for (const e of store.since(0)) reduce(state, e);
+  for (const e of store.since(0)) {
+    reduce(state, e);
+    coordination.apply(e);
+  }
 
   function emit(ev: NewEvent): MingaEvent {
     const stored = store.append(ev, now());
     reduce(state, stored);
+    coordination.apply(stored);
     if (listeners.size) {
       const frame = enc.encode(`id: ${stored.seq}\nevent: ${stored.type}\ndata: ${JSON.stringify(stored)}\n\n`);
       for (const l of listeners) {
@@ -317,7 +328,7 @@ export function createApp(deps: AppDeps) {
     return expired.length;
   }
 
-  function applyDecision(proposal: ProposalId, accepted: boolean, by: "head" | "vote", actor: AgentId | "server", reason?: string): TaskId | undefined {
+  function applyDecision(proposal: ProposalId, accepted: boolean, by: DecidedBy, actor: AgentId | "server", reason?: string): TaskId | undefined {
     emit({ type: "proposal.decided", actor, data: { proposal, accepted, by, ...(reason ? { reason } : {}) } });
     if (!accepted) return undefined;
     const p = state.proposals[proposal]!;
@@ -745,7 +756,27 @@ export function createApp(deps: AppDeps) {
         task = str(b.task, "task", 32);
         if (!state.tasks[task]) throw new HttpError(404, `no task ${task}`);
       }
-      str(b.title, "title", 200);
+      const title = str(b.title, "title", 200);
+      const dup = findDuplicate(state, task, title);
+      if (dup) {
+        if (dup.task) {
+          throw new HttpError(409, `an open task ${dup.task} already covers this: "${title}"`,
+            `work on it: minga next, or note on ${dup.task}`);
+        }
+        const other = dup.proposal!;
+        const p = state.proposals[other]!;
+        // A duplicate becomes an approving vote on the existing proposal when the
+        // proposer could have voted anyway. No new proposal is created or numbered.
+        if (!p.decided && p.agent !== agent && p.votes[agent] === undefined) {
+          emit({ type: "proposal.voted", actor: agent, data: { proposal: other, agent, approve: true, duplicate: true } });
+          const d = decideByVotes(state, other);
+          if (d) {
+            applyDecision(other, d.accepted, "vote", "server");
+            return { proposal: other, duplicateOf: { proposal: other }, decided: { accepted: d.accepted, by: "vote" as const } };
+          }
+        }
+        return { proposal: other, duplicateOf: { proposal: other } };
+      }
     } else if (b.kind === "impossible") {
       task = str(b.task, "task", 32);
       if (state.tasks[task]?.status !== "open") throw new HttpError(409, `task ${task} is not open`);
@@ -777,8 +808,9 @@ export function createApp(deps: AppDeps) {
     return { proposal: id };
   }
 
-  // ---------------------------------------------------------------- head verbs
-  function headPost(b: HeadPostRequest) {
+  // ---------------------------------------------------------------- head and lead verbs
+  /** Shared by /api/head/post and /api/lead/post; only the actor and `by` differ. */
+  function postTask(b: HeadPostRequest, actor: AgentId, by: "head" | "lead") {
     const title = str(b.title, "title", 200);
     const body = str(b.body, "body", NOTE_MAX, { optional: true });
     const parent = b.parent ?? null;
@@ -787,11 +819,36 @@ export function createApp(deps: AppDeps) {
     if (!Number.isInteger(points) || points < 0) throw new HttpError(400, "points must be an integer >= 0");
     const paths = intentPaths(b.paths);
     const id = nextId(state, "task");
-    emit({ type: "task.posted", actor: headId, data: {
-      task: id, title, body, parent, points, by: "head",
+    emit({ type: "task.posted", actor, data: {
+      task: id, title, body, parent, points, by,
       ...(paths !== undefined ? { paths } : {}),
     } });
     return { task: id };
+  }
+
+  function headPost(b: HeadPostRequest) {
+    return postTask(b, headId, "head");
+  }
+
+  function leadPost(agent: AgentId, b: HeadPostRequest) {
+    agentOrThrow(agent);
+    const parent = b.parent ?? null;
+    if (parent === null || leadAreaFor(state, agent, parent) === null) {
+      throw new HttpError(403, `you do not lead an area containing ${parent}`, "the head grants areas with POST /api/head/lead");
+    }
+    return postTask(b, agent, "lead");
+  }
+
+  function headLead(b: HeadLeadRequest) {
+    const agent = str(b.agent, "agent", 16);
+    const area = str(b.area, "area", 32);
+    if (typeof b.grant !== "boolean") throw new HttpError(400, "grant must be true or false");
+    if (!state.agents[agent]) throw new HttpError(404, `no agent ${agent}`);
+    if (!state.tasks[area]) throw new HttpError(404, `no task ${area}`);
+    const has = (state.leads?.[area] ?? []).includes(agent);
+    if (b.grant && !has) emit({ type: "lead.granted", actor: headId, data: { agent, area } });
+    if (!b.grant && has) emit({ type: "lead.revoked", actor: headId, data: { agent, area } });
+    return { ok: true as const, leads: state.leads?.[area] ?? [] };
   }
 
   function headDecide(b: HeadDecideRequest) {
@@ -800,6 +857,20 @@ export function createApp(deps: AppDeps) {
     if (!p) throw new HttpError(404, `no proposal ${b.proposal}`);
     if (p.decided) throw new HttpError(409, "already decided");
     const task = applyDecision(p.id, !!b.accept, "head", headId, b.reason ? str(b.reason, "reason", 500) : undefined);
+    return { ok: true as const, ...(task ? { task } : {}) };
+  }
+
+  function leadDecide(agent: AgentId, b: HeadDecideRequest) {
+    if (state.rules.accept.mode === "votes") throw new HttpError(403, "accept policy is votes only");
+    const p = state.proposals[b.proposal];
+    if (!p) throw new HttpError(404, `no proposal ${b.proposal}`);
+    if (p.decided) throw new HttpError(409, "already decided");
+    if (p.agent === agent) throw new HttpError(403, "you cannot decide your own proposal");
+    const area = leadAreaFor(state, agent, p.task);
+    if (area === null) {
+      throw new HttpError(403, `you do not lead an area containing ${p.task}`, "the head grants areas with POST /api/head/lead");
+    }
+    const task = applyDecision(p.id, !!b.accept, "lead", agent, b.reason ? str(b.reason, "reason", 500) : undefined);
     return { ok: true as const, ...(task ? { task } : {}) };
   }
 
@@ -870,7 +941,7 @@ export function createApp(deps: AppDeps) {
     const t = Date.now();
     if (viewCache && t - viewCache.at < 1000) return viewCache;
     if (viewCache && viewCache.seq === state.seq && t - viewCache.at < 5000) return viewCache;
-    const body = JSON.stringify(buildView({ state, project: projectInfo(), now: now(), events: store.head() }));
+    const body = JSON.stringify(buildView({ state, project: projectInfo(), now: now(), events: store.head(), coordination: coordination.snapshot() }));
     viewCache = { seq: state.seq, at: t, body };
     return viewCache;
   }
@@ -915,6 +986,7 @@ export function createApp(deps: AppDeps) {
       requests: { ...requests },
       statuses: { ...statuses },
       latencyMs: Object.fromEntries([...latency].map(([route, h]) => [route, h.summary()])),
+      coordination: coordination.snapshot(),
     };
   }
 
@@ -946,10 +1018,12 @@ export function createApp(deps: AppDeps) {
   const signed: Record<string, Handler> = {
     "/api/next": next, "/api/beat": beat, "/api/note": note, "/api/submit": submit,
     "/api/release": release, "/api/propose": propose, "/api/vote": vote,
+    "/api/lead/post": leadPost, "/api/lead/decide": leadDecide,
   };
   const head: Record<string, (body: any) => unknown> = {
     "/api/head/post": headPost, "/api/head/decide": headDecide, "/api/head/rule": headRule,
     "/api/head/ban": headBan, "/api/head/close": headClose, "/api/head/note": headNote,
+    "/api/head/lead": headLead,
   };
 
   async function handleApi(req: Request, url: URL, ip: string | undefined): Promise<Response> {

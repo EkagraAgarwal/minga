@@ -720,4 +720,159 @@ describe("server", () => {
     const avg = (performance.now() - t0) / reqs.length;
     expect(avg).toBeLessThan(0.5);
   });
+
+  test("head lead grant/revoke is validated and idempotent", async () => {
+    const s = setup();
+    const a = generateKeyPair();
+    const id = (await join(s, a, "m1")).body.agent;
+    const granted = await s.call(s.head, "/api/head/lead", { agent: id, area: "T-1", grant: true });
+    expect(granted.body).toEqual({ ok: true, leads: [id] });
+    expect((await s.call(s.head, "/api/head/lead", { agent: id, area: "T-1", grant: true })).body.leads).toEqual([id]);
+    expect(s.store.since(0).filter((e) => e.type === "lead.granted")).toHaveLength(1);
+
+    expect((await s.call(s.head, "/api/head/lead", { agent: id, area: "T-1", grant: false })).body.leads).toEqual([]);
+    await s.call(s.head, "/api/head/lead", { agent: id, area: "T-1", grant: false });
+    expect(s.store.since(0).filter((e) => e.type === "lead.revoked")).toHaveLength(1);
+
+    expect((await s.call(s.head, "/api/head/lead", { agent: "0000000000000000", area: "T-1", grant: true })).status).toBe(404);
+    expect((await s.call(s.head, "/api/head/lead", { agent: id, area: "T-99", grant: true })).status).toBe(404);
+    expect((await s.call(a, "/api/head/lead", { agent: id, area: "T-1", grant: true })).status).toBe(403);
+  });
+
+  test("lead post and decide are scoped to the led area and recorded as by: lead", async () => {
+    const s = setup();
+    const leadKeys = generateKeyPair(), otherKeys = generateKeyPair();
+    const lead = (await join(s, leadKeys, "m1")).body.agent;
+    await join(s, otherKeys, "m2");
+    expect((await s.call(s.head, "/api/head/lead", { agent: lead, area: "T-1", grant: true })).status).toBe(200);
+
+    const posted = await s.call(leadKeys, "/api/lead/post", { title: "Lead child", body: "b", parent: "T-2", paths: ["proofs/lead.ts"] });
+    expect(posted.status).toBe(200);
+    const child = posted.body.task;
+    expect(s.app.state.tasks[child]!.parent).toBe("T-2");
+    const postedEvent = s.store.since(0).find((e) => e.type === "task.posted" && e.data.task === child)!;
+    expect(postedEvent.actor).toBe(lead);
+    expect(postedEvent.data).toMatchObject({ by: "lead", paths: ["proofs/lead.ts"] });
+
+    const outside = await s.call(s.head, "/api/head/post", { title: "Outside", body: "", parent: null });
+    expect((await s.call(leadKeys, "/api/lead/post", { title: "Nope", body: "", parent: outside.body.task })).status).toBe(403);
+    expect((await s.call(leadKeys, "/api/lead/post", { title: "Nope", body: "", parent: null })).status).toBe(403);
+
+    const prop = await s.call(otherKeys, "/api/propose", { kind: "new_task", task: "T-2", title: "Sub lemma" });
+    expect(prop.status).toBe(200);
+    const decided = await s.call(leadKeys, "/api/lead/decide", { proposal: prop.body.proposal, accept: true });
+    expect(decided.status).toBe(200);
+    expect(s.app.state.tasks[decided.body.task]!.parent).toBe("T-2");
+    const de = s.store.since(0).find((e) => e.type === "proposal.decided" && e.data.proposal === prop.body.proposal)!;
+    expect(de.data).toMatchObject({ by: "lead", accepted: true });
+    expect(de.actor).toBe(lead);
+
+    const imp = await s.call(otherKeys, "/api/propose", { kind: "impossible", task: "T-2", evidence: "counterexample" });
+    expect((await s.call(leadKeys, "/api/lead/decide", { proposal: imp.body.proposal, accept: true })).status).toBe(200);
+    expect(s.app.state.tasks["T-2"]!.status).toBe("impossible");
+  });
+
+  test("leads cannot use head routes, decide own or out-of-area proposals, or act after revocation", async () => {
+    const s = setup();
+    const leadKeys = generateKeyPair(), otherKeys = generateKeyPair();
+    const lead = (await join(s, leadKeys, "m1")).body.agent;
+    await join(s, otherKeys, "m2");
+    await s.call(s.head, "/api/head/lead", { agent: lead, area: "T-1", grant: true });
+
+    expect((await s.call(leadKeys, "/api/head/post", { title: "x", body: "", parent: null })).status).toBe(403);
+    expect((await s.call(leadKeys, "/api/head/lead", { agent: lead, area: "T-1", grant: false })).status).toBe(403);
+    expect((await s.call(leadKeys, "/api/head/close", { task: "T-3", status: "withdrawn" })).status).toBe(403);
+
+    const own = await s.call(leadKeys, "/api/propose", { kind: "new_task", task: "T-2", title: "Lead's own" });
+    expect((await s.call(leadKeys, "/api/lead/decide", { proposal: own.body.proposal, accept: true })).status).toBe(403);
+
+    const root = await s.call(otherKeys, "/api/propose", { kind: "new_task", task: null, title: "Root idea" });
+    expect((await s.call(leadKeys, "/api/lead/decide", { proposal: root.body.proposal, accept: true })).status).toBe(403);
+    const outside = await s.call(s.head, "/api/head/post", { title: "Outside", body: "", parent: null });
+    const outsideProp = await s.call(otherKeys, "/api/propose", { kind: "new_task", task: outside.body.task, title: "Outside idea" });
+    expect((await s.call(leadKeys, "/api/lead/decide", { proposal: outsideProp.body.proposal, accept: true })).status).toBe(403);
+
+    expect((await s.call(otherKeys, "/api/lead/post", { title: "x", body: "", parent: "T-2" })).status).toBe(403);
+    const inside = await s.call(otherKeys, "/api/propose", { kind: "new_task", task: "T-2", title: "Inside idea" });
+    expect((await s.call(otherKeys, "/api/lead/decide", { proposal: inside.body.proposal, accept: true })).status).toBe(403);
+
+    await s.call(s.head, "/api/head/lead", { agent: lead, area: "T-1", grant: false });
+    expect((await s.call(leadKeys, "/api/lead/post", { title: "x", body: "", parent: "T-2" })).status).toBe(403);
+    expect((await s.call(leadKeys, "/api/lead/decide", { proposal: inside.body.proposal, accept: true })).status).toBe(403);
+
+    await s.call(s.head, "/api/head/lead", { agent: lead, area: "T-1", grant: true });
+    await s.call(s.head, "/api/head/rule", { rules: { accept: "votes:1" } });
+    expect((await s.call(leadKeys, "/api/lead/decide", { proposal: inside.body.proposal, accept: true })).status).toBe(403);
+  });
+
+  test("propose duplicate: open task conflicts; own and repeat duplicates are no-ops", async () => {
+    const s = setup({ accept: { mode: "votes", votes: 2 } });
+    const a = generateKeyPair(), b = generateKeyPair();
+    const aId = (await join(s, a, "m1")).body.agent;
+    await join(s, b, "m2");
+
+    const taskDup = await s.call(b, "/api/propose", { kind: "new_task", task: "T-1", title: "Lemma ONE" });
+    expect(taskDup.status).toBe(409);
+    expect(taskDup.body.error).toContain("already covers this");
+    expect(taskDup.body.detail).toContain("minga next");
+    expect(s.store.since(0).some((e) => e.type === "proposal.made")).toBe(false);
+
+    const p = await s.call(b, "/api/propose", { kind: "new_task", task: "T-1", title: "Fresh idea" });
+    expect(p.body.proposal).toBe("P-1");
+    const own = await s.call(b, "/api/propose", { kind: "new_task", task: "T-1", title: "a fresh IDEA!" });
+    expect(own.status).toBe(200);
+    expect(own.body).toMatchObject({ proposal: "P-1", duplicateOf: { proposal: "P-1" } });
+    expect(own.body.decided).toBeUndefined();
+    expect(s.store.since(0).filter((e) => e.type === "proposal.voted")).toHaveLength(0);
+
+    const voted = await s.call(a, "/api/propose", { kind: "new_task", task: "T-1", title: "fresh idea" });
+    expect(voted.body).toMatchObject({ proposal: "P-1", duplicateOf: { proposal: "P-1" } });
+    const votes = s.store.since(0).filter((e) => e.type === "proposal.voted");
+    expect(votes).toHaveLength(1);
+    expect(votes[0]!.data).toMatchObject({ proposal: "P-1", agent: aId, approve: true, duplicate: true });
+
+    const again = await s.call(a, "/api/propose", { kind: "new_task", task: "T-1", title: "FRESH IDEA" });
+    expect(again.body).toMatchObject({ proposal: "P-1", duplicateOf: { proposal: "P-1" } });
+    expect(s.store.since(0).filter((e) => e.type === "proposal.voted")).toHaveLength(1);
+    expect(s.store.since(0).filter((e) => e.type === "proposal.made")).toHaveLength(1);
+  });
+
+  test("propose duplicate becomes an approving vote that decides the existing proposal", async () => {
+    const s = setup();
+    const a = generateKeyPair(), b = generateKeyPair();
+    const aId = (await join(s, a, "m1")).body.agent;
+    await join(s, b, "m2");
+    const asg = (await s.call(a, "/api/next", {})).body.assignment;
+    expect((await submitAndWait(s, a, asg.attempt, "QED")).body.status).toBe("accepted");
+    expect(s.app.state.agents[aId]!.accepted).toBe(1);
+
+    const p = await s.call(b, "/api/propose", { kind: "new_task", task: "T-1", title: "The extra lemma" });
+    expect(p.body.proposal).toBe("P-1");
+    const dup = await s.call(a, "/api/propose", { kind: "new_task", task: "T-1", title: "an extra LEMMA" });
+    expect(dup.status).toBe(200);
+    expect(dup.body.proposal).toBe("P-1");
+    expect(dup.body.decided).toEqual({ accepted: true, by: "vote" });
+    expect(s.store.since(0).filter((e) => e.type === "proposal.made")).toHaveLength(1);
+    const created = Object.values(s.app.state.tasks).find((t) => t.title === "The extra lemma")!;
+    expect(created.parent).toBe("T-1");
+    const createdEvent = s.store.since(0).find((e) => e.type === "task.posted" && e.data.task === created.id);
+    expect(createdEvent?.type === "task.posted" ? createdEvent.data.by : null).toBe("vote");
+    expect((await s.get("/api/metrics")).body.coordination.duplicateProposals).toBe(1);
+
+    // The accepted proposal produced an open task, so later duplicates conflict with it.
+    expect((await s.call(b, "/api/propose", { kind: "new_task", task: "T-1", title: "extra lemma" })).status).toBe(409);
+  });
+
+  test("coordination stats appear in metrics and the view, and survive a restart", async () => {
+    const s = setup();
+    expect((await s.get("/api/metrics")).body.coordination).toMatchObject({ closes: 0, duplicateProposals: 0 });
+    // The view is cached per seq for up to a second, so only read it after the close.
+    expect((await s.call(s.head, "/api/head/close", { task: "T-3", status: "withdrawn" })).status).toBe(200);
+    expect((await s.get("/api/metrics")).body.coordination.closes).toBe(1);
+    expect((await s.get("/api/view")).body.coordination.closes).toBe(1);
+
+    const restarted = s.make();
+    expect((await s.get("/api/metrics", restarted)).body.coordination.closes).toBe(1);
+    expect((await s.get("/api/view", restarted)).body.coordination.closes).toBe(1);
+  });
 });
