@@ -462,7 +462,24 @@ export function createApp(deps: AppDeps) {
     }
   }
 
+  /** Submissions in review this agent may vote on (vote modes only), so idle agents review. */
+  function reviewableBy(agent: AgentId): number {
+    if (cfg.review.mode !== "votes" && cfg.review.mode !== "head-or-votes") return 0;
+    let n = 0;
+    for (const id of state.index.reviewSubmissions ?? []) if (reviewEligible(state, id, agent).ok) n += 1;
+    return n;
+  }
+  function withReviews(agent: AgentId, r: NextResponse): NextResponse {
+    const n = reviewableBy(agent);
+    return n ? { ...r, reviews: n } : r;
+  }
+
   function next(agent: AgentId, b: NextRequest, signal?: AbortSignal): NextResponse | Promise<NextResponse> {
+    const r = nextInner(agent, b, signal);
+    return r instanceof Promise ? r.then((x) => withReviews(agent, x)) : withReviews(agent, r);
+  }
+
+  function nextInner(agent: AgentId, b: NextRequest, signal?: AbortSignal): NextResponse | Promise<NextResponse> {
     const a = agentOrThrow(agent);
     sweep();
     const model = b.model === undefined ? a.model : str(b.model, "model", 80);

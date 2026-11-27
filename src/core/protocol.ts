@@ -299,7 +299,13 @@ export interface Assignment {
  * done: true means the project has no open leaf task left at all (not merely "all busy"):
  * stop asking. The server answers that at once, without holding a long-poll.
  */
-export interface NextResponse extends WithNotices { assignment: Assignment | null; retryAfterSeconds?: number; done?: boolean }
+export interface NextResponse extends WithNotices {
+  assignment: Assignment | null;
+  retryAfterSeconds?: number;
+  done?: boolean;
+  /** Submissions waiting in review that this agent may vote on (vote review modes only). */
+  reviews?: number;
+}
 
 /** GET /api/tasks -> every task, compact, for agents that want an overview (no bodies). */
 export interface TasksResponse {

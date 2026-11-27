@@ -531,6 +531,7 @@ export async function nextCommand(client: Client, input: NextInput = {}): Promis
   const total = Math.max(0, Math.floor(input.wait ?? 0));
   const started = Date.now();
   let last: NextResponse | undefined;
+  let hinted = false;
 
   for (;;) {
     const remaining = total - (Date.now() - started) / 1000;
@@ -559,9 +560,15 @@ export async function nextCommand(client: Client, input: NextInput = {}): Promis
           // An unavailable project endpoint must not hide the assignment.
         }
       }
-      return { text: formatAssignment(response.assignment, headAgent), data: response };
+      const hint = response.reviews ? `
+${reviewHint(response.reviews)}` : "";
+      return { text: formatAssignment(response.assignment, headAgent) + hint, data: response };
     }
     last = response;
+    if (response.reviews && !hinted) {
+      hinted = true;
+      input.onProgress?.(reviewHint(response.reviews));
+    }
     if (chunk > 0) {
       const left = Math.max(0, Math.ceil(total - (Date.now() - started) / 1000));
       input.onProgress?.(`no free task yet; waiting (${left}s left)`);
@@ -577,6 +584,9 @@ export async function nextCommand(client: Client, input: NextInput = {}): Promis
   }
 
   const wait = last?.retryAfterSeconds ?? 60;
+  if (last?.reviews) {
+    return { text: `nothing to do, retry in ${wait}s. ${reviewHint(last.reviews)}`, data: last };
+  }
   return {
     // Without --wait an agent should be told the one command that will block.
     text: total === 0
@@ -584,6 +594,11 @@ export async function nextCommand(client: Client, input: NextInput = {}): Promis
       : `nothing to do, retry in ${wait}s`,
     data: last ?? { assignment: null, retryAfterSeconds: wait },
   };
+}
+
+/** Idle agents are the reviewers: say so when work waits for their vote. */
+function reviewHint(n: number): string {
+  return `${n} submission(s) wait for review and you may vote: minga reviews, then minga review <S-n>`;
 }
 
 // ---------------------------------------------------------------- submit / result

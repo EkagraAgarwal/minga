@@ -12,7 +12,7 @@ import { formatHeadKey, generateKeyPair, signRequest, type KeyPair } from "../sr
 import { openEventStore } from "../src/log/store.ts";
 import { createApp } from "../src/server/app.ts";
 
-type Over = Partial<Pick<ProjectConfig, "protect" | "gates" | "review" | "holdout">> & { oneTask?: boolean };
+type Over = Partial<Pick<ProjectConfig, "protect" | "gates" | "review" | "holdout">> & { oneTask?: boolean; extraTask?: boolean };
 
 function setup(over: Over = {}) {
   const head = generateKeyPair();
@@ -26,7 +26,7 @@ function setup(over: Over = {}) {
       roles: { explore: 0, build: 1, attack: 0, distill: 0, plan: 0 },
       accept: { mode: "head-or-votes", votes: 1 }, defaultPoints: 10,
     },
-    seedTasks: over.oneTask ? [{ title: "Fix add", body: "" }] : [{ title: "Fix add", body: "" }, { title: "Fix sub", body: "" }],
+    seedTasks: over.oneTask ? [{ title: "Fix add", body: "" }] : [{ title: "Fix add", body: "" }, { title: "Fix sub", body: "" }, ...(over.extraTask ? [{ title: "Fix mul", body: "" }] : [])],
     protect: over.protect ?? ["project.toml"],
     gates: over.gates ?? { maxFiles: 0, maxChangedLines: 0, forbid: [], warn: [] },
     review: over.review ?? { mode: "none" },
@@ -322,6 +322,30 @@ describe("review", () => {
     expect(vb.body.status).toBe("rejected");
     expect(vb.body.stale).toBe(true);
     expect((await s.get("/api/reviews")).body.reviews).toEqual([]);
+  });
+
+  test("next tells an eligible idle agent how many submissions it may review", async () => {
+    const s = setup({ review: { mode: "votes", votes: 2 }, extraTask: true });
+    const reviewer = await s.agent("m-v");
+    const author = await s.agent("m-a");
+    const atR = await s.take(reviewer);
+    const pre = await s.submit(reviewer, atR.attempt, FIX);
+    await s.call(s.head, "/api/head/review", { submission: pre.body.id, approve: true });
+    await s.get(`/api/submission/${pre.body.id}?wait=5`);
+    const author2 = await s.agent("m-b");
+    const atA = await s.take(author);
+    const atB = await s.take(author2);
+    expect(atB.task).not.toBe(atA.task);
+    const r = await s.submit(author, atA.attempt, { "src/sub.ts": "PASS\n" });
+    const r2 = await s.submit(author2, atB.attempt, { "src/mul.ts": "PASS\n" });
+    expect([r.body.status, r2.body.status]).toEqual(["review", "review"]);
+    // Whichever task the reviewer is given, it may still vote on the other one.
+    const n = await s.call(reviewer, "/api/next", {});
+    expect(n.body.assignment).toBeTruthy();
+    expect(n.body.reviews).toBe(1);
+    // The author is not told to review its own work.
+    const own = await s.call(author, "/api/next", {});
+    expect(own.body.reviews).toBeUndefined();
   });
 
   test("review = none keeps the 0.2 behaviour, and review routes say so", async () => {
