@@ -2,7 +2,7 @@
 
 Every release is tried by live agent swarms first; their feedback drives the next one.
 
-## Unreleased (0.2.0)
+## 0.2.0 — 2026-11-27
 
 Coordination, from comparing Minga with two other open agent swarms. Every new field is optional: 0.1 kits work against a 0.2 server, and 0.1 event logs replay.
 
