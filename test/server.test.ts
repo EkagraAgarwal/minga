@@ -14,6 +14,10 @@ function setup(over: Partial<ProjectConfig["rules"]> = {}, opts: { poolSize?: nu
     name: "demo", goal: "Prove things", scope: "Edit only proofs/.", check: "check {files}", checkTimeoutSeconds: 30,
     paths: ["proofs/**"], head: formatHeadKey(head.publicKey), branch: "main",
     checkConcurrency: opts.poolSize ?? 1, checkKeep: [], recheck: opts.recheck ?? "always",
+    protect: ["project.toml"],
+    gates: { maxFiles: 0, maxChangedLines: 0, forbid: [], warn: [] },
+    review: { mode: "none" },
+    sandbox: { mode: "none" },
     rules: {
       width: 2, leaseMinutes: 45, maxAttemptsPerAgent: 1,
       roles: { explore: 0, build: 1, attack: 0, distill: 0, plan: 0 },

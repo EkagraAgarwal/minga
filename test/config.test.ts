@@ -4,7 +4,9 @@ import {
   loadProject,
   parseAcceptPolicy,
   parseProject,
+  parseReviewPolicy,
   pathAllowed,
+  pathProtected,
 } from "../src/project/config.ts";
 import { formatHeadKey, generateKeyPair, parseHeadKey } from "../src/identity/keys.ts";
 
@@ -49,6 +51,11 @@ describe("parseProject", () => {
       roles: { explore: 2, build: 5, attack: 2, distill: 1, plan: 0 },
     });
     expect(cfg.seedTasks).toEqual([]);
+    expect(cfg.protect).toEqual(["project.toml"]);
+    expect(cfg.gates).toEqual({ maxFiles: 0, maxChangedLines: 0, forbid: [], warn: [] });
+    expect(cfg.review).toEqual({ mode: "none" });
+    expect(cfg.holdout).toBeUndefined();
+    expect(cfg.sandbox).toEqual({ mode: "none" });
   });
 
   for (const key of Object.keys(REQUIRED_FIELDS)) {
@@ -313,6 +320,254 @@ under = "root"
     expect(() => parseProject(task(`["${"x".repeat(301)}"]`))).toThrow(/longer than 300/);
     expect(() => parseProject(task(`[${Array.from({ length: 51 }, () => '"x"').join(",")}]`))).toThrow(/at most 50/);
     expect(parseProject(task('["src/a.ts", "lib/"]')).seedTasks[0]!.paths).toEqual(["src/a.ts", "lib/"]);
+  });
+});
+
+describe("protect", () => {
+  test("parses globs and always includes project.toml once", () => {
+    const cfg = parseProject(
+      baseToml() + 'protect = ["test/**", "project.toml", "src/config.ts"]\n',
+    );
+    expect(cfg.protect).toEqual(["project.toml", "test/**", "src/config.ts"]);
+    expect(parseProject(baseToml() + 'protect = ["test/**"]\n').protect).toEqual([
+      "project.toml",
+      "test/**",
+    ]);
+  });
+
+  test("rejects invalid forms naming the key", () => {
+    expect(() => parseProject(baseToml() + 'protect = "test/**"\n')).toThrow(
+      /protect must be an array of globs/,
+    );
+    expect(() => parseProject(baseToml() + "protect = [3]\n")).toThrow(
+      /protect\[0\] must be a non-empty string glob/,
+    );
+    expect(() => parseProject(baseToml() + 'protect = ["  "]\n')).toThrow(
+      /protect\[0\] must be a non-empty string glob/,
+    );
+    expect(() => parseProject(baseToml() + 'protect = ["test/**", ""]\n')).toThrow(
+      /protect\[1\] must be a non-empty string glob/,
+    );
+  });
+});
+
+describe("parseReviewPolicy", () => {
+  test("parses every accepted form, in the file and directly", () => {
+    const cases = [
+      ["none", { mode: "none" }],
+      ["head", { mode: "head" }],
+      ["votes:2", { mode: "votes", votes: 2 }],
+      ["head-or-votes:5", { mode: "head-or-votes", votes: 5 }],
+      [" head ", { mode: "head" }],
+    ] as const;
+    for (const [text, expected] of cases) {
+      expect(parseReviewPolicy(text)).toEqual(expected);
+    }
+    expect(parseProject(baseToml() + 'review = "head-or-votes:5"\n').review).toEqual({
+      mode: "head-or-votes",
+      votes: 5,
+    });
+  });
+
+  test("rejects invalid policies naming review", () => {
+    for (const bad of ["", "maybe", "votes", "votes:0", "votes:1.5", "votes:999999999999999999999", "unknown:2"]) {
+      expect(() => parseReviewPolicy(bad)).toThrow(/review/);
+    }
+    expect(() => parseProject(baseToml() + "review = 5\n")).toThrow(/review must be a string/);
+    expect(() => parseProject(baseToml() + '[review]\nmode = "head"\n')).toThrow(/review/);
+  });
+});
+
+describe("gates", () => {
+  test("parses numbers, string rules and table rules", () => {
+    const cfg = parseProject(
+      baseToml() +
+        `[gates]
+max_files = 5
+max_changed_lines = 200
+forbid = [{ pattern = "TODO", paths = ["src/**"], reason = "no TODOs" }, "console\\\\.log"]
+warn = ["skip\\\\("]
+`,
+    );
+    expect(cfg.gates).toEqual({
+      maxFiles: 5,
+      maxChangedLines: 200,
+      forbid: [
+        { pattern: "TODO", paths: ["src/**"], reason: "no TODOs" },
+        { pattern: "console\\.log" },
+      ],
+      warn: [{ pattern: "skip\\(" }],
+    });
+  });
+
+  test("rejects invalid numbers and unknown keys", () => {
+    expect(() => parseProject(baseToml() + "[gates]\nmax_files = -1\n")).toThrow(
+      /gates\.max_files must be an integer >= 0/,
+    );
+    expect(() => parseProject(baseToml() + '[gates]\nmax_changed_lines = "x"\n')).toThrow(
+      /gates\.max_changed_lines must be an integer >= 0/,
+    );
+    expect(() => parseProject(baseToml() + "[gates]\nbogus = 1\n")).toThrow(
+      /gates\.bogus is not a known key/,
+    );
+    expect(() => parseProject(baseToml() + 'gates = "strict"\n')).toThrow(/gates must be a table/);
+  });
+
+  test("validates rule shapes naming the rule index", () => {
+    expect(() => parseProject(baseToml() + '[gates]\nforbid = "TODO"\n')).toThrow(
+      /gates\.forbid must be an array/,
+    );
+    expect(() => parseProject(baseToml() + "[gates]\nforbid = [3]\n")).toThrow(
+      /gates\.forbid\[0\] must be a string or a table/,
+    );
+    expect(() =>
+      parseProject(baseToml() + '[gates]\nforbid = [{ pattern = "TODO", bogus = 1 }]\n'),
+    ).toThrow(/gates\.forbid\[0\] has unknown key "bogus"/);
+    expect(() => parseProject(baseToml() + '[gates]\nforbid = [{ paths = ["src/**"] }]\n')).toThrow(
+      /gates\.forbid\[0\]\.pattern/,
+    );
+    expect(() =>
+      parseProject(baseToml() + '[gates]\nforbid = [{ pattern = "TODO", paths = [3] }]\n'),
+    ).toThrow(/gates\.forbid\[0\]\.paths\[0\]/);
+    expect(() =>
+      parseProject(baseToml() + '[gates]\nforbid = [{ pattern = "TODO", reason = 3 }]\n'),
+    ).toThrow(/gates\.forbid\[0\]\.reason must be a string/);
+  });
+
+  test("rejects regexes that do not compile", () => {
+    expect(() => parseProject(baseToml() + '[gates]\nforbid = ["("]\n')).toThrow(
+      /gates\.forbid\[0\].*regex/,
+    );
+    expect(() => parseProject(baseToml() + '[gates]\nwarn = [{ pattern = "[" }]\n')).toThrow(
+      /gates\.warn\[0\]\.pattern.*regex/,
+    );
+  });
+});
+
+describe("holdout", () => {
+  test("parses a holdout table", () => {
+    const cfg = parseProject(
+      baseToml() + '[holdout]\ncommand = "bun test --private"\ndir = "/tmp/minga-holdout"\n',
+    );
+    expect(cfg.holdout).toEqual({
+      command: "bun test --private",
+      dir: "/tmp/minga-holdout",
+    });
+  });
+
+  test("requires command and dir and rejects unsafe dirs", () => {
+    expect(() => parseProject(baseToml() + '[holdout]\ncommand = "x"\n')).toThrow(
+      /holdout\.dir/,
+    );
+    expect(() => parseProject(baseToml() + '[holdout]\ndir = "tests"\n')).toThrow(
+      /holdout\.command/,
+    );
+    expect(() =>
+      parseProject(baseToml() + '[holdout]\ncommand = ""\ndir = "tests"\n'),
+    ).toThrow(/holdout\.command/);
+    for (const dir of ["..", "a/../b", ".git", ".git/hooks", "tests/.git/x"]) {
+      expect(() =>
+        parseProject(baseToml() + `[holdout]\ncommand = "x"\ndir = "${dir}"\n`),
+      ).toThrow(/holdout\.dir/);
+    }
+    expect(() =>
+      parseProject(baseToml() + '[holdout]\ncommand = "x"\ndir = "."\n'),
+    ).toThrow(/holdout\.dir/);
+  });
+
+  test("rejects unknown keys", () => {
+    expect(() => parseProject(baseToml() + '[holdout]\ncommand = "x"\ndir = "d"\nbogus = 1\n')).toThrow(
+      /holdout\.bogus is not a known key/,
+    );
+    expect(() => parseProject(baseToml() + 'holdout = "x"\n')).toThrow(/holdout must be a table/);
+  });
+});
+
+describe("sandbox", () => {
+  test("parses docker with defaults and explicit values", () => {
+    expect(
+      parseProject(baseToml() + '[sandbox]\nmode = "docker"\nimage = "oven/bun:1"\n').sandbox,
+    ).toEqual({
+      mode: "docker",
+      image: "oven/bun:1",
+      network: "none",
+      memory: "2g",
+      cpus: 2,
+      pids: 512,
+    });
+    expect(
+      parseProject(
+        baseToml() +
+          `[sandbox]
+mode = "docker"
+image = "oven/bun:1"
+network = "bridge"
+memory = "512m"
+cpus = 1.5
+pids = 128
+`,
+      ).sandbox,
+    ).toEqual({
+      mode: "docker",
+      image: "oven/bun:1",
+      network: "bridge",
+      memory: "512m",
+      cpus: 1.5,
+      pids: 128,
+    });
+    expect(parseProject(baseToml() + '[sandbox]\nmode = "none"\n').sandbox).toEqual({
+      mode: "none",
+    });
+  });
+
+  test("rejects invalid modes, values and keys", () => {
+    expect(() => parseProject(baseToml() + '[sandbox]\nmode = "podman"\n')).toThrow(
+      /sandbox\.mode/,
+    );
+    expect(() => parseProject(baseToml() + '[sandbox]\nimage = "x"\n')).toThrow(
+      /sandbox\.image is only valid/,
+    );
+    expect(() => parseProject(baseToml() + '[sandbox]\nmode = "docker"\n')).toThrow(
+      /sandbox\.image/,
+    );
+    expect(() =>
+      parseProject(baseToml() + '[sandbox]\nmode = "docker"\nimage = "x"\nnetwork = "host"\n'),
+    ).toThrow(/sandbox\.network/);
+    expect(() =>
+      parseProject(baseToml() + '[sandbox]\nmode = "docker"\nimage = "x"\nmemory = "2gb"\n'),
+    ).toThrow(/sandbox\.memory/);
+    for (const cpus of ["0", "-1", '"2"']) {
+      expect(() =>
+        parseProject(baseToml() + `[sandbox]\nmode = "docker"\nimage = "x"\ncpus = ${cpus}\n`),
+      ).toThrow(/sandbox\.cpus must be a number > 0/);
+    }
+    for (const pids of ["15", "1.5"]) {
+      expect(() =>
+        parseProject(baseToml() + `[sandbox]\nmode = "docker"\nimage = "x"\npids = ${pids}\n`),
+      ).toThrow(/sandbox\.pids must be an integer >= 16/);
+    }
+    expect(() => parseProject(baseToml() + "[sandbox]\nbogus = 1\n")).toThrow(
+      /sandbox\.bogus is not a known key/,
+    );
+    expect(() => parseProject(baseToml() + 'sandbox = "none"\n')).toThrow(
+      /sandbox must be a table/,
+    );
+  });
+});
+
+describe("pathProtected", () => {
+  const cfg = parseProject(baseToml() + 'protect = ["test/**"]\n');
+
+  test("always protects project.toml", () => {
+    expect(pathProtected(cfg, "project.toml")).toBe(true);
+    expect(pathProtected(parseProject(baseToml()), "project.toml")).toBe(true);
+  });
+
+  test("matches protect globs and nothing else", () => {
+    expect(pathProtected(cfg, "test/config.test.ts")).toBe(true);
+    expect(pathProtected(cfg, "test/unit/helpers.test.ts")).toBe(true);
+    expect(pathProtected(cfg, "src/config.ts")).toBe(false);
+    expect(pathProtected(cfg, "tests/config.test.ts")).toBe(false);
   });
 });
 

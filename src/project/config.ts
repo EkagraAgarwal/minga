@@ -11,8 +11,19 @@ import type {
   ParseAcceptPolicy,
   ParseProject,
   PathAllowed,
+  PathProtected,
 } from "../core/contracts.ts";
-import type { ProjectConfig, Role, Rules, SeedTask } from "../core/types.ts";
+import type {
+  GateRule,
+  Gates,
+  Holdout,
+  ProjectConfig,
+  ReviewPolicy,
+  Role,
+  Rules,
+  Sandbox,
+  SeedTask,
+} from "../core/types.ts";
 import { ROLES } from "../core/types.ts";
 import { parseHeadKey } from "../identity/keys.ts";
 
@@ -42,6 +53,11 @@ const TOP_LEVEL_KEYS = new Set([
   "recheck",
   "rules",
   "task",
+  "protect",
+  "review",
+  "gates",
+  "holdout",
+  "sandbox",
 ]);
 
 const RECHECK_VALUES = new Set(["always", "on-overlap"]);
@@ -56,6 +72,11 @@ const RULE_KEYS = new Set([
 ]);
 
 const TASK_KEYS = new Set(["title", "body", "key", "under", "points", "paths"]);
+
+const GATE_KEYS = new Set(["max_files", "max_changed_lines", "forbid", "warn"]);
+const GATE_RULE_KEYS = new Set(["pattern", "paths", "reason"]);
+const HOLDOUT_KEYS = new Set(["command", "dir"]);
+const SANDBOX_KEYS = new Set(["mode", "image", "network", "memory", "cpus", "pids"]);
 
 function fail(message: string): never {
   throw new Error(`project.toml: ${message}`);
@@ -111,6 +132,25 @@ export const parseAcceptPolicy: ParseAcceptPolicy = (text) => {
   }
   return { mode, votes };
 };
+
+/** Parses `review`: "none" | "head" | "votes:N" | "head-or-votes:N". */
+export function parseReviewPolicy(text: string): ReviewPolicy {
+  const trimmed = text.trim();
+  if (trimmed === "none") return { mode: "none" };
+  if (trimmed === "head") return { mode: "head" };
+
+  const match = /^(head-or-votes|votes):(\d+)$/.exec(trimmed);
+  if (!match) {
+    fail(
+      `review must be "none", "head", "votes:N" or "head-or-votes:N" (got "${text}")`,
+    );
+  }
+  const votes = Number(match[2]);
+  if (!Number.isSafeInteger(votes) || votes < 1) {
+    fail(`review threshold must be an integer >= 1 (got "${text}")`);
+  }
+  return { mode: match[1] as "votes" | "head-or-votes", votes };
+}
 
 function parseRoles(value: unknown): Record<Role, number> {
   const roles: Record<Role, number> = { ...DEFAULT_ROLES };
@@ -183,6 +223,29 @@ function parsePaths(value: unknown): string[] {
     paths.push(entry);
   });
   return paths;
+}
+
+/** Validates an array of non-empty Bun.Glob patterns, reporting failures under `label`. */
+function parseGlobArray(value: unknown, label: string): string[] {
+  if (!Array.isArray(value)) fail(`${label} must be an array of globs`);
+  return value.map((entry, index) => {
+    const item = `${label}[${index}]`;
+    if (typeof entry !== "string" || entry.trim() === "") {
+      fail(`${item} must be a non-empty string glob`);
+    }
+    try {
+      new Bun.Glob(entry);
+    } catch {
+      fail(`${item} is not a valid glob (got "${entry}")`);
+    }
+    return entry;
+  });
+}
+
+/** Globs no submission may write; project.toml is always first and never duplicated. */
+function parseProtect(value: unknown): string[] {
+  if (value === undefined) return ["project.toml"];
+  return [...new Set(["project.toml", ...parseGlobArray(value, "protect")])];
 }
 
 /** Repo-relative, non-glob paths preserved between checks (build caches). */
@@ -306,6 +369,118 @@ function parseTasks(value: unknown): SeedTask[] {
   return tasks;
 }
 
+function parseGateRules(value: unknown, label: string): GateRule[] {
+  if (value === undefined) return [];
+  if (!Array.isArray(value)) {
+    fail(`${label} must be an array of regex sources or tables`);
+  }
+
+  return value.map((entry, index) => {
+    const item = `${label}[${index}]`;
+    if (typeof entry === "string") {
+      validateRegex(entry, item);
+      return { pattern: entry };
+    }
+    if (!isTable(entry)) fail(`${item} must be a string or a table`);
+
+    for (const key of Object.keys(entry)) {
+      if (!GATE_RULE_KEYS.has(key)) fail(`${item} has unknown key "${key}"`);
+    }
+
+    const pattern = requiredString(entry, "pattern", `${item}.pattern`);
+    validateRegex(pattern, `${item}.pattern`);
+    const rule: GateRule = { pattern };
+    if (entry.paths !== undefined) rule.paths = parseGlobArray(entry.paths, `${item}.paths`);
+    if (entry.reason !== undefined) {
+      if (typeof entry.reason !== "string") fail(`${item}.reason must be a string`);
+      rule.reason = entry.reason;
+    }
+    return rule;
+  });
+}
+
+function validateRegex(pattern: string, label: string): void {
+  try {
+    new RegExp(pattern);
+  } catch {
+    fail(`${label} is not a valid regex (got "${pattern}")`);
+  }
+}
+
+function parseGates(value: unknown): Gates {
+  if (value === undefined) return { maxFiles: 0, maxChangedLines: 0, forbid: [], warn: [] };
+  if (!isTable(value)) fail("gates must be a table");
+
+  for (const key of Object.keys(value)) {
+    if (!GATE_KEYS.has(key)) fail(`gates.${key} is not a known key`);
+  }
+
+  return {
+    maxFiles: integerField(value, "max_files", "gates.max_files", 0, 0),
+    maxChangedLines: integerField(
+      value,
+      "max_changed_lines",
+      "gates.max_changed_lines",
+      0,
+      0,
+    ),
+    forbid: parseGateRules(value.forbid, "gates.forbid"),
+    warn: parseGateRules(value.warn, "gates.warn"),
+  };
+}
+
+function parseHoldout(value: unknown): Holdout | undefined {
+  if (value === undefined) return undefined;
+  if (!isTable(value)) fail("holdout must be a table");
+
+  for (const key of Object.keys(value)) {
+    if (!HOLDOUT_KEYS.has(key)) fail(`holdout.${key} is not a known key`);
+  }
+
+  const command = requiredString(value, "command", "holdout.command");
+  const dir = requiredString(value, "dir", "holdout.dir");
+  if (dir.includes("..")) fail('holdout.dir must not contain ".."');
+  if (dir === ".") fail('holdout.dir must not be "."');
+  if (/(^|[\\/])\.git([\\/]|$)/.test(dir)) fail("holdout.dir must not be inside .git");
+  return { command, dir };
+}
+
+function parseSandbox(value: unknown): Sandbox {
+  if (value === undefined) return { mode: "none" };
+  if (!isTable(value)) fail("sandbox must be a table");
+
+  for (const key of Object.keys(value)) {
+    if (!SANDBOX_KEYS.has(key)) fail(`sandbox.${key} is not a known key`);
+  }
+
+  const mode = optionalString(value, "mode", "sandbox.mode", "none");
+  if (mode === "none") {
+    for (const key of Object.keys(value)) {
+      if (key !== "mode") fail(`sandbox.${key} is only valid when sandbox.mode is "docker"`);
+    }
+    return { mode: "none" };
+  }
+  if (mode !== "docker") fail('sandbox.mode must be "none" or "docker"');
+
+  const image = requiredString(value, "image", "sandbox.image");
+  const network = optionalString(value, "network", "sandbox.network", "none");
+  if (network !== "none" && network !== "bridge") {
+    fail('sandbox.network must be "none" or "bridge"');
+  }
+  const memory = optionalString(value, "memory", "sandbox.memory", "2g");
+  if (!/^\d+[kmg]?$/i.test(memory)) {
+    fail('sandbox.memory must be a number with an optional k, m or g suffix');
+  }
+
+  const cpus = value.cpus === undefined ? 2 : value.cpus;
+  if (typeof cpus !== "number" || !Number.isFinite(cpus) || cpus <= 0) {
+    fail("sandbox.cpus must be a number > 0");
+  }
+  const pids = integerField(value, "pids", "sandbox.pids", 512, 16);
+
+  return { mode: "docker", image, network, memory, cpus, pids };
+}
+
 /** Parses TOML text, applies defaults, validates. */
 export const parseProject: ParseProject = (tomlText) => {
   let parsed: object;
@@ -321,6 +496,9 @@ export const parseProject: ParseProject = (tomlText) => {
   for (const key of Object.keys(parsed)) {
     if (!TOP_LEVEL_KEYS.has(key)) fail(`unknown top-level key "${key}"`);
   }
+
+  const reviewText = parsed.review === undefined ? "none" : parsed.review;
+  if (typeof reviewText !== "string") fail("review must be a string");
 
   const config: ProjectConfig = {
     name: requiredString(parsed, "name"),
@@ -342,6 +520,11 @@ export const parseProject: ParseProject = (tomlText) => {
     recheck: parseRecheck(parsed.recheck),
     rules: parseRules(parsed.rules),
     seedTasks: parseTasks(parsed.task),
+    protect: parseProtect(parsed.protect),
+    gates: parseGates(parsed.gates),
+    review: parseReviewPolicy(reviewText),
+    holdout: parseHoldout(parsed.holdout),
+    sandbox: parseSandbox(parsed.sandbox),
   };
 
   if (config.branch.trim() === "") fail("branch must be a non-empty string");
@@ -378,4 +561,10 @@ export const pathAllowed: PathAllowed = (cfg, path) => {
   if (segments[0] === ".git" || segments[0] === ".minga") return false;
 
   return cfg.paths.some((pattern) => new Bun.Glob(pattern).match(path));
+};
+
+/** True when `path` is project.toml or matches one of cfg.protect's globs. */
+export const pathProtected: PathProtected = (cfg, path) => {
+  if (path === "project.toml") return true;
+  return cfg.protect.some((pattern) => new Bun.Glob(pattern).match(path));
 };
