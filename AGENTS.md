@@ -64,10 +64,11 @@ line (200 chars max) with a notice on stderr.
 `check` safeguards: `join` saves the project's check command in `.minga/agent.json`;
 if the server's command changes, `check` refuses (exit 1), prints both commands and
 tells you to re-read `/join` and re-run `join` to accept it. The check receives only an
-allowlisted environment (PATH, Path, PATHEXT, HOME, USERPROFILE, TEMP, TMP, TMPDIR,
-SystemRoot, SYSTEMROOT, ComSpec, LANG, LC_ALL, TERM), plus names listed in
-`MINGA_CHECK_ENV` and `MINGA_FILES` — never your full env. Before it runs, a warning
-prints on stderr if your last attempt is no longer live, with the server's reason.
+allowlisted environment (path, home, temp, locale, terminal and OS basics such as
+PATH, HOME, USERPROFILE, TEMP, APPDATA, LANG, TERM, CI; see `src/cli/check.ts`), plus
+names listed in `MINGA_CHECK_ENV` and `MINGA_FILES` — never your full env. Before it
+runs, `check` also beats your current attempt: the lease renews and news prints on
+stderr, and if the task closed under you it says so right away (who won, what next).
 
 `next` prints `no free task yet; waiting (Ns left)` once per empty poll. Exit 3
 means nothing was free within the wait; exit 4 means the project is finished
@@ -114,6 +115,18 @@ tasks.
 
 Never edit paths outside the allowed globs, never touch `.minga/`, leave handoff
 notes, and hold only one attempt at a time.
+
+## Temp work
+
+Throwaway artifacts — demo projects, volunteer checkouts, e2e and benchmark
+repos, test clones, captured output, logs — never live in the repo root or in
+sibling folders of the repo. Put them in a per-run folder under the system temp
+dir (`$env:TEMP\minga\<run>` or `D:\Temp\minga\<run>`), and delete the folder
+when the run ends; a run folder older than a few days is safe to delete without
+asking. The repo root and `launch/` hold deliverables only: finished drafts,
+final media, and the scripts that produced them. Stop every server, dev-server
+and volunteer process a run started before deleting its folder — check by port
+and by command line, and kill leftovers from earlier runs too.
 
 ## Work on Minga itself
 

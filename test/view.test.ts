@@ -74,6 +74,21 @@ const checked = (id: number, ok: boolean): NewEvent => ({
 });
 
 describe("buildView", () => {
+  test("tasks carry their declared paths and closing submission (the margin note shows them)", () => {
+    const ev = logger();
+    const state = replay(RULES, [
+      ev(join("aaa")),
+      ev({ type: "task.posted", actor: "server", data: { task: "T-1", title: "a", body: "b", parent: null, points: 3, by: "config", paths: ["src/a.ts", "lib/"] } }),
+      ev(post("T-2")),
+      ev({ type: "task.closed", actor: "aaa", data: { task: "T-2", status: "solved", agent: "aaa", submission: "S-1" } }),
+    ]);
+    const tasks = view(state).tasks;
+    expect(tasks.find((t) => t.id === "T-1")!.paths).toEqual(["src/a.ts", "lib/"]);
+    expect(tasks.find((t) => t.id === "T-1")).not.toHaveProperty("closedSubmission");
+    expect(tasks.find((t) => t.id === "T-2")!.closedSubmission).toBe("S-1");
+    expect(tasks.find((t) => t.id === "T-2")).not.toHaveProperty("paths");
+  });
+
   test("copies coordination stats and non-empty leads, omits both otherwise", () => {
     const ev = logger();
     const state = replay(RULES, [

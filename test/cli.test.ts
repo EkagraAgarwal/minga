@@ -1590,6 +1590,7 @@ describe("check safety", () => {
       writeFileSync(join(dir, "a.ts"), "x");
       const mock = mockFetch((call) => {
         if (call.url.endsWith("/api/project")) return json({ ...project, check: "node --version" });
+        if (call.url.endsWith("/api/beat")) return json({ error: "attempt A-8 ended", detail: "minga sync --discard" }, 410);
         if (call.url.endsWith("/api/attempt/A-8")) return json({
           id: "A-8", task: "T-1", agent: agentIdFromPublicKey(keys.publicKey), role: "build",
           state: "ended", endReason: "task_closed", leaseUntil: "2026-01-01T00:00:00.000Z",
@@ -1607,7 +1608,41 @@ describe("check safety", () => {
       expect(warnings[0]).toContain("warning: your last attempt A-8 is ended");
       expect(warnings[0]).toContain("T-1 was solved by S-6 from 4bec7c19de4503f8 (hy4)");
       expect(mock.calls.map((call) => new URL(call.url).pathname))
-        .toEqual(["/api/project", "/api/attempt/A-8"]);
+        .toEqual(["/api/project", "/api/beat", "/api/attempt/A-8"]);
+    });
+  });
+
+  test("on a live attempt, check is a signed beat: lease renews, news prints, notices pass through", async () => {
+    await withTempDir(async (dir) => {
+      const keys = generateKeyPair();
+      writeAgent(dir, {
+        url: "https://minga.test", agent: agentIdFromPublicKey(keys.publicKey),
+        publicKey: keys.publicKey, privateKey: keys.privateKey, model: "m", harness: "h",
+        check: "node --version",
+        lastAssignment: { attempt: "A-3", role: "build", leaseUntil: "2026-01-01T00:00:00.000Z", task: "T-2" },
+      });
+      writeFileSync(join(dir, "a.ts"), "x");
+      const note = { id: "N-4", task: "T-9", agent: "abc", kind: "idea", text: "try a heap", at: "2026-01-01T00:00:00.000Z", to: "me" };
+      const mock = mockFetch((call) => {
+        if (call.url.endsWith("/api/project")) return json({ ...project, check: "node --version" });
+        if (call.url.endsWith("/api/beat")) return json({
+          leaseUntil: "2026-01-01T00:20:00.000Z",
+          news: { taskStatus: "open", notes: [], others: [], conflicts: [] },
+          notices: [{ kind: "note", note }],
+        });
+        return json({});
+      });
+      const progress: string[] = [];
+      const outcome = await dispatch(
+        { command: "check", options: {}, positionals: ["a.ts"] },
+        { dir, fetchImpl: mock.fn, onProgress: (line) => progress.push(line) },
+      );
+      expect(outcome.code).toBe(0);
+      expect(JSON.parse(mock.calls[1]!.init.body as string)).toEqual({ attempt: "A-3" });
+      expect(progress).toEqual(["beat A-3: news: nothing new (task open, 0 other attempt(s) on it, no path conflicts)"]);
+      expect(outcome.notices?.length).toBe(1);
+      expect(outcome.notices![0]).toContain("N-4");
+      expect(mock.calls.map((call) => new URL(call.url).pathname)).toEqual(["/api/project", "/api/beat"]);
     });
   });
 });

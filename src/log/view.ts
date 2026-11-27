@@ -93,6 +93,8 @@ export const buildView: BuildView = (input: ViewInput): ViewResponse => {
     };
     if (task.closedAt !== undefined) viewTask.closedAt = task.closedAt;
     if (task.closedBy !== undefined) viewTask.closedBy = task.closedBy;
+    if (task.closedSubmission !== undefined) viewTask.closedSubmission = task.closedSubmission;
+    if (task.paths !== undefined) viewTask.paths = [...task.paths];
     tasks.push(viewTask);
   }
 

@@ -1,0 +1,3 @@
+[test]
+# launch/ holds git-ignored launch material, including seed projects whose task tests have no solutions.
+pathIgnorePatterns = ["launch/**", "dist/**"]

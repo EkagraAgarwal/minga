@@ -734,6 +734,10 @@ export function renderBeatNews(news: BeatNews): string {
   for (const c of news.conflicts) {
     lines.push(`conflict: ${c.path} also declared by ${c.attempt} on ${c.task}`);
   }
+  // Always say something, so a quiet beat reads as "nothing new", not as "no news feature".
+  if (lines.length === 0) {
+    lines.push(`news: nothing new (task ${news.taskStatus}, ${news.others.length} other attempt(s) on it, no path conflicts)`);
+  }
   return lines.join("\n");
 }
 

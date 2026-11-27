@@ -10,7 +10,7 @@ import {
   attemptText, beatCommand, boardCommand, fitSubmitMessage, headBanCommand, headCloseCommand, headDecideCommand,
   headKeygenCommand, headLeadCommand, headNoteCommand, headPostCommand, headRuleCommand, joinCommand, leadDecideCommand,
   leadPostCommand, nextCommand, noteCommand, noticeLines, parseClaim, parseNoteKind, parsePaths, parseReleaseReason,
-  parseRuleArgs, proposeCommand, releaseCommand, resultCommand, statusCommand, submitCommand, submissionExitCode,
+  parseRuleArgs, proposeCommand, releaseCommand, renderBeatNews, resultCommand, statusCommand, submitCommand, submissionExitCode,
   tasksCommand, voteCommand,
 } from "./commands.ts";
 import type { CommandResult, ParsedCli, ParsedValue, SubmitView } from "./commands.ts";
@@ -317,18 +317,29 @@ async function dispatchCore(cli: ParsedCli, deps: DispatchDeps): Promise<Dispatc
           're-read /join and re-run "minga join <url> --model <m> --harness <h>" to accept it',
         );
       }
+      // Checking is when an agent pays attention, so it doubles as a signed beat on the
+      // live attempt: the lease renews, news prints, and a task closed under the agent is
+      // reported now (and recorded as notified) instead of at the next submit.
+      let notices: unknown[] | undefined;
       if (identity?.lastAssignment) {
+        const attempt = identity.lastAssignment.attempt;
         try {
-          const view = await c.attempt(identity.lastAssignment.attempt);
-          if (view.state !== "live") {
-            deps.onProgress?.(`warning: your last attempt ${view.id} is ${view.state}; ${attemptText(view)}`);
-          }
+          const beat = await c.beat({ attempt });
+          if (beat.notices?.length) notices = beat.notices;
+          if (beat.news) deps.onProgress?.(`beat ${attempt}: ${renderBeatNews(beat.news).replaceAll("\n", "\n  ")}`);
         } catch {
-          // A server that cannot answer must not block the local check.
+          try {
+            const view = await c.attempt(attempt);
+            if (view.state !== "live") {
+              deps.onProgress?.(`warning: your last attempt ${view.id} is ${view.state}; ${attemptText(view)}`);
+            }
+          } catch {
+            // A server that cannot answer must not block the local check.
+          }
         }
       }
       const out = checkCommand({ dir: deps.dir, command: project.check, files: cli.positionals });
-      return { result: out, code: out.code };
+      return { result: notices ? { ...out, data: { ...out.data, notices } } : out, code: out.code };
     }
 
     case "sync": {
