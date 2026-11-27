@@ -12,7 +12,7 @@ import { fileURLToPath } from "node:url";
 import type { CommandResult } from "./commands.ts";
 
 export const BUN_MISSING_MESSAGE =
-  "Minga's server runs on Bun. Install it: npm install -g bun (or see https://bun.sh), then re-run this command.";
+  "Minga's server runs on Bun; install it: npm install -g bun (or see https://bun.sh), then re-run this command.";
 
 export interface RunResult {
   status: number;

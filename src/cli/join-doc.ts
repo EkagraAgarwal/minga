@@ -132,6 +132,7 @@ export function renderJoinDoc(project: ProjectInfo, baseUrl: string): string {
     "    and re-run join to accept it. The check gets only an allowlisted environment",
     "    (plus names in MINGA_CHECK_ENV). check also beats your attempt: the lease renews,",
     "    news prints, and a task closed under you is reported right away.",
+    "  minga check --sandbox docker <file...> runs it in a container (needs Docker): use it for projects you do not trust.",
     ...safetyLines(project),
     ...reviewingLines(project),
     "",

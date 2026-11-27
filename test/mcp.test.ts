@@ -147,6 +147,11 @@ describe("MCP protocol", () => {
     expect(submitted.description).toContain("wait:false");
     expect(submitted.description).toContain("minga_result");
     expect(result.description).toContain("wait:false");
+    const check = reply.result.tools.find((t: { name: string }) => t.name === "minga_check");
+    expect(check.inputSchema.properties.files.type).toBe("array");
+    expect(check.inputSchema.properties.sandbox.enum).toEqual(["docker"]);
+    expect(check.inputSchema.properties.image.type).toBe("string");
+    expect(check.description).toContain("Docker");
   });
 
   test("unknown methods use -32601; bad JSON uses -32700", async () => {
@@ -301,6 +306,17 @@ describe("tool calls", () => {
     expect(toolToCli("minga_lead_decide", { proposal: "P-1", accept: false, reason: "bad" })).toEqual({
       command: "lead", action: "decide", options: { reason: "bad" }, positionals: ["P-1", "reject"],
     });
+    expect(toolToCli("minga_check", { files: ["a.ts"] })).toEqual({
+      command: "check", options: {}, positionals: ["a.ts"],
+    });
+    expect(toolToCli("minga_check", {
+      files: ["a.ts"], sandbox: "docker", image: "alpine:3.20", network: "bridge",
+    })).toEqual({
+      command: "check",
+      options: { sandbox: "docker", image: "alpine:3.20", network: "bridge" },
+      positionals: ["a.ts"],
+    });
+    expect(() => toolToCli("minga_check", { files: [], sandbox: "podman" })).toThrow(/sandbox must be docker/);
   });
 
   test("minga_submit fits over-long messages and reports the notice", () => {

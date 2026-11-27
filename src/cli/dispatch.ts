@@ -2,6 +2,7 @@
  * One command dispatcher shared by the CLI and the MCP server. It never writes
  * to stdout: callers decide how to render `text` and `data`.
  */
+import { relative, resolve } from "node:path";
 import { generateKeyPair } from "../identity/keys.ts";
 import type { FetchLike } from "./client.ts";
 import { createClient } from "./client.ts";
@@ -20,6 +21,7 @@ import type { RuntimeDeps } from "./runtime.ts";
 import { serveCommand } from "./runtime.ts";
 import { syncCommand } from "./sync.ts";
 import { checkCommand } from "./check.ts";
+import { isProtectedPath } from "./glob.ts";
 import {
   agentPath, headPath, readAgent, readHead, resolveAgentDir, resolveDir, writeAgent, writeHead,
 } from "./store.ts";
@@ -206,6 +208,22 @@ async function dispatchCore(cli: ParsedCli, deps: DispatchDeps): Promise<Dispatc
       const fitted = fitSubmitMessage(rawMessage);
       if (fitted.notice !== undefined) deps.onProgress?.(fitted.notice);
       const { identity, identityDir, client: c } = requireAgent(deps);
+      // Fail locally before uploading: a protected path cannot be accepted, and
+      // a server without `safety` is too old to have this pre-check.
+      const project = await c.project();
+      const protect = project.safety?.protect;
+      if (protect !== undefined) {
+        const root = resolve(str(cli.options.root) ?? deps.dir);
+        for (const file of cli.positionals.slice(1)) {
+          const rel = relative(root, resolve(root, file)).replaceAll("\\", "/");
+          if (isProtectedPath(file, protect) || isProtectedPath(rel, protect)) {
+            throw new Error(
+              `path is protected: ${file}` +
+              `\nnext: the check depends on it, so no submission may change it; protected: ${protect.join(", ")}`,
+            );
+          }
+        }
+      }
       const result = await submitCommand(c, {
         attempt,
         claim: parseClaim(claimText),
@@ -330,20 +348,46 @@ async function dispatchCore(cli: ParsedCli, deps: DispatchDeps): Promise<Dispatc
     case "check": {
       const identity = readAgent(resolveAgentDir(deps.dir));
       const c = readClient(deps);
-      const project = await c.project();
+      // Offline, run the command accepted at join time; the server re-checks everything anyway.
+      let project: Awaited<ReturnType<typeof c.project>> | undefined;
+      try {
+        project = await c.project();
+      } catch (err) {
+        if (identity?.check === undefined) throw err;
+        deps.onProgress?.(`note: the server is unreachable (${(err as Error).message}); running the check saved at join`);
+      }
+      const checkCommandText = project?.check ?? identity!.check!;
       // The check runs submitted code on this machine. Never run a command the
       // agent did not accept at join time.
-      if (identity?.check !== undefined && identity.check !== project.check) {
+      if (project && identity?.check !== undefined && identity.check !== project.check) {
         throw new Error(
           `the project's check command changed on the server: saved "${identity.check}" vs current "${project.check}"; ` +
           're-read /join and re-run "minga join <url> --model <m> --harness <h>" to accept it',
         );
       }
+      const sandboxText = str(cli.options.sandbox) ?? process.env.MINGA_SANDBOX;
+      if (sandboxText !== undefined && sandboxText !== "docker" && sandboxText !== "none") {
+        throw new Error(`--sandbox must be docker, got "${sandboxText}"`);
+      }
+      const sandbox = sandboxText === "docker" ? "docker" : undefined;
+      const image = str(cli.options.image) ?? process.env.MINGA_SANDBOX_IMAGE;
+      const networkText = str(cli.options.network) ?? "none";
+      if (networkText !== "none" && networkText !== "bridge") {
+        throw new Error(`--network must be none or bridge, got "${networkText}"`);
+      }
+      const quiet = cli.options.quiet === true || process.env.MINGA_QUIET === "1";
+      if (project?.safety?.sandbox === "docker" && !quiet) {
+        if (sandbox === undefined) {
+          deps.onProgress?.("note: this runs the project's code on your machine; add --sandbox docker to contain it");
+        } else if (image === undefined) {
+          deps.onProgress?.("sandbox image not published by the protocol; using oven/bun:1 (pass --image to override)");
+        }
+      }
       // Checking is when an agent pays attention, so it doubles as a signed beat on the
       // live attempt: the lease renews, news prints, and a task closed under the agent is
       // reported now (and recorded as notified) instead of at the next submit.
       let notices: unknown[] | undefined;
-      if (identity?.lastAssignment) {
+      if (project && identity?.lastAssignment) {
         const attempt = identity.lastAssignment.attempt;
         try {
           const beat = await c.beat({ attempt });
@@ -360,7 +404,18 @@ async function dispatchCore(cli: ParsedCli, deps: DispatchDeps): Promise<Dispatc
           }
         }
       }
-      const out = checkCommand({ dir: deps.dir, command: project.check, files: cli.positionals });
+      // The checkout root is the directory holding the identity's .minga, so
+      // the container mounts exactly the tree the check command runs in.
+      const root = resolveAgentDir(deps.dir);
+      const files = root === resolve(deps.dir)
+        ? cli.positionals
+        : cli.positionals.map((file) => relative(root, resolve(deps.dir, file)).replaceAll("\\", "/"));
+      const out = checkCommand({
+        dir: root, command: checkCommandText, files,
+        ...(sandbox !== undefined ? { sandbox } : {}),
+        ...(image !== undefined ? { image } : {}),
+        network: networkText,
+      });
       return { result: notices ? { ...out, data: { ...out.data, notices } } : out, code: out.code };
     }
 

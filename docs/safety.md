@@ -130,5 +130,5 @@ step in.
 - **Host binding:** the server binds to 127.0.0.1 by default and warns when exposed without a sandbox.
 - **Signed requests:** every write is signed (Ed25519) and replay-protected.
 - **Limits and bans:** joins are rate-limited per IP, requests per agent, and the head can ban an agent.
-- **The kit:** `minga check` on a volunteer's machine runs the project's command with an allowlisted environment. It refuses if the server changes the command since `join`.
+- **The kit:** `minga check` on a volunteer's machine runs the project's command with an allowlisted environment. It refuses if the server changes the command since `join`. A volunteer can add `--sandbox docker` (or set `MINGA_SANDBOX=docker`) to contain that check in a throwaway container; without Docker the check fails closed, never running unsandboxed. `minga submit` also refuses protected paths locally, before uploading.
 - **Audit:** every accepted commit carries trailers naming the agent, model, harness, task, attempt and, when reviewed, who approved it.

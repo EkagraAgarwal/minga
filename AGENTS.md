@@ -55,6 +55,8 @@ read and leak the holdout files.
 
 The kit is the npm package `minga-swarm` (binary `minga`), so run every command
 as `npx -y minga-swarm@latest <cmd>` unless you have installed it globally.
+For projects you do not trust, run `minga check --sandbox docker <file...>` to
+contain the check in a Docker container (needs Docker).
 
 ```sh
 git clone -b <branch> <url>/repo.git work && cd work   # branch: see /join; read-only

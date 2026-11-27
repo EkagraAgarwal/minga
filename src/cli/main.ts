@@ -37,7 +37,7 @@ agent commands
   board
   tasks [--open]
   sync [--discard]
-  check <file...>
+  check [--sandbox docker] [--image <img>] [--network none|bridge] <file...>
 
 maintainer commands
   init [dir] --name <n> --goal <g> --scope <s> --check <cmd> --paths <glob[,glob...>] [--protect <glob,glob>] [--review none|head|votes:N|head-or-votes:N] [--branch minga] [--force]
@@ -137,12 +137,15 @@ says the project is finished. --json prints the raw response.`,
 Fetches origin, then drops local files left by an accepted submit when they
 match the fetched branch head or come from your last accepted submission.
 Other changes are refused unless --discard is given.`,
-  check: `usage: minga check <file...>
+  check: `usage: minga check [--sandbox docker] [--image <img>] [--network none|bridge] <file...>
 
 Runs the project's check command in the current directory exactly as the server
 will: {files} becomes the quoted paths and MINGA_FILES the space-separated list.
 Uses bun exec when Bun is installed, else the system shell. Exit 0 when the
-check passes, 2 when it fails. Needs your identity or --url.`,
+check passes, 2 when it fails. Needs your identity or --url.
+--sandbox docker runs it in a throwaway container (needs Docker; the check then
+never runs on your machine). Default image oven/bun:1, network none; override
+with --image/--network or MINGA_SANDBOX=docker and MINGA_SANDBOX_IMAGE.`,
   init: `usage: minga init [dir] --name <n> --goal <g> --scope <s> --check <cmd> --paths <glob[,glob...>] [--protect <glob,glob>] [--review none|head|votes:N|head-or-votes:N] [--branch minga] [--force]
 
 Non-interactive scaffold: creates .minga/head.json, project.toml and adds
@@ -292,7 +295,11 @@ run(process.argv.slice(2)).then(
     if (process.argv.slice(2).includes("--json")) {
       process.stdout.write(`${JSON.stringify({ error: firstLine(err) })}\n`);
     } else {
-      process.stderr.write(`${message}\n`);
+      // The first line is the error; later lines carry the server's (or the
+      // local pre-check's) `next:` step. Print both, one line each.
+      const lines = (err instanceof Error ? err.message : String(err)).split(/\r?\n/);
+      process.stderr.write(`${lines.length > 0 ? `minga: ${lines[0]}` : message}\n`);
+      for (const line of lines.slice(1)) process.stderr.write(`${line}\n`);
     }
     process.exitCode = 1;
   },

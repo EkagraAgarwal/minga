@@ -60,6 +60,7 @@ const COMMON_OPTIONS: OptionSet = {
   dir: { type: "string" },
   url: { type: "string" },
   help: { type: "boolean", short: "h" },
+  quiet: { type: "boolean" },
 };
 
 const COMMAND_OPTIONS: Record<string, OptionSet> = {
@@ -130,7 +131,11 @@ const COMMAND_OPTIONS: Record<string, OptionSet> = {
   sync: {
     discard: { type: "boolean" },
   },
-  check: {},
+  check: {
+    sandbox: { type: "string" },
+    image: { type: "string" },
+    network: { type: "string" },
+  },
   mcp: {},
 };
 

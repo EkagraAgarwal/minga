@@ -210,10 +210,15 @@ export const MCP_TOOLS: McpTool[] = [
   },
   {
     name: "minga_check",
-    description: "Run the project's check command locally on the files you will submit, exactly as the server will. ok means submit now; a failure includes the output tail.",
+    description: "Run the project's check command locally on the files you will submit, exactly as the server will. Set sandbox:'docker' (needs Docker) to contain it instead of running the project's code on your machine; image and network override the defaults. ok means submit now; a failure includes the output tail.",
     inputSchema: {
       type: "object",
-      properties: { files: { type: "array", items: { type: "string" }, description: "Repo-relative paths you will submit." } },
+      properties: {
+        files: { type: "array", items: { type: "string" }, description: "Repo-relative paths you will submit." },
+        sandbox: { type: "string", enum: ["docker"], description: "Run the check in a throwaway Docker container (needs Docker)." },
+        image: stringProp("Container image (default oven/bun:1)."),
+        network: { type: "string", enum: ["none", "bridge"], description: "Container network (default none)." },
+      },
       required: ["files"],
     },
   },
@@ -425,6 +430,12 @@ export function toolToCli(
       command = "check";
       if (!Array.isArray(args.files) || args.files.some((f) => typeof f !== "string")) throw new Error("files must be an array of paths");
       positionals = args.files as string[];
+      if (args.sandbox !== undefined) {
+        if (args.sandbox !== "docker") throw new Error("sandbox must be docker");
+        options.sandbox = "docker";
+      }
+      setOpt(options, "image", optString(args, "image"));
+      setOpt(options, "network", optString(args, "network"));
       break;
     case "minga_sync":
       command = "sync";

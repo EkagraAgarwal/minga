@@ -26,7 +26,7 @@ import { findPackageRoot, serveCommand, type RunResult } from "../src/cli/runtim
 import { parseProject } from "../src/project/config.ts";
 import type { GitRunner } from "../src/cli/sync.ts";
 import { syncCommand } from "../src/cli/sync.ts";
-import { checkCommand, checkEnv } from "../src/cli/check.ts";
+import { checkCommand, checkEnv, DEFAULT_CHECK_IMAGE } from "../src/cli/check.ts";
 import type { SessionIdentity } from "../src/cli/store.ts";
 import { agentPath, readAgent, readHead, resolveAgentDir, writeAgent, writeHead } from "../src/cli/store.ts";
 
@@ -343,6 +343,17 @@ describe("argument parsing", () => {
       argv: ["head", "note", "T-2", "fixed", "the", "test", "--kind", "result"],
       command: "head", action: "note", positionals: ["T-2", "fixed", "the", "test"],
       options: { kind: "result" },
+    },
+    {
+      name: "check with docker sandbox",
+      argv: ["check", "--sandbox", "docker", "--image", "alpine:3.20", "--network", "bridge", "a.ts"],
+      command: "check", positionals: ["a.ts"],
+      options: { sandbox: "docker", image: "alpine:3.20", network: "bridge" },
+    },
+    {
+      name: "check quiet",
+      argv: ["check", "--quiet", "a.ts"],
+      command: "check", positionals: ["a.ts"], options: { quiet: true },
     },
   ];
 
@@ -1285,7 +1296,7 @@ describe("serve and doctor", () => {
   test("serve errors cleanly when bun is missing", async () => {
     const missing = () => ({ status: 1, stdout: "", stderr: "" });
     await expect(serveCommand([], { syncRunner: missing, packageRoot: root })).rejects.toThrow(
-      "Minga's server runs on Bun. Install it: npm install -g bun (or see https://bun.sh), then re-run this command.",
+      "Minga's server runs on Bun; install it: npm install -g bun (or see https://bun.sh), then re-run this command.",
     );
     await expect(serveCommand([], {
       syncRunner: () => ({ status: 0, stdout: "1.2.9", stderr: "" }), packageRoot: root,
@@ -1755,6 +1766,275 @@ describe("check safety", () => {
   });
 });
 
+// ---------------------------------------------------------------- volunteer-side check sandbox
+
+describe("volunteer check sandbox", () => {
+  test("--sandbox docker builds a contained docker run argv", () => {
+    withTempDir((dir) => {
+      writeFileSync(join(dir, "a.ts"), "x");
+      mkdirSync(join(dir, ".git"));
+      mkdirSync(join(dir, ".minga"));
+      writeFileSync(join(dir, ".minga", "agent.json"), "secret");
+      const calls: { cmd: string; args: string[]; timeout?: number }[] = [];
+      const result = checkCommand({
+        dir, command: "bun test {files}", files: ["./a.ts"],
+        sandbox: "docker", image: "alpine:3.20", network: "none", dockerBin: "docker-for-test",
+        spawn: (cmd, args, opts) => {
+          calls.push({ cmd, args, timeout: opts.timeout });
+          return { status: 0, output: "ok\n" };
+        },
+      });
+      expect(result.code).toBe(0);
+      expect(result.data.runner).toBe("docker");
+      expect(result.data.image).toBe("alpine:3.20");
+      expect(result.text).toContain("check passed");
+      expect(calls).toHaveLength(1);
+      expect(calls[0]!.cmd).toBe("docker-for-test");
+      expect(calls[0]!.timeout).toBeGreaterThan(0);
+      const args = calls[0]!.args;
+      expect(args.slice(0, 2)).toEqual(["run", "--rm"]);
+      const name = args[args.indexOf("--name") + 1]!;
+      expect(name).toMatch(/^minga-vcheck-[0-9a-f]{16}$/);
+      for (const flag of ["--network", "--memory", "--cpus", "--pids-limit", "--cap-drop",
+        "--security-opt", "--read-only", "--tmpfs", "-w", "-e"]) expect(args).toContain(flag);
+      expect(args[args.indexOf("--network") + 1]).toBe("none");
+      expect(args[args.indexOf("--memory") + 1]).toBe("2g");
+      expect(args[args.indexOf("--cpus") + 1]).toBe("2");
+      expect(args[args.indexOf("--pids-limit") + 1]).toBe("512");
+      expect(args[args.indexOf("--cap-drop") + 1]).toBe("ALL");
+      expect(args[args.indexOf("--security-opt") + 1]).toBe("no-new-privileges");
+      expect(args[args.indexOf("--tmpfs") + 1]).toBe("/tmp:rw,exec,size=512m");
+      expect(args[args.indexOf("-w") + 1]).toBe("/work");
+      expect(args).toContain("MINGA_FILES=a.ts");
+      expect(args).toContain("HOME=/tmp");
+      const volumes = args.flatMap((arg, i) => arg === "-v" ? [args[i + 1]!] : []);
+      expect(volumes).toHaveLength(3);
+      expect(volumes[0]).toBe(`${dir}:/work`);
+      expect(volumes[1]).toMatch(/:\/work\/\.git:ro$/);
+      expect(volumes[2]).toMatch(/:\/work\/\.minga:ro$/);
+      expect(args.slice(-4)).toEqual(["alpine:3.20", "sh", "-c", "bun test 'a.ts'"]);
+      expect(args).toContain("--security-opt");
+    });
+  });
+
+  test("a default image is announced and overridable", () => {
+    withTempDir((dir) => {
+      writeFileSync(join(dir, "a.ts"), "x");
+      const prior = process.env.MINGA_SANDBOX_IMAGE;
+      delete process.env.MINGA_SANDBOX_IMAGE;
+      try {
+        const spawn = () => ({ status: 0, output: "" });
+        const fallback = checkCommand({ dir, command: "node --version", files: ["a.ts"], sandbox: "docker", spawn });
+        expect(fallback.data.image).toBe(DEFAULT_CHECK_IMAGE);
+        expect(fallback.text).toContain(DEFAULT_CHECK_IMAGE);
+        expect(fallback.text).toContain("not published by the protocol");
+        const custom = checkCommand({
+          dir, command: "node --version", files: ["a.ts"], sandbox: "docker", image: "my/image:1", spawn,
+        });
+        expect(custom.data.image).toBe("my/image:1");
+        expect(custom.text).not.toContain("not published by the protocol");
+      } finally {
+        if (prior !== undefined) process.env.MINGA_SANDBOX_IMAGE = prior;
+      }
+    });
+  });
+
+  test("missing docker fails closed with exit 1 and no unsandboxed fallback", () => {
+    withTempDir((dir) => {
+      writeFileSync(join(dir, "a.ts"), "x");
+      let calls = 0;
+      expect(() => checkCommand({
+        dir, command: "node --version", files: ["a.ts"], sandbox: "docker", dockerBin: "no-such-docker",
+        spawn: () => { calls++; return { status: null, error: new Error("spawnSync no-such-docker ENOENT"), output: "" }; },
+      })).toThrow(/docker is not available.*did not run unsandboxed\nnext: install Docker/s);
+      expect(calls).toBe(1);
+    });
+  });
+
+  test("a timeout removes the container and never reports success", () => {
+    withTempDir((dir) => {
+      writeFileSync(join(dir, "a.ts"), "x");
+      const commands: string[][] = [];
+      expect(() => checkCommand({
+        dir, command: "node --version", files: ["a.ts"], sandbox: "docker", dockerBin: "docker-for-test",
+        timeoutMs: 1000,
+        spawn: (cmd, args) => { commands.push(args); return { status: null, output: "", timedOut: true }; },
+      })).toThrow(/check timed out after 1s.*container was removed/s);
+      expect(commands[1]).toEqual(["rm", "-f", expect.stringMatching(/^minga-vcheck-/)]);
+    });
+  });
+
+  test("the unsandboxed safety note prints once and respects --quiet", async () => {
+    await withTempDir(async (dir) => {
+      writeFileSync(join(dir, "a.ts"), "x");
+      const keys = generateKeyPair();
+      const check = "node --version";
+      const projectForCheck: ProjectInfo = { ...safeProject, check };
+      writeAgent(dir, {
+        url: "https://minga.test", agent: agentIdFromPublicKey(keys.publicKey),
+        publicKey: keys.publicKey, privateKey: keys.privateKey, model: "m", harness: "h", check,
+      });
+      const mock = mockFetch((call) => call.url.endsWith("/api/project") ? json(projectForCheck) : json({}));
+      const note = "note: this runs the project's code on your machine; add --sandbox docker to contain it";
+      const progress: string[] = [];
+      const plain = await dispatch(parseCli(["check", "a.ts", "--dir", dir]),
+        { dir, fetchImpl: mock.fn, onProgress: (line) => progress.push(line) });
+      expect(plain.code).toBe(0);
+      expect(progress).toEqual([note]);
+      const quiet: string[] = [];
+      await dispatch(parseCli(["check", "a.ts", "--dir", dir, "--quiet"]),
+        { dir, fetchImpl: mock.fn, onProgress: (line) => quiet.push(line) });
+      expect(quiet).toEqual([]);
+      const prior = process.env.MINGA_QUIET;
+      process.env.MINGA_QUIET = "1";
+      const envQuiet: string[] = [];
+      try {
+        await dispatch(parseCli(["check", "a.ts", "--dir", dir]),
+          { dir, fetchImpl: mock.fn, onProgress: (line) => envQuiet.push(line) });
+      } finally {
+        if (prior === undefined) delete process.env.MINGA_QUIET; else process.env.MINGA_QUIET = prior;
+      }
+      expect(envQuiet).toEqual([]);
+    });
+  });
+
+  test("MINGA_SANDBOX and MINGA_SANDBOX_IMAGE select the docker runner", () => {
+    withTempDir((dir) => {
+      writeFileSync(join(dir, "a.ts"), "x");
+      const prior = process.env.MINGA_SANDBOX;
+      const priorImage = process.env.MINGA_SANDBOX_IMAGE;
+      process.env.MINGA_SANDBOX = "docker";
+      process.env.MINGA_SANDBOX_IMAGE = "env/image:7";
+      try {
+        const seen: string[][] = [];
+        const result = checkCommand({
+          dir, command: "node --version", files: ["a.ts"],
+          spawn: (cmd, args) => { seen.push(args); return { status: 0, output: "" }; },
+        });
+        expect(result.data.runner).toBe("docker");
+        expect(result.data.image).toBe("env/image:7");
+        expect(seen[0]!.slice(-4, -3)).toEqual(["env/image:7"]);
+      } finally {
+        if (prior === undefined) delete process.env.MINGA_SANDBOX; else process.env.MINGA_SANDBOX = prior;
+        if (priorImage === undefined) delete process.env.MINGA_SANDBOX_IMAGE; else process.env.MINGA_SANDBOX_IMAGE = priorImage;
+      }
+    });
+  });
+});
+
+describe("local protected-path pre-check", () => {
+  function submitDeps(dir: string, mock: { fn: FetchLike; calls: Call[] }) {
+    const keys = generateKeyPair();
+    writeAgent(dir, {
+      url: "https://minga.test", agent: agentIdFromPublicKey(keys.publicKey),
+      publicKey: keys.publicKey, privateKey: keys.privateKey, model: "m", harness: "h",
+    });
+    return { dir, fetchImpl: mock.fn };
+  }
+
+  test("a protected path is refused locally, without calling /api/submit", async () => {
+    await withTempDir(async (dir) => {
+      mkdirSync(join(dir, "test"), { recursive: true });
+      writeFileSync(join(dir, "test", "a.test.ts"), "x");
+      writeFileSync(join(dir, "a.ts"), "x");
+      const mock = mockFetch((call) => {
+        if (call.url.endsWith("/api/project")) return json(safeProject);
+        return json({ error: "unexpected call" }, 500);
+      });
+      let message = "";
+      try {
+        await dispatch(parseCli([
+          "submit", "A-1", "--claim", "solves", "-m", "fix it", "test/a.test.ts", "--root", dir,
+        ]), submitDeps(dir, mock));
+      } catch (err) {
+        message = (err as Error).message;
+      }
+      expect(message).toContain("path is protected: test/a.test.ts");
+      expect(message).toContain("next: the check depends on it");
+      expect(mock.calls.map((call) => new URL(call.url).pathname)).toEqual(["/api/project"]);
+    });
+  });
+
+  test("project.toml is protected even when not listed; non-protected paths pass through", async () => {
+    await withTempDir(async (dir) => {
+      writeFileSync(join(dir, "project.toml"), "x");
+      writeFileSync(join(dir, "a.ts"), "x");
+      const mock = mockFetch((call) => {
+        const path = new URL(call.url).pathname;
+        if (path === "/api/project") return json({ ...safeProject, safety: { ...safety, protect: [] } });
+        if (path === "/api/submit") return json({ submission: "S-1", status: "queued", position: 1 });
+        return json({
+          id: "S-1", status: "accepted", exitCode: 0, points: 10, attempt: "A-1", task: "T-1",
+          agent: "a", model: "m", claim: "solves", message: "m", files: ["a.ts"], bytes: 1,
+          queuedAt: "", runs: 1,
+        });
+      });
+      await expect(dispatch(parseCli([
+        "submit", "A-1", "--claim", "solves", "-m", "fix it", "project.toml", "--root", dir,
+      ]), submitDeps(dir, mock))).rejects.toThrow(/path is protected: project.toml/);
+      expect(mock.calls.map((call) => new URL(call.url).pathname)).toEqual(["/api/project"]);
+      const outcome = await dispatch(parseCli([
+        "submit", "A-1", "--claim", "solves", "-m", "fix it", "a.ts", "--root", dir,
+      ]), submitDeps(dir, mock));
+      expect(outcome.code).toBe(0);
+      expect(mock.calls.map((call) => new URL(call.url).pathname)).toEqual([
+        "/api/project", "/api/project", "/api/submit", "/api/submission/S-1",
+      ]);
+    });
+  });
+
+  test("an old server without safety skips the pre-check", async () => {
+    await withTempDir(async (dir) => {
+      writeFileSync(join(dir, "test"), "x");
+      const mock = mockFetch((call) => {
+        const path = new URL(call.url).pathname;
+        if (path === "/api/project") return json(project);
+        if (path === "/api/submit") return json({ submission: "S-2", status: "queued", position: 1 });
+        return json({
+          id: "S-2", status: "accepted", exitCode: 0, points: 10, attempt: "A-1", task: "T-1",
+          agent: "a", model: "m", claim: "solves", message: "m", files: ["test"], bytes: 1,
+          queuedAt: "", runs: 1,
+        });
+      });
+      const outcome = await dispatch(parseCli([
+        "submit", "A-1", "--claim", "solves", "-m", "fix it", "test", "--root", dir,
+      ]), submitDeps(dir, mock));
+      expect(outcome.code).toBe(0);
+      expect(mock.calls.map((call) => new URL(call.url).pathname)).toContain("/api/submit");
+    });
+  });
+});
+
+const dockerInfo = spawnSync("docker", ["info"], { encoding: "utf8", timeout: 8_000 });
+const testImage = process.env.MINGA_DOCKER_TEST_IMAGE ?? DEFAULT_CHECK_IMAGE;
+const imageReady = spawnSync("docker", ["image", "inspect", testImage], { encoding: "utf8", timeout: 8_000 });
+const dockerReady = dockerInfo.status === 0 && dockerInfo.error === undefined
+  && imageReady.status === 0 && imageReady.error === undefined;
+
+describe.skipIf(!dockerReady)("real docker sandbox", () => {
+  test("hides .minga/agent.json from the check", async () => {
+    await withTempDir(async (dir) => {
+      const keys = generateKeyPair();
+      const identity = {
+        url: "https://minga.test", agent: agentIdFromPublicKey(keys.publicKey),
+        publicKey: keys.publicKey, privateKey: keys.privateKey, model: "m", harness: "h",
+        check: "cat /work/.minga/agent.json || echo HIDDEN",
+      };
+      writeAgent(dir, identity);
+      writeFileSync(join(dir, "a.ts"), "x");
+      const mock = mockFetch((call) => call.url.endsWith("/api/project")
+        ? json({ ...project, check: identity.check })
+        : json({}));
+      const outcome = await dispatch(parseCli([
+        "check", "a.ts", "--dir", dir, "--sandbox", "docker", "--image", testImage,
+      ]), { dir, fetchImpl: mock.fn });
+      expect(outcome.code).toBe(0);
+      expect(outcome.result.text).toContain("HIDDEN");
+      expect(outcome.result.text).not.toContain(identity.privateKey);
+    });
+  });
+});
+
 // ---------------------------------------------------------------- review and safety
 
 describe("review and safety", () => {
@@ -1796,7 +2076,7 @@ describe("review and safety", () => {
       expect(text).toContain("Your attempt is done: minga sync && minga next --wait 600.");
       expect(text).toContain("Check later: minga result S-4");
       expect(mock.calls.map((c) => new URL(c.url).pathname)).toEqual([
-        "/api/submit", "/api/submission/S-4", "/api/project",
+        "/api/project", "/api/submit", "/api/submission/S-4", "/api/project",
       ]);
     });
   });
@@ -2346,9 +2626,34 @@ describe("bundle on plain Node", () => {
     expect(bad.stderr).toContain("unknown command: frobnicate");
   });
 
+  test("a missing docker binary fails the containerised check closed", async () => {
+    const server = startFakeServer({});
+    try {
+      await withTempDir(async (dir) => {
+        withIdentity(dir, server.url);
+        const stored = readAgent(dir)!;
+        writeAgent(dir, { ...stored, check: project.check });
+        writeFileSync(join(dir, "a.ts"), "x");
+        const prior = process.env.MINGA_DOCKER_BIN;
+        process.env.MINGA_DOCKER_BIN = join(dir, "no-docker-here");
+        try {
+          const result = await runKit(["check", "--sandbox", "docker", "a.ts", "--dir", dir], dir);
+          expect(result.status).toBe(1);
+          expect(result.stderr).toContain("docker is not available");
+          expect(result.stderr).toContain("next: install Docker");
+          expect(result.stdout).toBe("");
+        } finally {
+          if (prior === undefined) delete process.env.MINGA_DOCKER_BIN;
+          else process.env.MINGA_DOCKER_BIN = prior;
+        }
+      });
+    } finally {
+      server.server.stop();
+    }
+  });
+
   test("the built kit has no Bun API dependency", () => {
     const source = readFileSync(kit, "utf8");
-    expect(source).not.toContain("Bun.serve");
-    expect(source).not.toContain("Bun.Glob");
+    expect(source).not.toContain("Bun.");
   });
 });
