@@ -12,14 +12,14 @@
  * - `next` and submission reads can long-poll, so idle agents cost one open request;
  * - the UI snapshot is bounded and cached, and SSE frames are encoded once per event.
  */
-import { mkdirSync, readFileSync, rmSync, writeFileSync } from "node:fs";
-import { join as pathJoin } from "node:path";
-import type { BranchHead, ChangedPaths, CheckPool, CheckResult, CommitAccepted, EventStore } from "../core/contracts.ts";
+import { existsSync, mkdirSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { join as pathJoin, resolve as pathResolve } from "node:path";
+import type { BranchHead, ChangedPaths, CheckPool, CheckResult, CommitAccepted, EventStore, FileChange, ReadFileAt } from "../core/contracts.ts";
 import type {
   Assignment, AttemptView, BeatNews, BeatRequest, ErrorBody, EventsResponse, HeadBanRequest, HeadCloseRequest, HeadDecideRequest, HeadLeadRequest, HeadNoteRequest,
   HeadPostRequest, HeadRuleRequest, JoinRequest, JoinResponse, MetricsResponse, NextRequest, NextResponse,
-  NoteRequest, PathConflict, ProjectInfo, ProposeRequest, ReleaseRequest, SubmissionView, SubmitRequest, SubmitResponse, TasksResponse,
-  VoteRequest,
+  NoteRequest, PathConflict, ProjectInfo, ProposeRequest, ReleaseRequest, ReviewDetail, ReviewRequest, ReviewResponse, ReviewSummary, ReviewsResponse,
+  SubmissionView, SubmitRequest, SubmitResponse, TasksResponse, VoteRequest,
 } from "../core/protocol.ts";
 import {
   CLOSED_STATUSES, NOTE_KINDS, RELEASE_REASONS, ROLES,
@@ -33,7 +33,11 @@ import { findDuplicate } from "./dedupe.ts";
 import { leadAreaFor } from "./leads.ts";
 import { closedByOf, Notices } from "./notices.ts";
 import { buildView } from "../log/view.ts";
-import { pathAllowed, parseAcceptPolicy } from "../project/config.ts";
+import { pathAllowed, pathProtected, parseAcceptPolicy } from "../project/config.ts";
+import { unifiedDiff } from "../verify/diff.ts";
+import { evaluateGates } from "../verify/gates.ts";
+import { readFileAt as gitReadFileAt } from "../verify/gitops.ts";
+import { decideReview, reviewEligible } from "./review.ts";
 import { decideByVotes, expiredAttempts, pickTask } from "../sched/scheduler.ts";
 import { authenticate, HttpError, NonceCache, RateLimiter } from "./auth.ts";
 import { Latency } from "./latency.ts";
@@ -59,6 +63,10 @@ export interface AppDeps {
   recheckLimit?: number;
   /** Branch head at startup; kept current as accepted work lands. Sent with assignments. */
   initialHead?: string;
+  /** Reads a file at a commit (gates and review diffs). Default: git cat-file in repoDir. */
+  readFileAt?: ReadFileAt;
+  /** Where holdout runs write their private output. Default `<repoDir>/.minga/holdout-logs`. */
+  holdoutLogDir?: string;
 }
 
 const MAX_BODY = 3 * 1024 * 1024;
@@ -78,7 +86,7 @@ const KNOWN_ROUTES = new Set([
   "/api/project", "/api/view", "/api/leaderboard", "/api/metrics", "/api/tasks", "/api/events", "/api/stream", "/api/submission/:id", "/api/attempt/:id",
   "/api/join", "/api/next", "/api/beat", "/api/note", "/api/submit", "/api/release", "/api/propose", "/api/vote",
   "/api/head/post", "/api/head/decide", "/api/head/rule", "/api/head/ban", "/api/head/close", "/api/head/note", "/api/head/lead",
-  "/api/lead/post", "/api/lead/decide",
+  "/api/lead/post", "/api/lead/decide", "/api/reviews", "/api/review/:id", "/api/review", "/api/head/review",
 ]);
 
 type Waiter = { agent: AgentId; model: string; approach: string; finish: (a: Assignment | null | "done") => void };
@@ -95,6 +103,13 @@ export function createApp(deps: AppDeps) {
   let branchTip = deps.initialHead;
   const submissionsDir = deps.submissionsDir ?? pathJoin(repoDir, ".minga", "submissions");
   mkdirSync(submissionsDir, { recursive: true });
+  const readFileAt = deps.readFileAt ?? gitReadFileAt;
+  const holdoutDir = cfg.holdout ? pathResolve(repoDir, cfg.holdout.dir) : undefined;
+  const holdoutLogDir = deps.holdoutLogDir ?? pathJoin(repoDir, ".minga", "holdout-logs");
+  if (holdoutDir) mkdirSync(holdoutLogDir, { recursive: true });
+  const gatesActive = cfg.gates.maxFiles > 0 || cfg.gates.maxChangedLines > 0 || cfg.gates.forbid.length > 0 || cfg.gates.warn.length > 0;
+  /** Approved review submissions waiting for a pool slot to land. */
+  const landing = new Set<SubmissionId>();
   const startedAt = Date.now();
   const enc = new TextEncoder();
   const listeners = new Set<(bytes: Uint8Array) => void>();
@@ -129,7 +144,7 @@ export function createApp(deps: AppDeps) {
       }
     }
     if (CAPACITY_EVENTS.has(stored.type)) scheduleWaiters();
-    if (stored.type === "submission.checked") settleSubmissionWaiters(stored.data.submission);
+    if (stored.type === "submission.checked" || stored.type === "submission.passed") settleSubmissionWaiters(stored.data.submission);
     return stored;
   }
 
@@ -154,6 +169,7 @@ export function createApp(deps: AppDeps) {
   const leaseUntil = () => new Date(now().getTime() + state.rules.leaseMinutes * 60_000).toISOString();
   const projectInfo = (): ProjectInfo => ({
     name: cfg.name, goal: cfg.goal, scope: cfg.scope, check: cfg.check, paths: cfg.paths, headAgent: headId, rules: state.rules, branch: cfg.branch,
+    safety: { protect: cfg.protect, gates: cfg.gates, review: cfg.review, holdout: !!cfg.holdout, sandbox: cfg.sandbox.mode },
   });
   const json = (data: unknown, status = 200) => Response.json(data, { status });
   const fail = (status: number, error: string, detail?: string) => json({ error, ...(detail ? { detail } : {}) } satisfies ErrorBody, status);
@@ -313,6 +329,13 @@ export function createApp(deps: AppDeps) {
     emit({ type: "task.closed", actor, data: { task, status, ...extra } });
     // Attempts still waiting on a check keep running; their check finishes as stale.
     endAttempts(liveAttempts(state, task, now()).filter((a) => !pendingFor(a)), "task_closed");
+    // Work waiting in review on a closed task can no longer land.
+    for (const id of [...(state.index.reviewSubmissions ?? [])]) {
+      if (state.submissions[id]?.task === task && !inflight.has(id)) {
+        landing.delete(id);
+        finalize(id, { stale: true, outputTail: `task ${task} was closed (${status}) before this was reviewed` });
+      }
+    }
     // An area closes once every task under it is closed: solved if any child was solved or refuted.
     const parentId = state.tasks[task]?.parent;
     const parent = parentId ? state.tasks[parentId] : undefined;
@@ -581,6 +604,9 @@ export function createApp(deps: AppDeps) {
       const c = b.files[p];
       if (typeof c !== "string") throw new HttpError(400, `content of ${p} must be a string`);
       if (!pathAllowed(cfg, p)) throw new HttpError(400, `path not allowed: ${p}`, `allowed: ${cfg.paths.join(", ")}`);
+      if (pathProtected(cfg, p)) {
+        throw new HttpError(403, `path is protected: ${p}`, `the check depends on it, so no submission may change it; protected: ${cfg.protect.join(", ")}`);
+      }
       bytes += Buffer.byteLength(c);
     }
     if (bytes > MAX_FILES_BYTES) throw new HttpError(413, "files exceed 2 MB");
@@ -607,22 +633,27 @@ export function createApp(deps: AppDeps) {
   const inflight = new Set<SubmissionId>();
   const inflightTasks = new Set<TaskId>();
   let pumping = false;
-  /** Starts queued submissions while the pool has room: oldest first, at most one per task. */
+  /**
+   * Starts queued submissions while the pool has room: oldest first, at most one per task.
+   * Approved review submissions that still have to land (commit, or recheck on a newer head)
+   * go first: they already passed and only wait for the branch.
+   */
   function pump() {
     if (pumping) return;
     pumping = true;
     try {
-      for (const id of [...state.index.pendingSubmissions]) {
+      for (const id of [...landing, ...state.index.pendingSubmissions]) {
         if (inflight.size >= deps.pool.size) break;
         if (inflight.has(id)) continue;
         const s = state.submissions[id];
         if (!s || inflightTasks.has(s.task)) continue;
+        landing.delete(id);
         inflight.add(id);
         inflightTasks.add(s.task);
         processSubmission(id)
           .catch((err) => {
             console.error(`submission ${id} failed`, err);
-            if (state.submissions[id] && ["queued", "checking"].includes(state.submissions[id]!.status)) {
+            if (state.submissions[id] && ["queued", "checking", "review"].includes(state.submissions[id]!.status)) {
               finalize(id, { stale: true, outputTail: `internal error while checking: ${(err as Error).message}` });
             }
           })
@@ -631,6 +662,49 @@ export function createApp(deps: AppDeps) {
     } finally {
       pumping = false;
     }
+  }
+
+  /** Approved by the head, or by enough eligible votes. Derived from the log, so it survives restarts. */
+  function reviewApproved(s: SubmissionState): boolean {
+    if (s.reviews?.some((v) => v.head)) return s.reviews.filter((v) => v.head).at(-1)!.approve;
+    return decideReview(state, s.id, cfg.review)?.approved === true;
+  }
+
+  /** Static gates on the diff against `base`. Reads each file's old content only when gates are on. */
+  async function gateReport(base: string, files: Record<string, string>) {
+    if (!gatesActive) return { violations: [] as string[], warnings: [] as string[] };
+    const changes: FileChange[] = [];
+    for (const path of Object.keys(files)) {
+      changes.push({ path, before: await readFileAt(repoDir, base, path), after: files[path] ?? "" });
+    }
+    return evaluateGates(cfg.gates, changes);
+  }
+
+  /**
+   * The check, then (if it passed and the project has one) the holdout in the same files with
+   * the private tests laid over them. Holdout output never reaches agents: it goes to a file
+   * under .minga/ for the maintainer, and the published tail only says pass or fail.
+   */
+  async function runChecks(id: SubmissionId, base: string, files: Record<string, string>): Promise<{ result: CheckResult; holdout?: "passed" | "failed" }> {
+    const result = await deps.pool.run({ base, files, command: cfg.check, timeoutSeconds: cfg.checkTimeoutSeconds });
+    if (!result.ok || !cfg.holdout || !holdoutDir) return { result };
+    const hidden = await deps.pool.run({
+      base, files, command: cfg.holdout.command, timeoutSeconds: cfg.checkTimeoutSeconds, overlayDir: holdoutDir,
+    });
+    try {
+      writeFileSync(pathJoin(holdoutLogDir, `${id}.txt`),
+        `base ${base}\nexit ${hidden.exitCode}${hidden.timedOut ? " (timed out)" : ""}\n\n${hidden.outputTail}`);
+    } catch (err) { console.error(`cannot write holdout log for ${id}`, err); }
+    if (hidden.ok) return { result, holdout: "passed" };
+    return {
+      holdout: "failed",
+      result: {
+        ...hidden,
+        outputTail: `the check passed, but the project's holdout tests failed (exit ${hidden.exitCode}${hidden.timedOut ? ", timed out" : ""}).\n` +
+          "Holdout tests are private to the maintainer: their names and output are never shown to agents.\n" +
+          "Make the work correct in general, not just for the visible tests.",
+      },
+    };
   }
 
   async function processSubmission(id: SubmissionId): Promise<void> {
@@ -644,26 +718,70 @@ export function createApp(deps: AppDeps) {
     }
     const agent = state.agents[s.agent]!;
     const task = () => state.tasks[s.task]!;
+    // An approved review submission only has to land; it was gated and checked already.
+    // Also true for an approved submission a restart caught mid-recheck (status "checking").
+    const approved = (s.status === "review" || !!s.reviews?.length) && reviewApproved(s);
+    if (s.status === "review" && !approved) return; // still waiting for reviewers
+    const review = approved ? { approved: true, by: (s.reviews?.some((v) => v.head) ? "head" : "vote") as "head" | "vote" } : undefined;
+    let warnings = s.warnings;
+    let holdout = s.holdout;
     const firstRound = s.runs; // s is live state: s.runs grows with every start
     for (let round = firstRound; ; round++) {
-      if (task().status !== "open") return finalize(id, { stale: true, outputTail: `task ${s.task} was closed (${task().status}) before this check finished` });
-      if (round - firstRound > recheckLimit) return finalize(id, { stale: true, outputTail: "the branch kept moving while this was checked; submit again" });
+      if (task().status !== "open") return finalize(id, { stale: true, outputTail: `task ${s.task} was closed (${task().status}) before this check finished`, review });
+      if (round - firstRound > recheckLimit) return finalize(id, { stale: true, outputTail: "the branch kept moving while this was checked; submit again", review });
       const base = await deps.branchHead(repoDir, cfg.branch);
-      emit({ type: "submission.started", actor: "server", data: { submission: id, base, round } });
-      const result = await deps.pool.run({ base, files, command: cfg.check, timeoutSeconds: cfg.checkTimeoutSeconds });
-      if (!result.ok) return finalize(id, { base, result });
+      let result: CheckResult;
+      // Landing an approved submission: reuse its passing run when nothing it touched moved.
+      let reuse = false;
+      if (approved && round === firstRound && s.base) {
+        if (base === s.base) reuse = true;
+        else if (cfg.recheck === "on-overlap") {
+          const changed = await deps.changedPaths(repoDir, s.base, base);
+          reuse = !changed.some((p) => Object.hasOwn(files, p));
+        }
+      }
+      if (reuse) {
+        result = { ok: true, exitCode: 0, timedOut: false, outputTail: "", durationMs: s.durationMs ?? 0 };
+      } else {
+        if (!approved && round === firstRound) {
+          const report = await gateReport(base, files);
+          if (report.violations.length) {
+            return finalize(id, {
+              base, gate: report.violations, warnings: report.warnings.length ? report.warnings : undefined,
+              outputTail: "rejected by this project's gates before the check ran:\n" + report.violations.map((v) => `  ${v}`).join("\n") +
+                "\nRead the project's gates in /join (safety). Fix the work instead of the tests.",
+            });
+          }
+          if (report.warnings.length) warnings = report.warnings;
+        }
+        emit({ type: "submission.started", actor: "server", data: { submission: id, base, round } });
+        const ran = await runChecks(id, base, files);
+        result = ran.result;
+        holdout = ran.holdout ?? holdout;
+        if (!result.ok) return finalize(id, { base, result, warnings, holdout, review: approved ? { approved: true, by: review!.by, reason: "approved, but the recheck on the new head failed" } : undefined });
+        if (cfg.review.mode !== "none" && !approved) {
+          emit({ type: "submission.passed", actor: "server", data: {
+            submission: id, attempt: s.attempt, task: s.task, agent: s.agent, base, durationMs: result.durationMs,
+            outputTail: result.outputTail, ...(warnings?.length ? { warnings } : {}), ...(holdout === "passed" ? { holdout } : {}),
+          } });
+          // The agent is done with it; reviewers decide. The task stays open.
+          endAttempts([s.attempt], "submitted");
+          return;
+        }
+      }
       let parent = base;
       for (let hops = 0; ; hops++) {
-        if (task().status !== "open") return finalize(id, { base, result, stale: true, outputTail: `task ${s.task} was closed (${task().status}) before this could be committed` });
+        if (task().status !== "open") return finalize(id, { base, result, stale: true, outputTail: `task ${s.task} was closed (${task().status}) before this could be committed`, review });
         const out = await deps.commitAccepted({
           repoDir, branch: cfg.branch, parent, files, message: `${s.task}: ${s.message}`,
           author: `minga agent ${s.agent.slice(0, 8)}`,
           trailers: {
             "Agent-Id": s.agent, "Agent-Model": s.model, "Agent-Harness": agent.harness,
             "Minga-Task": s.task, "Minga-Attempt": s.attempt, "Minga-Claim": s.claim,
+            ...(review ? { "Minga-Review": review.by } : {}),
           },
         });
-        if (out.ok) { branchTip = out.commit; return finalize(id, { base, result, commit: out.commit }); }
+        if (out.ok) { branchTip = out.commit; return finalize(id, { base, result, commit: out.commit, warnings, holdout, review }); }
         // The branch moved. With recheck = "on-overlap", land on the new head when nothing
         // committed since the check's base touched these paths.
         if (cfg.recheck === "on-overlap" && hops < 20) {
@@ -675,17 +793,22 @@ export function createApp(deps: AppDeps) {
     }
   }
 
-  function finalize(id: SubmissionId, r: { base?: string; result?: CheckResult; commit?: string; stale?: boolean; outputTail?: string }) {
+  function finalize(id: SubmissionId, r: {
+    base?: string; result?: CheckResult; commit?: string; stale?: boolean; outputTail?: string;
+    gate?: string[]; warnings?: string[]; holdout?: "passed" | "failed"; review?: { approved: boolean; by: "head" | "vote"; reason?: string };
+  }) {
     const s = state.submissions[id]!;
     const task = state.tasks[s.task]!;
     const ok = !!r.commit;
     const points = ok ? (s.claim === "progress" ? Math.max(1, Math.round(task.points / 5)) : task.points) : 0;
     emit({ type: "submission.checked", actor: "server", data: {
       submission: id, attempt: s.attempt, task: s.task, agent: s.agent, model: s.model, claim: s.claim, files: s.files,
-      base: r.base ?? "", ...(r.stale ? { stale: true } : {}),
+      base: r.base ?? s.base ?? "", ...(r.stale ? { stale: true } : {}),
       ok, exitCode: r.result?.exitCode ?? -1, timedOut: r.result?.timedOut ?? false,
       outputTail: r.outputTail ?? r.result?.outputTail ?? "", durationMs: r.result?.durationMs ?? 0,
       points, ...(r.commit ? { commit: r.commit } : {}),
+      ...(r.gate?.length ? { gate: r.gate } : {}), ...(r.warnings?.length ? { warnings: r.warnings } : {}),
+      ...(r.holdout ? { holdout: r.holdout } : {}), ...(r.review ? { review: r.review } : {}),
     } });
     rmSync(fileOf(id), { force: true });
     if (ok) {
@@ -699,11 +822,24 @@ export function createApp(deps: AppDeps) {
     }
   }
 
+  // A restart can interrupt an approved submission before it landed: queue it again.
+  queueMicrotask(() => {
+    for (const id of state.index.reviewSubmissions ?? []) {
+      const s = state.submissions[id];
+      if (s && reviewApproved(s)) landing.add(id);
+    }
+    if (landing.size) pump();
+  });
+
   const isFinal = (s: SubmissionState) => s.status === "accepted" || s.status === "rejected";
+  /** Final, or parked in review: either way the submitter's wait is over. */
+  const isSettled = (s: SubmissionState) => isFinal(s) || s.status === "review";
   function submissionView(id: SubmissionId): SubmissionView {
     const s = state.submissions[id]!;
     const checked = s.checkedSeq ? store.get(s.checkedSeq) : undefined;
-    const outputTail = checked?.type === "submission.checked" ? checked.data.outputTail : undefined;
+    const passed = !checked && s.passedSeq ? store.get(s.passedSeq) : undefined;
+    const outputTail = checked?.type === "submission.checked" ? checked.data.outputTail
+      : passed?.type === "submission.passed" ? passed.data.outputTail : undefined;
     const position = s.status === "queued" ? queuePosition(id) : undefined;
     return { ...s, ...(outputTail !== undefined ? { outputTail } : {}), ...(position ? { position } : {}) };
   }
@@ -717,7 +853,7 @@ export function createApp(deps: AppDeps) {
   function getSubmission(id: string, wait: number, signal?: AbortSignal): SubmissionView | Promise<SubmissionView> {
     const s = state.submissions[id];
     if (!s) throw new HttpError(404, `no submission ${id}`);
-    if (isFinal(s) || !wait) return submissionView(id);
+    if (isSettled(s) || !wait) return submissionView(id);
     if (signal) heldRequests.add(signal);
     return new Promise((resolve) => {
       let set = submissionWaiters.get(id);
@@ -933,6 +1069,96 @@ export function createApp(deps: AppDeps) {
     return { ok: true as const };
   }
 
+  // ---------------------------------------------------------------- review
+  function reviewTarget(b: ReviewRequest): SubmissionState {
+    if (cfg.review.mode === "none") throw new HttpError(409, "this project does not review work", "passing work lands at once (project.toml review = \"none\")");
+    const id = str(b.submission, "submission", 32);
+    const s = state.submissions[id];
+    if (!s) throw new HttpError(404, `no submission ${id}`);
+    if (s.status !== "review") throw new HttpError(409, `submission ${id} is ${s.status}, not in review`);
+    if (typeof b.approve !== "boolean") throw new HttpError(400, "approve must be true or false");
+    return s;
+  }
+
+  function settleReview(s: SubmissionState, decided: { approved: boolean; by: "head" | "vote" }, reason?: string): void {
+    if (decided.approved) {
+      landing.add(s.id);
+      pump();
+      return;
+    }
+    finalize(s.id, {
+      review: { approved: false, by: decided.by, ...(reason ? { reason } : {}) },
+      warnings: s.warnings, holdout: s.holdout,
+      outputTail: `rejected in review by ${decided.by === "head" ? "the head" : "votes"}${reason ? `: ${reason}` : ""}`,
+    });
+  }
+
+  /** An eligible agent's vote. In "head" mode votes are advisory: recorded for the head, never deciding. */
+  function agentReview(agent: AgentId, b: ReviewRequest): ReviewResponse {
+    agentOrThrow(agent);
+    const s = reviewTarget(b);
+    const ok = reviewEligible(state, s.id, agent);
+    if (!ok.ok) throw new HttpError(403, `you may not review ${s.id}: ${ok.reason}`);
+    const reason = b.reason === undefined ? undefined : str(b.reason, "reason", 500);
+    emit({ type: "submission.reviewed", actor: agent, data: { submission: s.id, agent, approve: b.approve, ...(reason ? { reason } : {}) } });
+    const d = decideReview(state, s.id, cfg.review);
+    if (!d || inflight.has(s.id) || landing.has(s.id)) return { submission: s.id };
+    const reasons = (state.submissions[s.id]!.reviews ?? []).filter((v) => !v.head && v.approve === d.approved && v.reason).map((v) => v.reason);
+    settleReview(state.submissions[s.id]!, { approved: d.approved, by: "vote" }, reasons.join("; ").slice(0, 500) || undefined);
+    return { submission: s.id, decided: { approved: d.approved, by: "vote" } };
+  }
+
+  /** The head's decision settles a review at once, in every review mode. */
+  function headReview(b: ReviewRequest): ReviewResponse {
+    const s = reviewTarget(b);
+    if (inflight.has(s.id) || landing.has(s.id)) throw new HttpError(409, `submission ${s.id} is already approved and landing`);
+    const reason = b.reason === undefined ? undefined : str(b.reason, "reason", 500);
+    emit({ type: "submission.reviewed", actor: headId, data: { submission: s.id, agent: headId, approve: b.approve, head: true, ...(reason ? { reason } : {}) } });
+    settleReview(state.submissions[s.id]!, { approved: b.approve, by: "head" }, reason);
+    return { submission: s.id, decided: { approved: b.approve, by: "head" } };
+  }
+
+  function reviewSummary(s: SubmissionState): ReviewSummary {
+    const votes = s.reviews ?? [];
+    return {
+      submission: s.id, task: s.task, taskTitle: state.tasks[s.task]?.title ?? "", agent: s.agent, model: s.model,
+      claim: s.claim, message: s.message, files: s.files, passedAt: s.passedAt ?? s.checkedAt ?? "",
+      warnings: s.warnings ?? [], approvals: votes.filter((v) => v.approve).length,
+      rejections: votes.filter((v) => !v.approve).length, votes,
+    };
+  }
+
+  function reviewsList(): ReviewsResponse {
+    const reviews = (state.index.reviewSubmissions ?? []).map((id) => state.submissions[id]).filter((s): s is SubmissionState => !!s);
+    return { reviews: reviews.map(reviewSummary), policy: cfg.review };
+  }
+
+  /** The diff a reviewer reads: waiting files against their base, or a landed commit against its base. */
+  async function reviewDetail(id: string): Promise<ReviewDetail> {
+    const s = state.submissions[id];
+    if (!s) throw new HttpError(404, `no submission ${id}`);
+    let files: Record<string, string> | undefined;
+    if (existsSync(fileOf(id))) {
+      try { files = JSON.parse(readFileSync(fileOf(id), "utf8")); } catch { files = undefined; }
+    } else if (s.commit) {
+      files = {};
+      for (const p of s.files) files[p] = (await readFileAt(repoDir, s.commit, p)) ?? "";
+    }
+    const base = s.base ?? "";
+    const diffs: ReviewDetail["diffs"] = [];
+    for (const path of Object.keys(files ?? {}).sort()) {
+      const before = base ? await readFileAt(repoDir, base, path) : null;
+      const d = unifiedDiff({ path, before, after: files![path] ?? "" });
+      diffs.push({ path, diff: d.text, added: d.added, removed: d.removed, created: before === null });
+    }
+    const view = submissionView(id);
+    return {
+      ...reviewSummary(s), status: s.status, base, diffs, outputTail: view.outputTail ?? "",
+      ...(s.holdout ? { holdout: s.holdout } : {}),
+    };
+  }
+
+
   // ---------------------------------------------------------------- reads
   // Rebuilt at most once a second (and kept up to 5 s while nothing changes). Gzipped once per
   // rebuild: at ~1,500 agents the JSON is ~1 MB and compresses about 10x.
@@ -1018,12 +1244,12 @@ export function createApp(deps: AppDeps) {
   const signed: Record<string, Handler> = {
     "/api/next": next, "/api/beat": beat, "/api/note": note, "/api/submit": submit,
     "/api/release": release, "/api/propose": propose, "/api/vote": vote,
-    "/api/lead/post": leadPost, "/api/lead/decide": leadDecide,
+    "/api/lead/post": leadPost, "/api/lead/decide": leadDecide, "/api/review": agentReview,
   };
   const head: Record<string, (body: any) => unknown> = {
     "/api/head/post": headPost, "/api/head/decide": headDecide, "/api/head/rule": headRule,
     "/api/head/ban": headBan, "/api/head/close": headClose, "/api/head/note": headNote,
-    "/api/head/lead": headLead,
+    "/api/head/lead": headLead, "/api/head/review": headReview,
   };
 
   async function handleApi(req: Request, url: URL, ip: string | undefined): Promise<Response> {
@@ -1034,6 +1260,8 @@ export function createApp(deps: AppDeps) {
       if (path === "/api/leaderboard") return json(computeLeaderboard(state, 1000));
       if (path === "/api/metrics") return json(metrics());
       if (path === "/api/tasks") return json(tasksOverview());
+      if (path === "/api/reviews") return json(reviewsList());
+      if (path.startsWith("/api/review/")) return json(await reviewDetail(decodeURIComponent(path.slice("/api/review/".length))));
       if (path === "/api/events") {
         const after = Number(url.searchParams.get("after") ?? 0) || 0;
         const limit = Math.min(5000, Number(url.searchParams.get("limit") ?? 1000) || 1000);
@@ -1084,7 +1312,8 @@ export function createApp(deps: AppDeps) {
     const url = new URL(req.url);
     // Bounded keys: arbitrary paths must not grow the metrics maps.
     const path = url.pathname.startsWith("/api/submission/") ? "/api/submission/:id"
-      : url.pathname.startsWith("/api/attempt/") ? "/api/attempt/:id" : url.pathname;
+      : url.pathname.startsWith("/api/attempt/") ? "/api/attempt/:id"
+      : url.pathname.startsWith("/api/review/") ? "/api/review/:id" : url.pathname;
     const route = KNOWN_ROUTES.has(path) ? `${req.method} ${path}` : "other";
     requests[route] = (requests[route] ?? 0) + 1;
     let res: Response;

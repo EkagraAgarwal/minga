@@ -79,6 +79,21 @@ if (checkedOut !== null && !values["allow-checked-out"]) {
     `set branch = "minga" in project.toml (serve creates it), check out another branch there, or pass --allow-checked-out`,
   );
 }
+// Holdout tests must stay private: refuse a holdout directory git tracks (it would be served
+// to every volunteer in repo.git), and one that does not exist.
+if (cfg.holdout) {
+  const dir = resolve(repoDir, cfg.holdout.dir);
+  if (!existsSync(dir)) die(`holdout dir ${dir} does not exist`, "create it and put the private tests there, or remove [holdout]");
+  const tracked = Bun.spawnSync(["git", "-C", repoDir, "ls-files", "--", dir]);
+  if (tracked.exitCode === 0 && tracked.stdout.toString().trim() !== "") {
+    die(`holdout dir ${cfg.holdout.dir} is tracked by git, so volunteers can read it`, `move it under .minga/ (git-ignored), or git rm -r --cached ${cfg.holdout.dir}`);
+  }
+  const onBranch = Bun.spawnSync(["git", "-C", repoDir, "ls-tree", "-r", "--name-only", cfg.branch, "--", dir]);
+  if (onBranch.exitCode === 0 && onBranch.stdout.toString().trim() !== "") {
+    die(`holdout files are committed on branch ${cfg.branch}, so volunteers can read them`, "remove them from that branch's history first");
+  }
+}
+
 const concurrency = values["check-concurrency"] !== undefined
   ? Math.max(1, Number(values["check-concurrency"]) || 1)
   : cfg.checkConcurrency > 0 ? cfg.checkConcurrency : Math.max(1, availableParallelism() - 1);
@@ -87,6 +102,7 @@ if (values["dry-run"]) {
   console.log(JSON.stringify({
     ok: true,
     project: { name: cfg.name, check: cfg.check, paths: cfg.paths, branch: cfg.branch, head, recheck: cfg.recheck, checkKeep: cfg.checkKeep },
+    safety: { protect: cfg.protect, gates: cfg.gates, review: cfg.review, holdout: cfg.holdout ?? null, sandbox: cfg.sandbox },
     checkConcurrency: concurrency,
     seedTasks: cfg.seedTasks.length,
   }, null, 2));
@@ -106,12 +122,18 @@ function checkedOutIn(repo: string, branch: string): string | null {
 }
 
 const LOOPBACK = new Set(["127.0.0.1", "localhost", "::1"]);
-if (!LOOPBACK.has(values.host!)) {
+if (!LOOPBACK.has(values.host!) && cfg.sandbox.mode === "none") {
   console.warn(
     "minga: WARNING: listening beyond this machine. The check command runs agent-submitted files\n" +
-    "  with this user's permissions and no sandbox. Run the server inside a container or VM with\n" +
-    "  no secrets before exposing it.",
+    "  with this user's permissions and no sandbox. Set [sandbox] mode = \"docker\" in project.toml,\n" +
+    "  or run the server inside a container or VM with no secrets, before exposing it.",
   );
+}
+if (cfg.holdout && cfg.sandbox.mode === "none") {
+  console.warn("minga: WARNING: [holdout] without [sandbox]: checked code runs on this machine and can read the holdout files. Use mode = \"docker\" to keep them private.");
+}
+if (cfg.review.mode === "none") {
+  console.log("minga: review = \"none\": work that passes the check lands at once. Set review = \"head\" to approve each change first.");
 }
 
 const stateDir = join(repoDir, ".minga");
@@ -121,7 +143,7 @@ if (!existsSync(join(stateDir, ".gitignore"))) await Bun.write(join(stateDir, ".
 const dbPath = values.db ? resolve(values.db) : join(stateDir, "events.db");
 mkdirSync(dirname(dbPath), { recursive: true });
 const store = openEventStore(dbPath);
-const pool = await createCheckPool({ repoDir, size: concurrency, keep: cfg.checkKeep });
+const pool = await createCheckPool({ repoDir, size: concurrency, keep: cfg.checkKeep, sandbox: cfg.sandbox });
 
 const app = createApp({
   cfg, store, repoDir, pool, commitAccepted, branchHead, changedPaths, initialHead: head,
