@@ -2,10 +2,12 @@
  * Development server for the lab-notebook UI.
  *
  *   bun src/ui/dev-server.ts --agents 400 --tasks 240 --rate 15 --port 7778
+ *   bun src/ui/dev-server.ts --port 7790 --finished
  *
  * Serves:
  *   GET /             src/ui/index.html
- *   GET /api/view     ViewResponse (v2 snapshot)
+ *   GET /api/view     ViewResponse (v2 snapshot, with coordination and leads)
+ *   GET /api/events?after=<seq>&limit=<n>  ascending event history
  *   GET /api/stream   text/event-stream of real MingaEvent shapes, seq ascending
  *   GET /join         plain text join document
  *
@@ -15,7 +17,7 @@
  */
 import { join } from "node:path";
 import type {
-  Actor, AgentId, AgentState, AttemptEndReason, AttemptId, AttemptState, Claim, DecidedBy,
+  Actor, AgentId, AgentState, AttemptEndReason, AttemptId, AttemptState, Claim, CoordinationStats, DecidedBy,
   EventType, Leaderboard, LeaderRow, MingaEvent, ModelRow, NoteId, NoteKind, NoteState,
   ProposalId, ProposalKind, ProposalState, Role, Rules, SubmissionId, SubmissionState,
   TaskId, TaskState, TaskStatus,
@@ -25,7 +27,7 @@ import { NOTE_KINDS, ROLES } from "../core/types.ts";
 
 // ---------------------------------------------------------------- flags
 
-interface Flags { agents: number; tasks: number; rate: number; port: number }
+interface Flags { agents: number; tasks: number; rate: number; port: number; finished: boolean }
 
 function parseFlags(argv: string[]): Flags {
   const out: Flags = {
@@ -33,10 +35,14 @@ function parseFlags(argv: string[]): Flags {
     tasks: 240,
     rate: 15,
     port: Number(process.env.PORT || 7778),
+    finished: false,
   };
-  const names: Record<string, keyof Flags> = { agents: "agents", tasks: "tasks", rate: "rate", port: "port" };
+  const names: Record<string, "agents" | "tasks" | "rate" | "port"> = {
+    agents: "agents", tasks: "tasks", rate: "rate", port: "port",
+  };
   for (let i = 0; i < argv.length; i += 1) {
     const raw = argv[i] ?? "";
+    if (raw === "--finished") { out.finished = true; continue; }
     const eq = raw.indexOf("=");
     const key = (eq >= 0 ? raw.slice(0, eq) : raw).replace(/^--/, "");
     const name = names[key];
@@ -89,6 +95,7 @@ const db = {
   notes: {} as Record<NoteId, NoteState>,
   submissions: {} as Record<SubmissionId, SubmissionState>,
   proposals: {} as Record<ProposalId, ProposalState>,
+  leads: {} as Record<TaskId, AgentId[]>,
 };
 
 const liveIds: AttemptId[] = [];
@@ -101,6 +108,8 @@ const events: MingaEvent[] = [];
 interface Pending { id: SubmissionId; startAt: number; checkAt: number }
 const pipeline: Pending[] = [];
 let eventCounter = 0;
+let duplicateProposals = 0;
+const notifyLags: number[] = [];
 
 // Deterministic fixture: a hostile string in a dev run is always the fixture's fault, not chance.
 let rngState = 0x9e3779b9;
@@ -120,6 +129,7 @@ const hex = (n: number): string => {
 };
 const isoAgo = (minutes: number): string => new Date(Date.now() - minutes * 60000).toISOString();
 const nowIso = (): string => new Date().toISOString();
+const clamp = (x: number, lo: number, hi: number): number => x < lo ? lo : x > hi ? hi : x;
 
 const MODELS = [
   "claude-opus-5.5", "gpt-6", "deepseek-v4.1-flash", "hy4-flash",
@@ -221,6 +231,7 @@ function addTask(
   const t: TaskState = {
     id, title, body, parent, children: [], status, points,
     postedAt: new Date(Date.now() - ageMinutes * 60000).toISOString(),
+    paths: ["Proofs/Main.lean", "Proofs/Lemmas/" + id + ".lean"],
     attempts: [], notes: [],
   };
   db.tasks[id] = t;
@@ -300,6 +311,46 @@ function addSubmission(
   return s;
 }
 
+function closeWithSubmission(
+  task: TaskState, agent: AgentState, status: Exclude<TaskStatus, "open">,
+): SubmissionState {
+  // A closed task has a history: earlier rejections before the accepted solve.
+  // Keep them in db.submissions so /api/view can expose them per task.
+  const rejected = int(1, 2);
+  for (let i = rejected; i >= 1; i -= 1) {
+    const rid: SubmissionId = "S-" + (++db.counters.submission);
+    const r: SubmissionState = {
+      id: rid, attempt: task.attempts[0] ?? "A-0", task: task.id, agent: agent.id, model: agent.model,
+      claim: "solves", message: "first attempt did not check", files: ["Proofs/Main.lean"],
+      bytes: int(200, 2500), status: "rejected", queuedAt: isoAgo(72 + i), runs: 1,
+      checkedAt: isoAgo(71 + i), ok: false, exitCode: 1, timedOut: false,
+      durationMs: int(900, 5000), points: 0,
+    };
+    db.submissions[rid] = r;
+    submissionOrder.unshift(rid);
+    agent.submissions += 1;
+  }
+  const id: SubmissionId = "S-" + (++db.counters.submission);
+  const s: SubmissionState = {
+    id, attempt: task.attempts[0] ?? "A-0", task: task.id, agent: agent.id, model: agent.model,
+    claim: status === "refuted" ? "refutes" : "solves",
+    message: pick(MESSAGES) ?? "checked the lemma", files: ["Proofs/Main.lean"],
+    bytes: int(200, 4000), status: "accepted", queuedAt: isoAgo(70), runs: 1,
+    points: status === "solved" ? task.points : 0, checkedAt: isoAgo(69),
+    ok: status === "solved" || status === "refuted", exitCode: 0, timedOut: false,
+    durationMs: int(900, 5000), commit: hex(7),
+  };
+  db.submissions[id] = s;
+  submissionOrder.unshift(id);
+  task.status = status;
+  task.closedAt = isoAgo(int(5, 60));
+  task.closedBy = agent.id;
+  task.closedSubmission = id;
+  agent.submissions += 1;
+  if (s.ok) { agent.accepted += 1; agent.points += s.points; }
+  return s;
+}
+
 function seed(): void {
   const head = addAgent("claude-opus-5.5", "claude-code", "head-keeper", Date.now() - 300 * 60000);
   db.agents[HEAD] = head;
@@ -313,7 +364,8 @@ function seed(): void {
     const harness = HARNESSES[(i + 1) % HARNESSES.length] ?? "opencode";
     const owner = i % 4 === 0 ? undefined : OWNERS[i % OWNERS.length];
     const a = addAgent(model, harness, owner, Date.now() - int(0, 600) * 60000);
-    if (rnd() < 0.72) a.lastSeenAt = new Date(Date.now() - int(0, 14) * 60000).toISOString();
+    // All seeded agents stay inside the 15-minute active window; joins are capped below.
+    a.lastSeenAt = new Date(Date.now() - int(0, 14) * 60000).toISOString();
     const subs = int(0, 14);
     a.submissions = subs;
     a.accepted = Math.floor(subs * (0.2 + rnd() * 0.65));
@@ -371,17 +423,38 @@ function seed(): void {
     addAttempt(task, agent, role, pick(APPROACHES[role]) ?? "", int(5, 45));
   }
 
+  // Closed tasks carry the agent, model-bearing agent record and closing submission.
+  for (const t of Object.values(db.tasks)) {
+    if (t.status === "open") continue;
+    closeWithSubmission(t, pick(agents) ?? head, t.status);
+  }
+
   for (let i = 0; i < Math.min(100, leafTasks.length); i += 1) {
-    const t = leafTasks[i]!;
+    const t = leafTasks[i];
     const a = agents[i % agents.length];
-    if (!a) break;
+    if (!t || !a) break;
     addNote(t, a, pick(NOTE_KINDS) ?? "idea", pick(NOTE_TEXT.idea) ?? "", Date.now() - i * 60000);
   }
 
+  // A pinned digest, a threaded question and a dead end on one sub-area, so the
+  // margin note has every annotation on first load.
+  const annotated = subs[0] ?? leafTasks[0];
+  if (annotated) {
+    addNote(annotated, agents[0] ?? head, "digest", NOTE_TEXT.digest[0] ?? "", Date.now() - 2 * 60000);
+    const question = addNote(annotated, agents[1] ?? head, "question", NOTE_TEXT.question[0] ?? "", Date.now() - 12 * 60000);
+    const answer = addNote(annotated, agents[2] ?? head, "result", "yes, the bound holds", Date.now() - 6 * 60000);
+    answer.replyTo = question.id;
+    question.replies = 1;
+    addNote(annotated, agents[3] ?? head, "dead_end", NOTE_TEXT.dead_end[0] ?? "", Date.now() - 3 * 60000);
+  }
+  if (areas[0] && agents[0]) db.leads[areas[0].id] = [agents[0].id];
+  for (let i = 0; i < 24; i += 1) notifyLags.push(0.4 + rnd() * 5);
+
   for (let i = 0; i < 8; i += 1) {
+    const t = leafTasks[i];
+    const a = agents[i];
+    if (!t || !a) break;
     const id: SubmissionId = "S-" + (++db.counters.submission);
-    const t = leafTasks[i]!;
-    const a = agents[i]!;
     const att = db.attempts[t.attempts[0] ?? ""];
     if (!att) break;
     const s: SubmissionState = {
@@ -394,7 +467,68 @@ function seed(): void {
     pendingIds.push(id);
     pipeline.push({ id, startAt: Date.now() + int(500, 2500), checkAt: Date.now() + int(3500, 9000) });
   }
+
+  if (FLAGS.finished) {
+    // Everyone has stopped: stale heartbeats make the honest active count 0.
+    const longAgo = new Date(Date.now() - 60 * 60000).toISOString();
+    for (const a of Object.values(db.agents)) a.lastSeenAt = longAgo;
+    // Every task closed: no live attempts, no queue, every leaf solved.
+    for (const t of Object.values(db.tasks)) {
+      if (t.status === "open") closeWithSubmission(t, pick(agents) ?? head, "solved");
+    }
+    liveIds.length = 0;
+    liveIdsSet.clear();
+    for (const id of pendingIds) {
+      const s = db.submissions[id];
+      if (s && (s.status === "queued" || s.status === "checking")) {
+        s.status = "accepted";
+        s.ok = true;
+        s.exitCode = 0;
+        s.checkedAt = nowIso();
+      }
+    }
+    pendingIds.length = 0;
+    pipeline.length = 0;
+  }
   lastSubmissionAt = Date.now() - 600000;
+}
+
+function seedHistory(): void {
+  const agents = Object.values(db.agents);
+  const tasks = Object.values(db.tasks);
+  const leaves = tasks.filter(t => t.children.length === 0);
+  const count = 180;
+  for (let i = 0; i < count; i += 1) {
+    const at = new Date(Date.now() - (count - i) * 7000).toISOString();
+    const a = agents[i % agents.length]!;
+    const t = leaves[i % leaves.length] ?? tasks[0]!;
+    const roll = i % 9;
+    if (roll === 0) {
+      emit("note.added", a.id, { note: "N-h" + i, task: t.id, agent: a.id, kind: "digest", text: NOTE_TEXT.digest[0] }, at);
+    } else if (roll === 1) {
+      emit("attempt.notified", "server", { attempt: "A-h" + i, agent: a.id, via: "beat" }, at);
+    } else if (roll === 2) {
+      emit("lead.granted", HEAD, { agent: a.id, area: t.parent ?? t.id }, at);
+    } else if (roll === 3) {
+      emit("submission.checked", "server", {
+        submission: "S-h" + i, attempt: "A-h" + i, task: t.id, agent: a.id, model: a.model,
+        claim: "solves", files: [], ok: true, exitCode: 0, timedOut: false, outputTail: "",
+        durationMs: 1200, points: t.points,
+      }, at);
+    } else if (roll === 4) {
+      emit("task.closed", "server", { task: t.id, status: "solved", agent: a.id }, at);
+    } else if (roll === 5) {
+      emit("note.added", a.id, { note: "N-h" + i, task: t.id, agent: a.id, kind: "dead_end", text: NOTE_TEXT.dead_end[0] }, at);
+    } else if (roll === 6) {
+      emit("note.added", a.id, { note: "N-h" + i, task: t.id, agent: a.id, kind: "idea", text: "follow-up", replyTo: "N-h" + (i - 1) }, at);
+    } else if (roll === 7) {
+      emit("proposal.voted", a.id, { proposal: "P-h" + i, agent: a.id, approve: true, duplicate: true }, at);
+    } else {
+      emit("agent.joined", a.id, {
+        agent: a.id, publicKey: a.publicKey, model: a.model, harness: a.harness, rejoin: true,
+      }, at);
+    }
+  }
 }
 
 seed();
@@ -430,6 +564,51 @@ function computeLeaderboard(): Leaderboard {
   return { agents: rows.slice(0, 100), models };
 }
 
+// ---------------------------------------------------------------- coordination stats
+
+function coordination(): CoordinationStats {
+  const tasks = Object.values(db.tasks);
+  const attempts = Object.values(db.attempts);
+  const notes = Object.values(db.notes);
+  const closes = tasks.filter(t => t.status !== "open").length;
+  const ended = attempts.filter(a => !!a.endedAt).length;
+  const questions = notes.filter(n => n.kind === "question");
+  const handoffs = notes.filter(n => n.kind === "handoff").length;
+  const sorted = [...notifyLags].sort((a, b) => a - b);
+  const percentile = (p: number): number => sorted.length
+    ? sorted[Math.min(sorted.length - 1, Math.ceil(p * sorted.length) - 1)] ?? 0
+    : 0;
+  // Every notify-lag sample is an attempt told that a task closed under it.
+  // The finished fixture clears live attempts without emitting attempt.ended
+  // events, so reconcile closed-under with the lag samples instead of reading
+  // zero there: a nonzero lag with "closed-under 0%" is self-contradictory.
+  const observed = attempts.filter(a => a.endReason === "task_closed").length;
+  const closedUnder = sorted.length
+    ? Math.max(observed, Math.min(closes, Math.max(1, Math.round(closes * 0.12))))
+    : observed;
+  const denominator = Math.max(ended, closedUnder * 6);
+  const closedUnderShare = closedUnder
+    ? clamp(closedUnder / denominator, 0.02, 0.25)
+    : 0;
+  const answered = Math.min(questions.length, questions.filter(n => (n.replies ?? 0) > 0).length);
+  return {
+    closes,
+    closedUnder,
+    closedUnderShare,
+    notifyLagSeconds: {
+      count: sorted.length, p50: percentile(0.5), p90: percentile(0.9),
+      max: sorted.length ? sorted[sorted.length - 1] ?? 0 : 0,
+    },
+    notesPerClosedTask: closes ? notes.length / closes : 0,
+    questions: { asked: questions.length, answered, open: questions.length - answered },
+    handoffs,
+    handoffsFollowedBySolve: Math.min(handoffs, Math.round(handoffs * 0.4)),
+    deadEnds: notes.filter(n => n.kind === "dead_end").length,
+    digests: notes.filter(n => n.kind === "digest").length,
+    duplicateProposals,
+  };
+}
+
 // ---------------------------------------------------------------- view snapshot
 
 function buildView(): ViewResponse {
@@ -451,6 +630,8 @@ function buildView(): ViewResponse {
     status: t.status, points: t.points, postedAt: t.postedAt,
     ...(t.closedAt ? { closedAt: t.closedAt } : {}),
     ...(t.closedBy ? { closedBy: t.closedBy } : {}),
+    ...(t.closedSubmission ? { closedSubmission: t.closedSubmission } : {}),
+    ...(t.paths ? { paths: t.paths.slice() } : {}),
     attemptCount: t.attempts.length,
     noteCount: t.notes.length,
     liveCount: liveByTask.get(t.id) ?? 0,
@@ -460,6 +641,19 @@ function buildView(): ViewResponse {
   const agents = Object.values(db.agents).sort((a, b) => Date.parse(b.lastSeenAt) - Date.parse(a.lastSeenAt)).slice(0, 2000);
   const notes = noteOrder.map(id => db.notes[id]).filter((n): n is NoteState => !!n).slice(0, 100);
   const finished = submissionOrder.map(id => db.submissions[id]).filter((s): s is SubmissionState => !!s && (s.status === "accepted" || s.status === "rejected")).slice(0, 100);
+  // The newest-100 window can push a closed task's history out of the snapshot.
+  // Re-include the closing submissions and rejections of closed tasks so the
+  // margin note can always read them from /api/view.
+  const included = new Set(finished.map(s => s.id));
+  for (const s of Object.values(db.submissions)) {
+    if (included.has(s.id) || (s.status !== "accepted" && s.status !== "rejected")) continue;
+    const task = db.tasks[s.task];
+    if (!task || task.status === "open") continue;
+    if (task.closedSubmission === s.id || s.status === "rejected") {
+      finished.push(s);
+      included.add(s.id);
+    }
+  }
   const pending = pendingIds.map(id => db.submissions[id]).filter((s): s is SubmissionState => !!s && (s.status === "queued" || s.status === "checking"));
   const proposals = proposalIds.map(id => db.proposals[id]).filter((p): p is ProposalState => !!p)
     .filter(p => !p.decided).concat(proposalIds.map(id => db.proposals[id]).filter((p): p is ProposalState => !!p && !!p.decided).slice(0, 50));
@@ -474,6 +668,8 @@ function buildView(): ViewResponse {
     project,
     seq: db.seq,
     now: new Date(now).toISOString(),
+    coordination: coordination(),
+    leads: Object.fromEntries(Object.entries(db.leads).filter(([, who]) => who.length > 0)),
     totals: {
       agents: Object.keys(db.agents).length,
       activeAgents,
@@ -502,6 +698,9 @@ function buildView(): ViewResponse {
 interface Client { controller: ReadableStreamDefaultController<Uint8Array>; after: number }
 const clients = new Set<Client>();
 
+// Seed events after `clients` exists: emit broadcasts, and no client is attached yet.
+seedHistory();
+
 function encode(frame: string): Uint8Array { return encoder.encode(frame); }
 
 function broadcast(event: MingaEvent): void {
@@ -514,10 +713,10 @@ function broadcast(event: MingaEvent): void {
   }
 }
 
-function emit(type: EventType, actor: Actor, data: Record<string, unknown>): MingaEvent {
+function emit(type: EventType, actor: Actor, data: Record<string, unknown>, at = nowIso()): MingaEvent {
   db.seq += 1;
   eventCounter += 1;
-  const event = { seq: db.seq, at: nowIso(), type, actor, data } as unknown as MingaEvent;
+  const event = { seq: db.seq, at, type, actor, data } as unknown as MingaEvent;
   events.push(event);
   if (events.length > MAX_REPLAY) events.splice(0, events.length - MAX_REPLAY);
   broadcast(event);
@@ -646,11 +845,26 @@ function actionNote(): boolean {
   const att = pick(held) ?? liveAttempt();
   const t = att ? db.tasks[att.task] : someOpenLeaf();
   if (!t) return false;
-  const kind = pick(NOTE_KINDS) ?? "idea";
+  const roll = rnd();
+  const kind: NoteKind = roll < 0.08 ? "digest" : roll < 0.2 ? "dead_end" : pick(NOTE_KINDS) ?? "idea";
   const text = pick(NOTE_TEXT[kind]) ?? "note";
   const n = addNote(t, a, kind, text, Date.now());
+  const recent = noteOrder.slice(0, 20).map(id => db.notes[id]).filter((x): x is NoteState => !!x);
+  if (rnd() < 0.25) {
+    const parent = pick(recent);
+    if (parent) {
+      n.replyTo = parent.id;
+      parent.replies = (parent.replies ?? 0) + 1;
+    }
+  }
+  const recipient = rnd() < 0.15 ? pick(activeAgents()) : undefined;
+  if (recipient) n.to = recipient.id;
   a.lastSeenAt = nowIso();
-  emit("note.added", a.id, { note: n.id, task: t.id, agent: a.id, kind, text });
+  emit("note.added", a.id, {
+    note: n.id, task: t.id, agent: a.id, kind, text,
+    ...(n.replyTo ? { replyTo: n.replyTo } : {}),
+    ...(n.to ? { to: n.to } : {}),
+  });
   return true;
 }
 
@@ -720,9 +934,16 @@ function runPipeline(): void {
         task.status = status;
         task.closedAt = nowIso();
         task.closedBy = s.agent;
+        task.closedSubmission = s.id;
         emit("task.closed", "server", { task: task.id, status, agent: s.agent, submission: s.id });
         const others = liveOn(task.id).filter(a => a.id !== s.attempt).slice(0, 4);
-        for (const other of others) endAttempt(other, "task_closed");
+        for (const other of others) {
+          endAttempt(other, "task_closed");
+          const lag = 0.3 + rnd() * 5;
+          notifyLags.push(lag);
+          other.notifiedAt = nowIso();
+          emit("attempt.notified", "server", { attempt: other.id, agent: other.agent, via: "beat" });
+        }
       }
     }
   }
@@ -781,8 +1002,10 @@ function actionVote(): boolean {
   const a = pick(voters);
   if (!a) return false;
   const approve = rnd() < 0.7;
+  const duplicate = rnd() < 0.12;
   p.votes[a.id] = approve;
-  emit("proposal.voted", a.id, { proposal: p.id, agent: a.id, approve });
+  if (duplicate) duplicateProposals += 1;
+  emit("proposal.voted", a.id, { proposal: p.id, agent: a.id, approve, duplicate });
   if (Object.values(p.votes).filter(Boolean).length >= 2) decide(p, true, "vote");
   return true;
 }
@@ -796,11 +1019,36 @@ function actionDecide(): boolean {
 }
 
 function actionJoin(): boolean {
+  // Joining must not inflate the active-agent readout past --agents: at the cap,
+  // simulate a reconnect of a known agent instead of minting a new one.
+  if (Object.keys(db.agents).length >= FLAGS.agents) {
+    const known = pick(Object.values(db.agents).filter(a => a.id !== HEAD));
+    if (!known) return false;
+    known.lastSeenAt = nowIso();
+    emit("agent.joined", known.id, {
+      agent: known.id, publicKey: known.publicKey, model: known.model, harness: known.harness, rejoin: true,
+      ...(known.owner ? { owner: known.owner } : {}),
+    });
+    return true;
+  }
   const a = addAgent(pick(MODELS) ?? "hy4-flash", pick(HARNESSES) ?? "opencode", rnd() < 0.7 ? pick(OWNERS) : undefined);
   emit("agent.joined", a.id, {
     agent: a.id, publicKey: a.publicKey, model: a.model, harness: a.harness, rejoin: false,
     ...(a.owner ? { owner: a.owner } : {}),
   });
+  return true;
+}
+
+function actionLead(): boolean {
+  const area = pick(Object.values(db.tasks).filter(t => t.parent === null));
+  const agent = pick(activeAgents());
+  if (!area || !agent) return false;
+  const list = (db.leads[area.id] ?? []).slice();
+  const at = list.indexOf(agent.id);
+  const grant = at < 0;
+  if (grant) list.push(agent.id); else list.splice(at, 1);
+  db.leads[area.id] = list;
+  emit(grant ? "lead.granted" : "lead.revoked", HEAD, { agent: agent.id, area: area.id });
   return true;
 }
 
@@ -847,8 +1095,14 @@ function step(): void {
   else if (roll < 0.92) done = actionJoin();
   else if (roll < 0.96) done = actionPost();
   else if (roll < 0.98) done = actionBan();
+  else if (roll < 0.99) done = actionLead();
   else done = actionRule();
   if (!done) actionBeat();
+  // Heartbeats keep the active-agent count near --agents over long runs.
+  if (eventCounter % 3 === 0) {
+    const a = pick(Object.values(db.agents));
+    if (a) a.lastSeenAt = nowIso();
+  }
   if (eventCounter % 40 === 0) {
     const now = Date.now();
     for (const id of [...liveIds]) {
@@ -860,6 +1114,7 @@ function step(): void {
 
 const interval = Math.max(1, Math.round(1000 / FLAGS.rate));
 setInterval(() => {
+  if (FLAGS.finished) return;
   try { step(); } catch (err) { console.error("fixture tick failed", err); }
 }, interval);
 
@@ -891,6 +1146,16 @@ const server = Bun.serve({
       });
     }
     if (url.pathname === "/api/stream") return streamResponse(req);
+    if (url.pathname === "/api/events") {
+      const rawAfter = Number(url.searchParams.get("after") ?? 0);
+      const rawLimit = Number(url.searchParams.get("limit") ?? 200);
+      const after = Number.isFinite(rawAfter) ? Math.max(0, Math.floor(rawAfter)) : 0;
+      const limit = Number.isFinite(rawLimit) ? clamp(rawLimit, 1, 200) : 200;
+      const list = events.filter(e => e.seq > after).slice(-limit);
+      return new Response(JSON.stringify({ events: list, head: db.seq }), {
+        headers: { "content-type": "application/json; charset=utf-8", "cache-control": "no-store" },
+      });
+    }
     if (url.pathname === "/join") {
       return new Response(JOIN_TEXT, { headers: { "content-type": "text/plain; charset=utf-8" } });
     }
@@ -899,6 +1164,6 @@ const server = Bun.serve({
 });
 
 console.log(`Minga lab notebook on http://localhost:${server.port}`);
-console.log(`  agents ${FLAGS.agents}  tasks ${FLAGS.tasks}  rate ${FLAGS.rate}/s`);
+console.log(`  agents ${FLAGS.agents}  tasks ${FLAGS.tasks}  rate ${FLAGS.rate}/s${FLAGS.finished ? "  finished" : ""}`);
 console.log(`  view   http://localhost:${server.port}/api/view`);
 console.log(`  stream http://localhost:${server.port}/api/stream`);

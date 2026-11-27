@@ -36,6 +36,7 @@ body{
 .sc{font-variant-caps:all-small-caps; letter-spacing:.04em; font-size:12px}
 .label{font-variant-caps:all-small-caps; letter-spacing:.04em; font-size:12px; color:var(--ink-2)}
 .caption{font:500 15px/1.4 var(--sans); color:var(--ink); margin:6px 0 10px}
+.caption{overflow-wrap:anywhere}
 .caption.note,.caption .note{font:400 13px/1.5 var(--sans); color:var(--ink-2)}
 button.textbtn{
   font:500 12px/1.4 var(--sans); color:var(--ink-2); background:none; border:0;
@@ -51,6 +52,9 @@ button.textbtn:hover{color:var(--ink)}
 .wordmark{font:500 13px/1.2 var(--sans); font-variant-caps:all-small-caps; letter-spacing:.04em; color:var(--ink-2)}
 .masthead h1{font:600 32px/1.1 var(--sans); letter-spacing:-0.01em; margin:8px 0 6px}
 .goal{font:400 15px/1.45 var(--sans); color:var(--ink-2); margin:0; max-width:68ch}
+.finished{display:flex; flex-wrap:wrap; gap:4px 10px; font:500 13px/1.4 var(--sans); color:var(--accent); margin:10px 0 0}
+.finished[hidden]{display:none}
+.finished .note{font:400 12px/1.4 var(--sans); color:var(--ink-2)}
 .join{text-align:left; min-width:260px}
 .join .line{display:flex; align-items:baseline; gap:10px; margin:4px 0 14px}
 .join .url{font-size:13px; color:var(--ink); overflow-wrap:anywhere}
@@ -65,6 +69,11 @@ button.textbtn:hover{color:var(--ink)}
 .spark polyline{fill:none; stroke:var(--ink); stroke-width:1; vector-effect:non-scaling-stroke}
 .spark line{stroke:var(--accent); stroke-width:1; vector-effect:non-scaling-stroke}
 
+.coord{display:flex; flex-wrap:wrap; align-items:baseline; gap:4px 20px; padding:10px 0; border-bottom:1px solid var(--rule); font:400 12px/1.5 var(--mono); font-variant-numeric:tabular-nums; color:var(--ink-2)}
+.coord[hidden]{display:none}
+.coord .citem{white-space:nowrap}
+.coord .citem b{font-weight:500; color:var(--ink)}
+
 .block{border-bottom:1px solid var(--rule); padding:20px 0}
 .section{font:500 15px/1.3 var(--sans); margin:0 0 4px; font-variant-caps:all-small-caps; letter-spacing:.02em}
 .section .sc{font-family:var(--sans); color:var(--ink-2); margin-right:8px}
@@ -78,7 +87,7 @@ button.textbtn:hover{color:var(--ink)}
 .tasklist .spacer{width:1px}
 .task-row{position:absolute; left:0; right:0; height:22px; display:grid; grid-template-columns:18px 58px minmax(0,1fr) 48px; gap:8px; align-items:center; font-size:12px}
 .task-row .t{font-family:var(--mono); font-size:12px}
-.task-row .title{overflow:hidden; text-overflow:ellipsis; white-space:nowrap}
+.task-row .title{overflow:hidden; text-overflow:ellipsis; white-space:nowrap; min-width:0}
 .task-row .live{text-align:right; font-family:var(--mono); font-variant-numeric:tabular-nums; color:var(--ink-2)}
 
 .rightcol{min-width:0; display:flex; flex-direction:column; gap:20px}
@@ -90,6 +99,9 @@ button.textbtn:hover{color:var(--ink)}
 .nlist li b{font-weight:500; color:var(--ink)}
 .nlist li .role{font-family:var(--sans)}
 .nhead{font-size:12px; color:var(--ink-2); margin:10px 0 3px}
+.margin-note .digest{font:400 12px/1.5 var(--sans); color:var(--ink); margin:2px 0 8px; overflow-wrap:anywhere}
+.nlist li .mark{color:var(--accent)}
+.nlist li .reply{color:var(--ink-3)}
 
 .qlist{position:relative; max-height:240px; overflow-y:auto; border-top:1px solid var(--rule); border-bottom:1px solid var(--rule); scrollbar-width:thin}
 .qlist .spacer{width:1px}
@@ -100,7 +112,7 @@ button.textbtn:hover{color:var(--ink)}
 .qrow.more{color:var(--ink-3); font-family:var(--sans); font-size:12px}
 .qlist .qempty{font:400 12px/20px var(--sans); color:var(--ink-3)}
 .loglist{list-style:none; margin:8px 0 0; padding:0; max-height:200px; overflow-y:auto; border-top:1px solid var(--rule); scrollbar-width:thin}
-.logline{display:grid; grid-template-columns:72px 62px 76px minmax(0,1fr); gap:8px; font:400 12px/1.7 var(--mono); font-variant-numeric:tabular-nums; color:var(--ink); overflow-wrap:anywhere}
+.logline{display:grid; grid-template-columns:72px 62px 92px minmax(0,1fr); gap:8px; font:400 12px/1.7 var(--mono); font-variant-numeric:tabular-nums; color:var(--ink); overflow-wrap:anywhere}
 .logline time{color:var(--ink-3)}
 .logline .who,.logline .verb{color:var(--ink-2)}
 .logline.fresh{color:var(--accent); transition:color 1.2s linear}
@@ -143,6 +155,7 @@ td.mono{font:400 12px/1.5 var(--mono); font-variant-numeric:tabular-nums}
   .readouts{grid-template-columns:repeat(2,minmax(0,1fr)); gap:16px}
   .cwrap{display:none}
   .tasklist{display:block}
+  .tables section{overflow-x:auto}
   .logline{grid-template-columns:64px 52px minmax(0,1fr)}
   .logline .verb{display:none}
 }
@@ -155,6 +168,7 @@ td.mono{font:400 12px/1.5 var(--mono); font-variant-numeric:tabular-nums}
       <div class="wordmark">minga</div>
       <h1 id="projectName">project</h1>
       <p class="goal" id="projectGoal"></p>
+      <p class="finished" id="finishedLine" hidden></p>
     </div>
     <div class="join">
       <div class="label">join</div>
@@ -178,6 +192,8 @@ td.mono{font:400 12px/1.5 var(--mono); font-variant-numeric:tabular-nums}
     <div class="readout"><div class="label">events / min</div><div class="val" id="rEvents">0</div>
       <svg class="spark" viewBox="0 0 60 14" preserveAspectRatio="none" aria-hidden="true"><polyline id="spEvents" points=""></polyline><line id="lpEvents" x1="59" y1="7" x2="59" y2="7"></line></svg></div>
   </section>
+
+  <section class="coord" id="coordPanel" aria-label="Coordination" hidden></section>
 
   <div class="main">
     <section class="figure-section" aria-label="Task field">
@@ -269,12 +285,14 @@ td.mono{font:400 12px/1.5 var(--mono); font-variant-numeric:tabular-nums}
 
   const EVENT_TYPES = [
     "agent.joined", "agent.banned", "task.posted", "task.closed", "attempt.started",
-    "attempt.beat", "attempt.ended", "note.added", "submission.queued", "submission.started",
+    "attempt.beat", "attempt.ended", "attempt.notified", "lead.granted", "lead.revoked",
+    "note.added", "submission.queued", "submission.started",
     "submission.checked", "proposal.made", "proposal.voted", "proposal.decided", "rule.changed",
   ];
   const VERBS = {
     "agent.joined": "joined", "agent.banned": "banned", "task.posted": "posted", "task.closed": "closed",
-    "attempt.started": "took", "attempt.beat": "beat", "attempt.ended": "released", "note.added": "noted",
+    "attempt.started": "took", "attempt.beat": "beat", "attempt.ended": "released",
+    "attempt.notified": "told", "lead.granted": "granted lead", "lead.revoked": "revoked lead", "note.added": "noted",
     "submission.queued": "submitted", "submission.started": "submitted", "submission.checked": "accepted",
     "proposal.made": "proposed", "proposal.voted": "voted", "proposal.decided": "decided", "rule.changed": "changed",
   };
@@ -319,9 +337,11 @@ td.mono{font:400 12px/1.5 var(--mono); font-variant-numeric:tabular-nums}
   let liveByTask = new Map();
   let notesByTask = new Map();
   let subsByAttempt = new Map();
+  let subsByTask = new Map();
   let pendingSubs = [];
   let checking = new Set();
   let logLines = [];
+  let seenSeq = new Set();
   let eventTimes = [];
   let samples = {};
   let lastSample = 0;
@@ -367,6 +387,53 @@ td.mono{font:400 12px/1.5 var(--mono); font-variant-numeric:tabular-nums}
   const familyGlyph = modelName => hash(S(modelName)) % 6;
   const numId = id => N(S(id).replace(/^T-/, ""));
 
+  // History is bounded: view.seq minus 200, never negative.
+  function historyUrl(seq) {
+    return "/api/events?after=" + Math.max(0, N(seq) - 200) + "&limit=200";
+  }
+  const taskIsLeaf = t => !!t && (!Array.isArray(t.children) || t.children.length === 0);
+  const fmtSec = v => (Math.round(N(v) * 10) / 10) + "s";
+  function taskChain(t) {
+    const out = [];
+    let cur = t;
+    const seen = new Set();
+    while (cur && !seen.has(cur.id)) {
+      out.push(cur);
+      seen.add(cur.id);
+      cur = cur.parent ? findTask(cur.parent) : null;
+    }
+    return out;
+  }
+  function digestFor(t) {
+    if (!t) return null;
+    for (const task of taskChain(t)) {
+      const notes = (notesByTask.get(task.id) || []).filter(n => S(n.kind) === "digest");
+      if (notes.length) {
+        notes.sort((a, b) => Date.parse(b.at) - Date.parse(a.at));
+        return { task, note: notes[0] };
+      }
+    }
+    return null;
+  }
+  function noteAnswered(n, notes) {
+    return N(n.replies) > 0 || (notes || []).some(x => x.replyTo === n.id);
+  }
+  function closedLabel(t) {
+    if (!t || t.status === "open") return "";
+    const agent = t.closedBy ? agentById.get(S(t.closedBy)) : null;
+    return shortId(t.closedBy, 6) +
+      (agent && agent.model ? " · " + S(agent.model) : "") +
+      (t.closedSubmission ? " · " + S(t.closedSubmission) : "");
+  }
+  function finishedSummary() {
+    if (!model) return null;
+    const leaves = model.tasks.filter(taskIsLeaf);
+    if (!leaves.length || leaves.some(t => t.status === "open")) return null;
+    const counts = { solved: 0, refuted: 0, impossible: 0, withdrawn: 0 };
+    for (const t of leaves) if (Object.prototype.hasOwnProperty.call(counts, t.status)) counts[t.status] += 1;
+    return { solved: counts.solved, total: leaves.length, counts };
+  }
+
   // Pure formatting helpers. Exposed on the test hook so layout rules can be
   // checked without a browser; each one is also used by a renderer below.
   function clipText(text, maxWidth, measure) {
@@ -410,7 +477,15 @@ td.mono{font:400 12px/1.5 var(--mono); font-variant-numeric:tabular-nums}
     switch (type) {
       case "attempt.beat":
       case "attempt.ended": return S(task) + " · " + S(d.attempt);
-      case "note.added": return S(task) + " " + S(d.kind);
+      case "attempt.notified": return S(d.attempt) + ": task closed";
+      case "lead.granted":
+      case "lead.revoked": return S(d.agent) + " · " + S(d.area);
+      case "note.added": {
+        const base = S(task) + " " + S(d.kind);
+        if (d.replyTo) return base + " ↳ re " + S(d.replyTo);
+        if (d.kind === "dead_end" || d.kind === "digest") return base + " " + S(d.text).slice(0, 72);
+        return base;
+      }
       case "submission.checked": return S(task) + " " + (d.ok ? "accepted" : "rejected");
       case "task.closed": return S(task) + " " + S(d.status);
       case "attempt.started": return S(task) + " " + S(d.role);
@@ -435,6 +510,7 @@ td.mono{font:400 12px/1.5 var(--mono); font-variant-numeric:tabular-nums}
     checking = new Set();
     pendingSubs = [];
     subsByAttempt = new Map();
+    subsByTask = new Map();
     for (const s of model.submissions) {
       if (s.status === "queued" || s.status === "checking") pendingSubs.push(s);
       if (s.status === "checking") checking.add(s.attempt);
@@ -442,6 +518,10 @@ td.mono{font:400 12px/1.5 var(--mono); font-variant-numeric:tabular-nums}
       list.unshift(s);
       subsByAttempt.set(s.attempt, list);
       if (list.length > 6) list.pop();
+      const byTask = subsByTask.get(s.task) || [];
+      byTask.unshift(s);
+      subsByTask.set(s.task, byTask);
+      if (byTask.length > 8) byTask.pop();
     }
     notesByTask = new Map();
     for (const n of model.notes) {
@@ -529,16 +609,38 @@ td.mono{font:400 12px/1.5 var(--mono); font-variant-numeric:tabular-nums}
     return a;
   }
 
-  function logEvent(e) {
+  function logEvent(e, fresh) {
     const d = e.data || {};
+    const seq = N(e.seq);
+    if (seq && seenSeq.has(seq)) return;
+    if (seq) seenSeq.add(seq);
     // Beat/released events carry only an attempt id; resolve its task before formatting.
     const task = S(d.task) || S(attemptById.get(S(d.attempt))?.task || "");
     const object = logObject(e.type, d, e.actor, task);
     let verb = VERBS[e.type] || S(e.type).split(".")[1] || "event";
     if (e.type === "submission.checked") verb = d.ok ? "accepted" : "rejected";
-    logLines.unshift({ at: S(e.at), actor: S(e.actor), verb, object, fresh: true });
+    const isFresh = fresh !== false;
+    logLines.unshift({ at: S(e.at), actor: S(e.actor), verb, object, fresh: isFresh });
     if (logLines.length > 200) logLines.pop();
-    logCount += 1;
+    if (isFresh) logCount += 1;
+  }
+
+  // Cheap live updates; the periodic view resync remains authoritative.
+  function nudgeCoordination(e) {
+    const c = model && model.coordination;
+    if (!c) return;
+    const d = e.data || {};
+    if (e.type === "note.added") {
+      if (d.kind === "dead_end") c.deadEnds = N(c.deadEnds) + 1;
+      else if (d.kind === "digest") c.digests = N(c.digests) + 1;
+      else if (d.kind === "question") {
+        if (!c.questions) c.questions = { asked: 0, answered: 0, open: 0 };
+        c.questions.asked = N(c.questions.asked) + 1;
+        c.questions.open = N(c.questions.open) + 1;
+      }
+    } else if (e.type === "proposal.voted" && d.duplicate) {
+      c.duplicateProposals = N(c.duplicateProposals) + 1;
+    }
   }
 
   function applyEvent(e) {
@@ -573,6 +675,7 @@ td.mono{font:400 12px/1.5 var(--mono); font-variant-numeric:tabular-nums}
         if (task) {
           if (task.status === "open") t.openTasks -= 1;
           task.status = S(d.status); task.closedAt = S(e.at); task.closedBy = d.agent ? S(d.agent) : undefined;
+          if (d.submission) task.closedSubmission = S(d.submission);
         }
         staticDirty = true;
         break;
@@ -610,13 +713,20 @@ td.mono{font:400 12px/1.5 var(--mono); font-variant-numeric:tabular-nums}
         const n = {
           id: S(d.note), task: S(d.task), agent: S(d.agent), kind: S(d.kind), text: S(d.text), at: S(e.at),
         };
+        if (d.replyTo) n.replyTo = S(d.replyTo);
+        if (d.to) n.to = S(d.to);
         model.notes.unshift(n);
         if (model.notes.length > 100) model.notes.pop();
         const list = notesByTask.get(n.task) || [];
         list.push(n); notesByTask.set(n.task, list);
         if (list.length > 6) list.shift();
+        if (n.replyTo) {
+          const parent = model.notes.find(x => x.id === n.replyTo);
+          if (parent) parent.replies = N(parent.replies) + 1;
+        }
         const task = findTask(n.task); if (task) task.noteCount += 1;
         t.notes += 1;
+        dirtyNote = true;
         break;
       }
       case "submission.queued": {
@@ -630,6 +740,9 @@ td.mono{font:400 12px/1.5 var(--mono); font-variant-numeric:tabular-nums}
         const list = subsByAttempt.get(s.attempt) || [];
         list.unshift(s); subsByAttempt.set(s.attempt, list);
         if (list.length > 6) list.pop();
+        const byTask = subsByTask.get(s.task) || [];
+        byTask.unshift(s); subsByTask.set(s.task, byTask);
+        if (byTask.length > 8) byTask.pop();
         t.queuedSubmissions += 1; t.submissions += 1;
         dirtyQueue = true;
         break;
@@ -694,12 +807,30 @@ td.mono{font:400 12px/1.5 var(--mono); font-variant-numeric:tabular-nums}
         if (p) p.decided = { accepted: !!d.accepted, by, reason: S(d.reason), at: S(e.at) };
         break;
       }
+      case "attempt.notified": {
+        const att = attemptById.get(S(d.attempt));
+        if (att) att.notifiedAt = S(e.at);
+        break;
+      }
+      case "lead.granted":
+      case "lead.revoked": {
+        if (!model.leads) model.leads = {};
+        const area = S(d.area);
+        const list = (model.leads[area] || []).slice();
+        const at = list.indexOf(S(d.agent));
+        if (e.type === "lead.granted" && at < 0) list.push(S(d.agent));
+        if (e.type === "lead.revoked" && at >= 0) list.splice(at, 1);
+        model.leads[area] = list;
+        dirtyNote = true;
+        break;
+      }
       case "rule.changed": {
         if (model.project.rules) Object.assign(model.project.rules, d.rules || {});
         break;
       }
       default: break;
     }
+    nudgeCoordination(e);
     logEvent(e);
     eventTimes.push(Date.now());
     if (eventTimes.length > 600) eventTimes.shift();
@@ -874,6 +1005,13 @@ td.mono{font:400 12px/1.5 var(--mono); font-variant-numeric:tabular-nums}
         pctx.fillStyle = C["--ink"];
         pctx.fillText(S(t.title).slice(0, 96), xTitle, y);
         pctx.font = ID_FONT;
+        const closer = closedLabel(t);
+        if (closer) {
+          const xClose = xTickStart();
+          pctx.fillStyle = C["--ink-2"];
+          pctx.textAlign = "left";
+          pctx.fillText(clipText(closer, Math.max(60, W - xClose - 10), w => pctx.measureText(w).width), xClose, y);
+        }
       }
     }
   }
@@ -936,10 +1074,55 @@ td.mono{font:400 12px/1.5 var(--mono); font-variant-numeric:tabular-nums}
     return n;
   }
 
+  function renderFinished() {
+    const el = $("finishedLine");
+    const s = finishedSummary();
+    if (!s) { el.hidden = true; el.replaceChildren(); return; }
+    el.hidden = false;
+    const kids = [node("span", "", "finished — " + s.solved + " of " + s.total + " tasks solved")];
+    const rest = ["refuted", "impossible", "withdrawn"].filter(k => s.counts[k] > 0).map(k => k + " " + s.counts[k]);
+    if (rest.length) kids.push(node("span", "note", rest.join(" · ")));
+    el.replaceChildren(...kids);
+  }
+
+  function coordItem(name, value) {
+    const s = node("span", "citem");
+    s.appendChild(node("span", "label", name + " "));
+    s.appendChild(node("b", "", value));
+    return s;
+  }
+  function renderCoordination() {
+    const el = $("coordPanel");
+    const c = model && model.coordination;
+    if (!c) { el.hidden = true; el.replaceChildren(); return; }
+    el.hidden = false;
+    const lag = c.notifyLagSeconds || {};
+    const q = c.questions || {};
+    el.replaceChildren(
+      coordItem("notify lag", fmtSec(lag.p50) + " / " + fmtSec(lag.p90) + " p50/p90"),
+      coordItem("closed-under", Math.round(N(c.closedUnderShare) * 100) + "%"),
+      coordItem("questions", N(q.open) + " / " + N(q.asked) + " open/asked"),
+      coordItem("handoff solves", N(c.handoffsFollowedBySolve) + " / " + N(c.handoffs)),
+      coordItem("dead ends", String(N(c.deadEnds))),
+      coordItem("digests", String(N(c.digests))),
+      coordItem("duplicate proposals", String(N(c.duplicateProposals))),
+    );
+  }
+
   function renderReadouts() {
     if (!model) return;
     const t = model.totals;
-    $("rAgents").textContent = String(N(t.activeAgents));
+    const active = N(t.activeAgents);
+    if (finishedSummary() && N(t.agents) > 0) {
+      // A finished run has no live heartbeats; keep the value honest and note
+      // how many agents took part, using the small readout sublabel style.
+      $("rAgents").replaceChildren(
+        node("span", "", String(active)),
+        node("span", "sc", " · " + N(t.agents) + " took part"),
+      );
+    } else {
+      $("rAgents").textContent = String(active);
+    }
     $("rAttempts").textContent = String(N(t.liveAttempts));
     $("rQueue").replaceChildren(
       node("span", "mono", N(t.queuedSubmissions)), node("span", "sc", " queued "),
@@ -1094,7 +1277,8 @@ td.mono{font:400 12px/1.5 var(--mono); font-variant-numeric:tabular-nums}
     dirtyNote = false;
     const holder = document.createDocumentFragment ? document.createDocumentFragment() : document.createElement("div");
     const row = hover >= 0 ? rows[hover] : (focusRow >= 0 ? rows[focusRow] : null);
-    const t = row ? row.task : busiestOpenLeaf(model.tasks, liveByTask);
+    const t = row ? row.task : (busiestOpenLeaf(model.tasks, liveByTask) ||
+      (finishedSummary() ? model.tasks.find(taskIsLeaf) : null));
     selectedTask = t ? t.id : null;
     const box = $("marginNote");
     const title = $("noteTitle");
@@ -1104,6 +1288,8 @@ td.mono{font:400 12px/1.5 var(--mono); font-variant-numeric:tabular-nums}
     const kids = [node("div", "label", "margin note"), title, body];
     if (t) {
       kids.push(node("div", "nhead", S(t.id) + "  " + S(t.status) + "  " + N(t.points) + " points"));
+      const label = closedLabel(t);
+      if (label) kids.push(node("div", "nhead", "closed by " + label));
       const atts = liveByTask.get(t.id) || [];
       kids.push(node("div", "nhead", "live attempts (" + atts.length + ")"));
       kids.push(noteList(atts.slice(0, 10), a => {
@@ -1114,14 +1300,64 @@ td.mono{font:400 12px/1.5 var(--mono); font-variant-numeric:tabular-nums}
         li.appendChild(node("span", "role", S(a.approach).slice(0, 160)));
         return li;
       }));
+      const dg = digestFor(t);
+      if (dg) {
+        kids.push(node("div", "nhead", "pinned digest · " + S(dg.task.id)));
+        kids.push(node("div", "digest", S(dg.note.text).slice(0, 600)));
+      }
       const notes = notesByTask.get(t.id) || [];
       kids.push(node("div", "nhead", "newest notes"));
-      kids.push(noteList(notes.slice(-5).reverse(), n =>
-        node("li", "", clock(n.at) + "  " + shortId(n.agent, 6) + "  " + S(n.kind) + "  " + S(n.text).slice(0, 200))));
-      const subs = subsByAttempt.get((atts[0] || {}).id || "") || [];
-      kids.push(node("div", "nhead", "submission history"));
-      kids.push(noteList(subs.slice(0, 6), s =>
-        node("li", "", S(s.id) + "  " + S(s.status) + "  " + S(s.claim) + "  " + N(s.points) + " points")));
+      kids.push(noteList(notes.slice(-5).reverse(), n => {
+        const li = node("li");
+        if (S(n.kind) === "dead_end") li.appendChild(node("span", "mark", "[dead end] "));
+        if (S(n.kind) === "question" && !noteAnswered(n, notes)) li.appendChild(node("span", "mark", "[open] "));
+        li.appendChild(node("span", "", clock(n.at) + "  " + shortId(n.agent, 6) + "  " + S(n.kind) + "  " + S(n.text).slice(0, 200)));
+        if (n.replyTo) li.appendChild(node("span", "reply", "  ↳ re " + S(n.replyTo)));
+        return li;
+      }));
+      const paths = Array.isArray(t.paths) ? t.paths : [];
+      kids.push(node("div", "nhead", "paths"));
+      kids.push(noteList(paths.length ? paths : ["—"], p => node("li", "", S(p))));
+      const leads = [];
+      for (const area of taskChain(t)) {
+        const who = (model.leads || {})[area.id] || [];
+        if (who.length) {
+          const names = who.map(id => {
+            const a = agentById.get(id);
+            return shortId(id, 6) + (a && a.model ? " · " + S(a.model) : "");
+          });
+          leads.push(S(area.id) + "  " + names.join(", "));
+        }
+      }
+      if (leads.length) {
+        kids.push(node("div", "nhead", "area leads"));
+        kids.push(noteList(leads, x => node("li", "", x)));
+      }
+      let subs = (subsByTask.get(t.id) || []).filter(s =>
+        S(s.status) === "accepted" || S(s.status) === "rejected");
+      if (!subs.length && t.closedSubmission) {
+        // The real view carries closedSubmission/closedBy but not a per-task
+        // list; render the closing verdict from what is available.
+        const closer = agentById.get(S(t.closedBy));
+        subs = [{
+          id: S(t.closedSubmission), agent: S(t.closedBy),
+          model: closer && closer.model ? S(closer.model) : "",
+          status: "accepted", ok: true, claim: "solves", points: 0,
+        }];
+      }
+      if (subs.length) {
+        kids.push(node("div", "nhead", "submission history"));
+        kids.push(noteList(subs.slice(0, 6), s => {
+          const verdict = s.ok === true ? "accepted" : s.ok === false ? "rejected" : S(s.status);
+          const li = node("li");
+          li.appendChild(node("b", "", S(s.id) + "  "));
+          li.appendChild(node("span", "who", shortId(s.agent, 6) + "  "));
+          li.appendChild(node("span", "", S(s.model) + "  "));
+          li.appendChild(node("span", "role", verdict + "  "));
+          li.appendChild(node("span", "", N(s.points) + " points"));
+          return li;
+        }));
+      }
     }
     for (const k of kids) holder.appendChild(k);
     box.replaceChildren(holder);
@@ -1145,7 +1381,8 @@ td.mono{font:400 12px/1.5 var(--mono); font-variant-numeric:tabular-nums}
       const glyphText = N(t.liveCount) > 0 && t.status === "open" ? "■" : (marks[t.status] || "□");
       row.appendChild(node("span", "", glyphText));
       row.appendChild(node("span", "t", S(t.id)));
-      row.appendChild(node("span", "title", S(t.title)));
+      const label = closedLabel(t);
+      row.appendChild(node("span", "title", S(t.title) + (label ? "  " + label : "")));
       row.appendChild(node("span", "live", String(N(t.liveCount))));
       holder.appendChild(row);
     }
@@ -1155,6 +1392,8 @@ td.mono{font:400 12px/1.5 var(--mono); font-variant-numeric:tabular-nums}
   let logCount = 0;
   function renderNow() {
     renderReadouts();
+    renderFinished();
+    renderCoordination();
     if (dirtyTable) renderTables();
     if (dirtyQueue) renderQueue();
     appendLog(logCount);
@@ -1194,6 +1433,24 @@ td.mono{font:400 12px/1.5 var(--mono); font-variant-numeric:tabular-nums}
     } finally {
       loading = false;
       if (loadAgain) { loadAgain = false; loadView(); }
+    }
+  }
+
+  // Fold the last 200 events into the log before the stream takes over. They are
+  // already inside the view snapshot, so they only render rows: no state replay.
+  async function loadHistory() {
+    if (!model) return;
+    try {
+      const res = await fetch(historyUrl(model.seq), { cache: "no-store" });
+      if (!res.ok) return;
+      const body = await res.json();
+      const events = body && Array.isArray(body.events) ? body.events : [];
+      events.sort((a, b) => N(a.seq) - N(b.seq));
+      for (const e of events) logEvent(e, false);
+      renderLogAll();
+      renderNow();
+    } catch (err) {
+      console.error(err);
     }
   }
 
@@ -1318,7 +1575,7 @@ td.mono{font:400 12px/1.5 var(--mono); font-variant-numeric:tabular-nums}
     requestAnimationFrame(frame);
     const resync = () => { loadView(); setTimeout(resync, 60000); };
     setTimeout(resync, 60000);
-    loadView().then(connectStream);
+    loadView().then(loadHistory).then(connectStream);
   }
 
   // Small read-only debug surface for layout checks in headless environments.
@@ -1339,6 +1596,7 @@ td.mono{font:400 12px/1.5 var(--mono); font-variant-numeric:tabular-nums}
   if (typeof hook === "function") hook({
     applyView, queueEvent, flush, renderNow, reindex, buildRows, renderTables, renderQueue, renderNote, renderReadouts, ctx, plate,
     clipText, sparkGeometry, queueLayout, busiestOpenLeaf, logObject, pushSample, sampleLengths,
+    historyUrl, finishedSummary, renderFinished, renderCoordination, nudgeCoordination, logEvent, renderLogAll, resize, draw, readColors,
   });
   else boot();
 })();

@@ -18,12 +18,17 @@ describe("lab notebook index.html", () => {
     expect(script).toContain('fetch("/api/view"');
     expect(script).toContain("/api/stream?after=");
     expect(script).toContain("visibilitychange");
+    expect(script).toContain('"/api/events?after="');
+    expect(script).toContain('"attempt.notified"');
+    expect(script).toContain('"lead.granted"');
+    expect(script).toContain('"lead.revoked"');
   });
 
   test("contains the required element ids", () => {
     const ids = [
       "cv", "cwrap", "cspacer", "taskList", "taskSpacer", "marginNote", "noteTitle", "noteBody",
       "qlist", "qspacer", "logList", "projectName", "projectGoal", "headAgent", "joinUrl",
+      "finishedLine", "coordPanel",
       "rAgents", "rAttempts", "rQueue", "rAccepted", "rOpen", "rEvents",
       "leaderBody", "modelBody", "conn", "serverTime", "seq",
       "themeLight", "themeDark", "themeAuto", "copyJoin",
@@ -145,6 +150,7 @@ class FakeNode {
   children: FakeNode[] = [];
   parentNode: FakeNode | null = null;
   scrollTop = 0;
+  hidden = false;
   clientWidth = 820;
   clientHeight = 560;
   private text = "";
@@ -356,22 +362,33 @@ describe("server strings", () => {
       close(): void {}
     };
     const at = new Date().toISOString();
-    g.fetch = async () => ({
-      ok: true,
-      json: async () => ({
-        project: { name: "boot", goal: "goal", scope: "", check: "", paths: [], headAgent: "aaaa", rules: { width: 2 } },
-        seq: 7, now: at,
-        totals: {
-          agents: 1, activeAgents: 1, tasks: 1, openTasks: 1, liveAttempts: 1,
-          queuedSubmissions: 0, checkingSubmissions: 0, submissions: 0, accepted: 0, notes: 0, events: 7,
-        },
-        tasks: [{ id: "T-1", title: "boot task", body: "body", parent: null, children: [], status: "open", points: 1, postedAt: at, attemptCount: 1, noteCount: 0, liveCount: 1 }],
-        attempts: [{ id: "A-1", task: "T-1", agent: "aaaa", role: "build", approach: "x", model: "hy4-flash", startedAt: at, leaseUntil: new Date(Date.now() + 60000).toISOString(), lastBeatAt: at }],
-        agents: [{ id: "aaaa", publicKey: "", model: "hy4-flash", harness: "opencode", joinedAt: at, lastSeenAt: at, banned: false, points: 0, accepted: 0, submissions: 0 }],
-        notes: [], submissions: [], proposals: [],
-        leaderboard: { agents: [], models: [] },
-      }),
-    });
+    const urls: string[] = [];
+    g.fetch = async (url: string) => {
+      urls.push(String(url));
+      return {
+        ok: true,
+        json: async () => ({
+          project: { name: "boot", goal: "goal", scope: "", check: "", paths: [], headAgent: "aaaa", rules: { width: 2 } },
+          seq: 7, now: at,
+          coordination: {
+            closes: 1, closedUnder: 1, closedUnderShare: 0.5,
+            notifyLagSeconds: { count: 2, p50: 1, p90: 2, max: 2 }, notesPerClosedTask: 1,
+            questions: { asked: 2, answered: 1, open: 1 }, handoffs: 1,
+            handoffsFollowedBySolve: 1, deadEnds: 1, digests: 1, duplicateProposals: 1,
+          },
+          leads: { "T-1": ["aaaa"] },
+          totals: {
+            agents: 1, activeAgents: 1, tasks: 1, openTasks: 1, liveAttempts: 1,
+            queuedSubmissions: 0, checkingSubmissions: 0, submissions: 0, accepted: 0, notes: 0, events: 7,
+          },
+          tasks: [{ id: "T-1", title: "boot task", body: "body", parent: null, children: [], status: "open", points: 1, postedAt: at, attemptCount: 1, noteCount: 0, liveCount: 1 }],
+          attempts: [{ id: "A-1", task: "T-1", agent: "aaaa", role: "build", approach: "x", model: "hy4-flash", startedAt: at, leaseUntil: new Date(Date.now() + 60000).toISOString(), lastBeatAt: at }],
+          agents: [{ id: "aaaa", publicKey: "", model: "hy4-flash", harness: "opencode", joinedAt: at, lastSeenAt: at, banned: false, points: 0, accepted: 0, submissions: 0 }],
+          notes: [], submissions: [], proposals: [],
+          leaderboard: { agents: [], models: [] },
+        }),
+      };
+    };
     delete g.__MINGA_UI_TEST__;
     try {
       new Function(script)();
@@ -380,6 +397,10 @@ describe("server strings", () => {
       expect(frame).toBeTruthy();
       frame!(16);
       expect(streams).toEqual(["/api/stream?after=7"]);
+      expect(urls).toContain("/api/view");
+      expect(urls).toContain("/api/events?after=0&limit=200");
+      expect(byId.get("coordPanel")!.hidden).toBe(false);
+      expect(byId.get("coordPanel")!.textContent).toContain("1s / 2s");
       expect(g.document.title).toBe("Minga — boot");
       expect(drawn.join("\n")).toContain("boot task");
       expect(byId.get("rAttempts")?.textContent).toBe("1");
@@ -483,6 +504,230 @@ function bigView(leafCount: number, submissionCount: number): AnyRec {
     leaderboard: { agents: [], models: [] },
   };
 }
+
+function coordView(): AnyRec {
+  const v = bigView(2, 0);
+  v.coordination = {
+    closes: 4, closedUnder: 2, closedUnderShare: 0.25,
+    notifyLagSeconds: { count: 20, p50: 1.2, p90: 4.3, max: 8 },
+    notesPerClosedTask: 2, questions: { asked: 9, answered: 6, open: 3 },
+    handoffs: 10, handoffsFollowedBySolve: 4, deadEnds: 5, digests: 2, duplicateProposals: 7,
+  };
+  v.leads = { "T-1": ["abcdef"] };
+  v.agents = [{
+    id: "abcdef", publicKey: "", model: "hy4-flash", harness: "opencode",
+    joinedAt: v.now, lastSeenAt: v.now, banned: false, points: 0, accepted: 0, submissions: 0,
+  }];
+  // Makes T-7 the default margin-note selection (busiest open leaf).
+  v.attempts = [{
+    id: "A-7", task: "T-7", agent: "abcdef", role: "build", approach: "x", model: "hy4-flash",
+    startedAt: v.now, leaseUntil: new Date(Date.now() + 600000).toISOString(), lastBeatAt: v.now,
+  }];
+  v.tasks.find((t: AnyRec) => t.id === "T-7")!.liveCount = 1;
+  v.tasks.find((t: AnyRec) => t.id === "T-7")!.paths = ["Proofs/Main.lean"];
+  v.notes = [
+    { id: "N-1", task: "T-7", agent: "abcdef", kind: "question", text: "is it true?", at: v.now, replies: 0 },
+    { id: "N-2", task: "T-7", agent: "abcdef", kind: "idea", text: "yes", at: v.now, replyTo: "N-1" },
+    { id: "N-3", task: "T-7", agent: "abcdef", kind: "dead_end", text: "stalls at the carry", at: v.now },
+    { id: "N-4", task: "T-4", agent: "abcdef", kind: "digest", text: "area digest", at: v.now },
+    { id: "N-5", task: "T-7", agent: "abcdef", kind: "question", text: "still open?", at: v.now, replies: 0 },
+  ];
+  return v;
+}
+
+function finishedView(): AnyRec {
+  const at = new Date().toISOString();
+  const tasks: AnyRec[] = [];
+  const agents: AnyRec[] = [];
+  for (let i = 1; i <= 6; i += 1) {
+    const id = "aa" + String(i).padStart(4, "0");
+    tasks.push({
+      id: "T-" + i, title: "Task " + i, body: "body", parent: null, children: [], status: "solved",
+      points: 10, postedAt: at, closedAt: at, closedBy: id, closedSubmission: "S-" + i,
+      paths: ["Proofs/T" + i + ".lean"], attemptCount: 1, noteCount: 0, liveCount: 0,
+    });
+    agents.push({
+      id, publicKey: "", model: "model-" + i, harness: "opencode",
+      joinedAt: at, lastSeenAt: at, banned: false, points: 10, accepted: 1, submissions: 1,
+    });
+  }
+  return {
+    project: { name: "done", goal: "g", scope: "", check: "", paths: [], headAgent: "head", rules: { width: 6 } },
+    seq: 42, now: at,
+    totals: {
+      agents: 6, activeAgents: 6, tasks: 6, openTasks: 0, liveAttempts: 0,
+      queuedSubmissions: 0, checkingSubmissions: 0, submissions: 6, accepted: 6, notes: 0, events: 42,
+    },
+    tasks, attempts: [], agents, notes: [], submissions: [], proposals: [],
+    leaderboard: { agents: [], models: [] },
+  };
+}
+
+describe("coordination, finished state and history", () => {
+  test("history URL is built from the snapshot seq with a zero floor", () => {
+    const m = mountScript();
+    try {
+      expect(m.hooks.historyUrl(450)).toBe("/api/events?after=250&limit=200");
+      expect(m.hooks.historyUrl(200)).toBe("/api/events?after=0&limit=200");
+      expect(m.hooks.historyUrl(7)).toBe("/api/events?after=0&limit=200");
+      expect(m.hooks.historyUrl(undefined)).toBe("/api/events?after=0&limit=200");
+    } finally { m.restore(); }
+  });
+
+  test("a snapshot with coordination and leads boots into annotated readouts", () => {
+    const m = mountScript();
+    try {
+      m.hooks.applyView(coordView());
+      m.hooks.flush();
+      const coord = m.byId.get("coordPanel")!;
+      expect(coord.hidden).toBe(false);
+      const text = coord.textContent;
+      for (const part of ["1.2s / 4.3s", "25%", "3 / 9", "4 / 10", "5", "2", "7"]) expect(text).toContain(part);
+      const note = m.byId.get("marginNote")!.textContent;
+      expect(note).toContain("pinned digest · T-4");
+      expect(note).toContain("area digest");
+      expect(note).toContain("↳ re N-1");
+      expect(note).toContain("[dead end]");
+      expect(note).toContain("[open]");
+      expect(note).toContain("Proofs/Main.lean");
+      expect(note).toContain("area leads");
+      expect(note).toContain("abcdef · hy4-flash");
+      expect(m.byId.get("finishedLine")!.hidden).toBe(true);
+    } finally { m.restore(); }
+  });
+
+  test("a fully closed project shows the finished line and who closed each task", () => {
+    const m = mountScript();
+    try {
+      m.hooks.applyView(finishedView());
+      m.hooks.flush();
+      const finished = m.byId.get("finishedLine")!;
+      expect(finished.hidden).toBe(false);
+      expect(finished.textContent).toContain("finished — 6 of 6 tasks solved");
+      const note = m.byId.get("marginNote")!.textContent;
+      expect(note).toContain("closed by aa0001 · model-1 · S-1");
+      expect(m.hooks.finishedSummary()).toEqual({
+        solved: 6, total: 6,
+        counts: { solved: 6, refuted: 0, impossible: 0, withdrawn: 0 },
+      });
+      const at = new Date().toISOString();
+      m.hooks.queueEvent({
+        seq: 43, at, type: "task.closed", actor: "server",
+        data: { task: "T-1", status: "refuted", agent: "aa0001", submission: "S-1" },
+      });
+      m.hooks.flush();
+      expect(m.byId.get("finishedLine")!.textContent).toContain("finished — 5 of 6 tasks solved");
+      expect(m.byId.get("finishedLine")!.textContent).toContain("refuted 1");
+    } finally { m.restore(); }
+  });
+
+  test("a finished run shows an honest zero active count with a took-part sublabel", () => {
+    const m = mountScript();
+    try {
+      const v = finishedView();
+      v.totals.agents = 399;
+      v.totals.activeAgents = 0;
+      m.hooks.applyView(v);
+      m.hooks.flush();
+      const readout = m.byId.get("rAgents")!;
+      expect(readout.textContent).toContain("0");
+      expect(readout.textContent).toContain("399 took part");
+    } finally { m.restore(); }
+  });
+
+  test("a closed task renders the submissions the view carries", () => {
+    const m = mountScript();
+    try {
+      const v = finishedView();
+      const owner = v.agents[0].id;
+      v.submissions = [
+        { id: "S-1", attempt: "A-1", task: "T-1", agent: owner, model: "model-1", claim: "solves",
+          message: "m", files: [], bytes: 0, status: "accepted", ok: true, queuedAt: v.now,
+          checkedAt: v.now, runs: 1, points: 10 },
+        { id: "S-0", attempt: "A-1", task: "T-1", agent: "bb0002", model: "model-x", claim: "solves",
+          message: "m", files: [], bytes: 0, status: "rejected", ok: false, queuedAt: v.now,
+          checkedAt: v.now, runs: 1, points: 0 },
+      ];
+      m.hooks.applyView(v);
+      m.hooks.flush();
+      const note = m.byId.get("marginNote")!.textContent;
+      expect(note).toContain("submission history");
+      for (const part of ["S-1", "S-0", "aa0001", "bb0002", "model-1", "model-x", "accepted", "rejected"]) {
+        expect(note).toContain(part);
+      }
+    } finally { m.restore(); }
+  });
+
+  test("a closed task falls back to closedSubmission when the view has no per-task list", () => {
+    const m = mountScript();
+    try {
+      m.hooks.applyView(finishedView());
+      m.hooks.flush();
+      const note = m.byId.get("marginNote")!.textContent;
+      expect(note).toContain("submission history");
+      for (const part of ["S-1", "aa0001", "model-1"]) expect(note).toContain(part);
+    } finally { m.restore(); }
+  });
+
+  test("a task without a finished submission omits the history header", () => {
+    const m = mountScript();
+    try {
+      m.hooks.applyView(coordView());
+      m.hooks.flush();
+      expect(m.byId.get("marginNote")!.textContent).not.toContain("submission history");
+    } finally { m.restore(); }
+  });
+
+  test("new event types render log rows", () => {
+    const m = mountScript();
+    try {
+      m.hooks.applyView(bigView(4, 0));
+      m.hooks.flush();
+      const at = new Date().toISOString();
+      const events: AnyRec[] = [
+        { seq: 10, at, type: "attempt.notified", actor: "server", data: { attempt: "A-8", agent: "abcdef", via: "beat" } },
+        { seq: 11, at, type: "lead.granted", actor: "head", data: { agent: "abcdef", area: "T-1" } },
+        { seq: 12, at, type: "lead.revoked", actor: "head", data: { agent: "abcdef", area: "T-1" } },
+        { seq: 13, at, type: "note.added", actor: "abcdef", data: { note: "N-9", task: "T-7", agent: "abcdef", kind: "dead_end", text: "stalls" } },
+        { seq: 14, at, type: "note.added", actor: "abcdef", data: { note: "N-10", task: "T-7", agent: "abcdef", kind: "digest", text: "summary" } },
+        { seq: 15, at, type: "note.added", actor: "abcdef", data: { note: "N-11", task: "T-7", agent: "abcdef", kind: "idea", text: "follow-up", replyTo: "N-1" } },
+      ];
+      for (const e of events) m.hooks.queueEvent(e);
+      m.hooks.flush();
+      const text = m.byId.get("logList")!.textContent;
+      expect(text).toContain("told");
+      expect(text).toContain("A-8: task closed");
+      expect(text).toContain("granted lead");
+      expect(text).toContain("revoked lead");
+      expect(text).toContain("dead_end");
+      expect(text).toContain("digest");
+      expect(text).toContain("↳ re N-1");
+      expect(m.byId.get("logList")!.children).toHaveLength(6);
+    } finally { m.restore(); }
+  });
+
+  test("history rows are old-to-new and never marked fresh", () => {
+    const m = mountScript();
+    try {
+      m.hooks.applyView(bigView(4, 0));
+      m.hooks.flush();
+      const at = new Date().toISOString();
+      for (let i = 1; i <= 4; i += 1) {
+        m.hooks.logEvent({
+          seq: 100 + i, at, type: "note.added", actor: "abcdef",
+          data: { note: "N-h" + i, task: "T-7", agent: "abcdef", kind: "dead_end", text: "h" + i },
+        }, false);
+      }
+      m.hooks.renderLogAll();
+      const lines = m.byId.get("logList")!.children;
+      expect(lines).toHaveLength(4);
+      expect(lines.every((n: FakeNode) => !n.className.includes("fresh"))).toBe(true);
+      expect(lines.map((n: FakeNode) => n.children[3]!.textContent)).toEqual([
+        "T-7 dead_end h4", "T-7 dead_end h3", "T-7 dead_end h2", "T-7 dead_end h1",
+      ]);
+    } finally { m.restore(); }
+  });
+});
 
 describe("visual review fixes", () => {
   test("areas are expanded by default: the debug layout has over 100 rows", () => {
@@ -778,7 +1023,7 @@ describe("dev server", () => {
     expect(res.headers.get("content-type") ?? "").toContain("application/json");
     const body = await res.json() as AnyRec;
     expect(Object.keys(body).sort()).toEqual([
-      "agents", "attempts", "leaderboard", "notes", "now", "project", "proposals", "seq", "submissions", "tasks", "totals",
+      "agents", "attempts", "coordination", "leaderboard", "leads", "notes", "now", "project", "proposals", "seq", "submissions", "tasks", "totals",
     ]);
     expect(typeof body.seq).toBe("number");
     expect(Number.isNaN(Date.parse(String(body.now)))).toBe(false);
@@ -877,4 +1122,129 @@ describe("dev server", () => {
     expect(res.headers.get("content-type") ?? "").toContain("text/plain");
     expect(await res.text()).toContain("/kit/minga.mjs");
   });
+});
+
+// ------------------------------------------------------------------ dev server flags
+
+async function startDev(args: string[]): Promise<{ origin: string; seq: number; stop: () => Promise<void> }> {
+  const probe = Bun.serve({ port: 0, fetch: () => new Response("ok") });
+  const port = probe.port;
+  probe.stop(true);
+  const origin = `http://127.0.0.1:${port}`;
+  const proc = Bun.spawn([process.execPath, join(root, "src", "ui", "dev-server.ts"), "--port", String(port), ...args], {
+    cwd: root,
+    env: { ...process.env },
+    stdout: "pipe",
+    stderr: "pipe",
+  });
+  const deadline = Date.now() + 15000;
+  let seq = 0;
+  while (Date.now() < deadline) {
+    try {
+      const res = await fetch(origin + "/api/view");
+      if (res.ok) { seq = (await res.json() as { seq: number }).seq; break; }
+    } catch {
+      // not up yet
+    }
+    await Bun.sleep(100);
+  }
+  if (!seq) { proc.kill(); await proc.exited; throw new Error("dev server did not start on " + origin); }
+  return {
+    origin, seq,
+    stop: async () => { proc.kill(); await proc.exited; },
+  };
+}
+
+describe("dev server flags", () => {
+  let counted: Awaited<ReturnType<typeof startDev>> | null = null;
+  let finished: Awaited<ReturnType<typeof startDev>> | null = null;
+
+  beforeAll(async () => {
+    counted = await startDev(["--agents", "60", "--tasks", "30", "--rate", "4"]);
+    finished = await startDev(["--agents", "12", "--tasks", "8", "--rate", "1", "--finished"]);
+  }, 30000);
+
+  afterAll(async () => {
+    if (counted) await counted.stop();
+    if (finished) await finished.stop();
+  });
+
+  test("active agents stay within 10% of --agents", async () => {
+    const body = await fetch(counted!.origin + "/api/view").then(r => r.json()) as AnyRec;
+    const totals = body.totals as AnyRec;
+    expect(totals.agents).toBe(60);
+    expect(totals.activeAgents).toBeGreaterThanOrEqual(54);
+    expect(totals.activeAgents).toBeLessThanOrEqual(66);
+    const c = body.coordination as AnyRec;
+    for (const k of ["closes", "closedUnderShare", "notifyLagSeconds", "questions", "handoffs", "deadEnds", "digests", "duplicateProposals"]) {
+      expect(k in c).toBe(true);
+    }
+    expect(c.notifyLagSeconds.p90).toBeGreaterThan(0);
+    expect(typeof body.leads).toBe("object");
+  }, 15000);
+
+  test("/api/events returns bounded ascending history", async () => {
+    const after = Math.max(0, counted!.seq - 200);
+    const body = await fetch(counted!.origin + `/api/events?after=${after}&limit=5`).then(r => r.json()) as AnyRec;
+    const events = body.events as AnyRec[];
+    expect(events.length).toBeGreaterThan(0);
+    expect(events.length).toBeLessThanOrEqual(5);
+    for (let i = 1; i < events.length; i += 1) expect(events[i]!.seq).toBeGreaterThan(events[i - 1]!.seq);
+    for (const e of events) expect(e.seq).toBeGreaterThan(after);
+    expect(body.head).toBeGreaterThanOrEqual(counted!.seq);
+  }, 15000);
+
+  test("--finished closes every task and still serves recent history", async () => {
+    const body = await fetch(finished!.origin + "/api/view").then(r => r.json()) as AnyRec;
+    const tasks = body.tasks as AnyRec[];
+    expect(tasks.length).toBeGreaterThan(1);
+    expect((body.totals as AnyRec).openTasks).toBe(0);
+    for (const t of tasks) {
+      expect(t.status).not.toBe("open");
+      if (!t.children.length) {
+        expect(t.closedBy).toBeTruthy();
+        expect(t.closedSubmission).toBeTruthy();
+      }
+    }
+    expect((body.attempts as unknown[]).length).toBe(0);
+    const history = await fetch(finished!.origin + "/api/events?after=0&limit=200").then(r => r.json()) as AnyRec;
+    const events = history.events as AnyRec[];
+    expect(events.length).toBeGreaterThan(20);
+    const types = new Set(events.map(e => e.type as string));
+    expect(types.has("attempt.notified")).toBe(true);
+    expect(types.has("lead.granted")).toBe(true);
+  }, 15000);
+
+  test("--finished has no recent heartbeats but keeps the participant total", async () => {
+    const body = await fetch(finished!.origin + "/api/view").then(r => r.json()) as AnyRec;
+    const totals = body.totals as AnyRec;
+    expect(totals.agents).toBe(12);
+    expect(totals.activeAgents).toBe(0);
+  }, 15000);
+
+  test("--finished exposes the closing and rejected submissions of closed tasks", async () => {
+    const body = await fetch(finished!.origin + "/api/view").then(r => r.json()) as AnyRec;
+    const tasks = body.tasks as AnyRec[];
+    const subs = body.submissions as AnyRec[];
+    const closed = tasks.find(t => t.status !== "open" && t.closedSubmission && !t.children.length)!;
+    expect(closed).toBeTruthy();
+    const own = subs.filter(s => s.task === closed.id && (s.status === "accepted" || s.status === "rejected"));
+    expect(own.some(s => s.id === closed.closedSubmission && s.status === "accepted")).toBe(true);
+    expect(own.some(s => s.status === "rejected")).toBe(true);
+  }, 15000);
+
+  test("coordination stats agree with notify lags and stay bounded", async () => {
+    for (const dev of [counted!, finished!]) {
+      const body = await fetch(dev.origin + "/api/view").then(r => r.json()) as AnyRec;
+      const c = body.coordination as AnyRec;
+      const lag = c.notifyLagSeconds as AnyRec;
+      if (lag.count > 0) {
+        expect(c.closedUnder).toBeGreaterThan(0);
+        expect(c.closedUnderShare).toBeGreaterThan(0);
+        expect(c.closedUnderShare).toBeLessThanOrEqual(0.25);
+      }
+      expect(c.questions.answered).toBeLessThanOrEqual(c.questions.asked);
+      expect(c.handoffsFollowedBySolve).toBeLessThanOrEqual(c.handoffs);
+    }
+  }, 15000);
 });
