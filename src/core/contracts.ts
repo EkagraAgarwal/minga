@@ -7,8 +7,8 @@
  * final report instead of working around it.
  */
 import type {
-  AgentId, AttemptId, CoordinationStats, Leaderboard, MingaEvent, NewEvent, ProjectConfig, ProposalId,
-  Role, Rules, State, TaskId,
+  AgentId, AttemptId, CoordinationStats, Gates, Leaderboard, MingaEvent, NewEvent, ProjectConfig, ProposalId,
+  ReviewPolicy, Role, Rules, Sandbox, State, SubmissionId, TaskId,
 } from "./types.ts";
 import type { ProjectInfo, ViewResponse } from "./protocol.ts";
 
@@ -152,6 +152,11 @@ export interface CheckInput {
   timeoutSeconds: number;
   /** Bytes of combined output to keep from the end. Default 8000. */
   maxOutput?: number;
+  /**
+   * Absolute directory whose files are copied over the checkout after `files`, keeping their
+   * paths relative to it (holdout tests). Never committed. Copied files overwrite submitted ones.
+   */
+  overlayDir?: string;
 }
 export interface CheckResult {
   ok: boolean;
@@ -169,6 +174,19 @@ export interface CheckPoolOptions {
   keep: string[];
   /** Where the worktrees live. Default `<repoDir>/.minga/worktrees`. */
   dir?: string;
+  /**
+   * Default { mode: "none" }. With "docker", each run is
+   * `docker run --rm --name minga-check-<slot>-<n> --network <network> --memory <memory>
+   *  --cpus <cpus> --pids-limit <pids> --cap-drop ALL --security-opt no-new-privileges
+   *  --read-only --tmpfs /tmp -v <slot>:/work -w /work [--user uid:gid on POSIX]
+   *  -e <allowlisted env> <image> sh -c "<command>"`.
+   * Only the slot is mounted, never the repository or `.minga/`; the slot's `.git` is
+   * hidden from the container (mounted over with an empty read-only directory) so the
+   * host's later git commands never read files the check wrote there. On timeout the
+   * container is removed with `docker rm -f`. When docker is unavailable, run() resolves
+   * ok: false with an output tail that says so (fail closed), never runs unsandboxed.
+   */
+  sandbox?: Sandbox;
 }
 /**
  * A fixed set of persistent ("warm") git worktrees, one per slot, reused between checks so
@@ -216,3 +234,47 @@ export type CommitOutcome = { ok: true; commit: string } | { ok: false; stale: t
  * Calls for the same repo are serialized internally.
  */
 export type CommitAccepted = (input: CommitInput) => Promise<CommitOutcome>;
+/** Content of `path` at `commit` (git cat-file blob), or null when the path does not exist there. */
+export type ReadFileAt = (repoDir: string, commit: string, path: string) => Promise<string | null>;
+
+// ======================================================================
+// src/verify/diff.ts and src/verify/gates.ts — pure, no I/O
+// ======================================================================
+export interface FileChange {
+  path: string;
+  /** Content at the base, or null for a new file. */
+  before: string | null;
+  after: string;
+}
+/**
+ * Unified diff (`--- a/path`, `+++ b/path`, `@@ -l,n +l,n @@` hunks, `context` lines around
+ * changes, default 3), line based (LF and CRLF treated alike). Empty text when unchanged.
+ * Must stay fast on 2 MB inputs (Myers or a common-prefix/suffix trim plus LCS on the middle,
+ * falling back to a whole-block replace when the middle is too large).
+ */
+export type UnifiedDiff = (change: FileChange, context?: number) => { text: string; added: number; removed: number };
+export interface GateReport {
+  /** Each a one-line reason, e.g. `test/a.test.ts:12 adds ".only(": focused test`. Non-empty rejects. */
+  violations: string[];
+  warnings: string[];
+  added: number;
+  removed: number;
+}
+/** Applies Gates to added lines only (lines present in `after` but not `before`, per the diff). */
+export type EvaluateGates = (gates: Gates, changes: FileChange[]) => GateReport;
+
+// ======================================================================
+// src/server/review.ts — pure
+// ======================================================================
+/**
+ * Applies the review policy's vote threshold to a submission in "review".
+ * Counts only votes from eligible agents: not the author, not banned, accepted >= 1, and
+ * holding no open attempt and no other submission in review on the same task (rivals
+ * must not judge each other). Head votes are not counted here (the server decides those).
+ * Returns null for mode "none"/"head" or when no threshold is reached.
+ */
+export type DecideReview = (state: State, submission: SubmissionId, policy: ReviewPolicy) => { approved: boolean } | null;
+/** Whether `agent` may vote on `submission` (same rules as above); a reason when not. */
+export type ReviewEligible = (state: State, submission: SubmissionId, agent: AgentId) => { ok: true } | { ok: false; reason: string };
+/** True when path matches a cfg.protect glob or is "project.toml". */
+export type PathProtected = (cfg: ProjectConfig, path: string) => boolean;

@@ -24,8 +24,8 @@
  * servers and old event logs replay.
  */
 import type {
-  AgentId, AgentState, AttemptEndReason, AttemptId, AttemptState, Claim, CoordinationStats, Leaderboard, MingaEvent, NoteId,
-  NoteKind, NoteState, ProposalId, ProposalKind, ProposalState, ReleaseReason, Role, Rules, SubmissionId, SubmissionState,
+  AgentId, AgentState, AttemptEndReason, AttemptId, AttemptState, Claim, CoordinationStats, Gates, Leaderboard, MingaEvent, NoteId,
+  NoteKind, NoteState, ProposalId, ProposalKind, ProposalState, ReleaseReason, ReviewPolicy, ReviewVote, Role, Rules, SubmissionId, SubmissionState,
   TaskId, TaskState, TaskStatus,
 } from "./types.ts";
 
@@ -75,6 +75,54 @@ export interface ProjectInfo {
   rules: Rules;
   /** The branch accepted work lands on; clone it with `git clone -b <branch> <url>/repo.git`. */
   branch?: string;
+  /** What guards the gate besides the check. Absent from 0.2 servers. */
+  safety?: ProjectSafety;
+}
+
+export interface ProjectSafety {
+  /** Globs no submission may write. */
+  protect: string[];
+  gates: Gates;
+  review: ReviewPolicy;
+  /** True when server-only holdout tests also run (agents never see them). */
+  holdout: boolean;
+  sandbox: "none" | "docker";
+}
+
+/** GET /api/reviews -> submissions waiting in review, oldest first (public). */
+export interface ReviewSummary {
+  submission: SubmissionId;
+  task: TaskId;
+  taskTitle: string;
+  agent: AgentId;
+  model: string;
+  claim: Claim;
+  message: string;
+  files: string[];
+  passedAt: string;
+  warnings: string[];
+  approvals: number;
+  rejections: number;
+  votes: ReviewVote[];
+}
+export interface ReviewsResponse { reviews: ReviewSummary[]; policy: ReviewPolicy }
+
+/** GET /api/review/<S-n> -> one submission's diff against its base (public; review or finished). */
+export interface ReviewDetail extends ReviewSummary {
+  status: SubmissionState["status"];
+  base: string;
+  diffs: { path: string; diff: string; added: number; removed: number; created: boolean }[];
+  /** The check's output tail (never the holdout's). */
+  outputTail: string;
+  holdout?: "passed" | "failed";
+}
+
+/** POST /api/review (signed agent) and POST /api/head/review (head). */
+export interface ReviewRequest { submission: SubmissionId; approve: boolean; reason?: string }
+export interface ReviewResponse extends WithNotices {
+  submission: SubmissionId;
+  /** Present when this vote settled it. Approval then commits (rechecking if the branch moved). */
+  decided?: { approved: boolean; by: "head" | "vote" };
 }
 
 /**

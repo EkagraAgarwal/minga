@@ -126,7 +126,80 @@ export interface ProjectConfig {
   recheck: "always" | "on-overlap";
   rules: Rules;
   seedTasks: SeedTask[];
+  /**
+   * Globs no submission may write, even when `paths` matches (project.toml `protect`).
+   * Use it for the tests, manifests and configs that steer the check. "project.toml" is
+   * always protected. Default ["project.toml"].
+   */
+  protect: string[];
+  /** Static checks on the diff, run before the check (project.toml [gates]). */
+  gates: Gates;
+  /** Who admits work that passed the check (project.toml `review`). Default { mode: "none" }. */
+  review: ReviewPolicy;
+  /** Server-only tests agents never see (project.toml [holdout]). */
+  holdout?: Holdout;
+  /** Where the check runs (project.toml [sandbox]). Default { mode: "none" }. */
+  sandbox: Sandbox;
 }
+
+/**
+ * Who admits a submission that passed the check (and the holdout, if any).
+ * "none": it is committed at once (the 0.2 behaviour).
+ * "head": it waits until the head approves or rejects it.
+ * "votes:N": N approvals (or N rejections) from eligible agents decide.
+ * "head-or-votes:N": whichever comes first.
+ * Agent identities are self-minted, so votes are a quality signal, not a security
+ * boundary; "head" is the real gate.
+ */
+export type ReviewPolicy =
+  | { mode: "none" }
+  | { mode: "head" }
+  | { mode: "votes"; votes: number }
+  | { mode: "head-or-votes"; votes: number };
+
+/** `pattern` (a JS regex source) must not appear on an added line of a file matching `paths` (globs; all files when absent). */
+export interface GateRule {
+  pattern: string;
+  paths?: string[];
+  /** Shown to the agent and the reviewers. */
+  reason?: string;
+}
+
+/**
+ * Static checks on a submission's diff against its base, run before the check.
+ * Heuristics that catch common shortcuts (focused or skipped tests, suppressed type
+ * errors, huge rewrites); they are not a proof of good work.
+ */
+export interface Gates {
+  /** Most files one submission may write. 0 = no limit. */
+  maxFiles: number;
+  /** Most added + removed lines in one submission. 0 = no limit. */
+  maxChangedLines: number;
+  /** A match rejects the submission before the check runs. */
+  forbid: GateRule[];
+  /** A match only flags the submission for reviewers. */
+  warn: GateRule[];
+}
+
+/**
+ * Server-only tests. After `check` passes, the files under `dir` are copied over the same
+ * checkout (repo-relative paths kept) and `command` runs. Agents never see the files and
+ * never see the command's output; they only learn pass or fail.
+ */
+export interface Holdout {
+  command: string;
+  /** As written in project.toml: absolute, or relative to the repository. Must not be tracked by git. */
+  dir: string;
+}
+
+/**
+ * Where the check runs. "docker": in a throwaway container with only the checkout mounted
+ * (at /work), no network by default, capped memory, CPUs and processes, all capabilities
+ * dropped. If Docker is missing the check fails closed: nothing is accepted.
+ */
+export type Sandbox =
+  | { mode: "none" }
+  | { mode: "docker"; image: string; network: "none" | "bridge"; memory: string; cpus: number; pids: number };
 
 // ---------------------------------------------------------------- events
 
@@ -263,6 +336,40 @@ export type SubmissionChecked = Ev<"submission.checked", {
   commit?: string;
   /** Points awarded (0 when not ok). */
   points: number;
+  /** Gate violations that rejected it before the check ran. */
+  gate?: string[];
+  /** Gate warnings (flags for reviewers; never reject). */
+  warnings?: string[];
+  /** Holdout outcome, when the project has one and the check passed. */
+  holdout?: "passed" | "failed";
+  /** The review decision, when the project reviews work. */
+  review?: { approved: boolean; by: "head" | "vote"; reason?: string };
+}>;
+
+/**
+ * The check (and holdout) passed and the project reviews work: the submission waits in
+ * "review". Its attempt ends ("submitted") so the agent can move on; the task stays open.
+ * The final verdict is still a submission.checked event.
+ */
+export type SubmissionPassed = Ev<"submission.passed", {
+  submission: SubmissionId;
+  attempt: AttemptId;
+  task: TaskId;
+  agent: AgentId;
+  base: string;
+  durationMs: number;
+  outputTail: string;
+  warnings?: string[];
+  holdout?: "passed";
+}>;
+
+/** A review vote. `head` marks the head's decision, which settles it at once. */
+export type SubmissionReviewed = Ev<"submission.reviewed", {
+  submission: SubmissionId;
+  agent: AgentId;
+  approve: boolean;
+  reason?: string;
+  head?: boolean;
 }>;
 
 export type ProposalMade = Ev<"proposal.made", {
@@ -303,6 +410,8 @@ export type MingaEvent =
   | SubmissionQueued
   | SubmissionStarted
   | SubmissionChecked
+  | SubmissionPassed
+  | SubmissionReviewed
   | ProposalMade
   | ProposalVoted
   | ProposalDecided
@@ -386,7 +495,10 @@ export interface NoteState {
   replies?: number;
 }
 
-export type SubmissionStatus = "queued" | "checking" | "accepted" | "rejected";
+/** "review": passed the check, waiting for the head or votes (see ReviewPolicy). Not final. */
+export type SubmissionStatus = "queued" | "checking" | "review" | "accepted" | "rejected";
+
+export interface ReviewVote { agent: AgentId; approve: boolean; reason?: string; head?: boolean; at: string }
 
 /**
  * In-memory view of a submission. Deliberately has no `outputTail`: that stays in the log
@@ -421,6 +533,18 @@ export interface SubmissionState {
   commit?: string;
   /** Points awarded (0 until accepted). */
   points: number;
+  /** When it entered review (submission.passed). */
+  passedAt?: string;
+  /** Seq of the submission.passed event (its outputTail). */
+  passedSeq?: number;
+  /** Gate violations (rejected before the check) or warnings (flags for reviewers). */
+  gate?: string[];
+  warnings?: string[];
+  holdout?: "passed" | "failed";
+  /** Review votes so far, oldest first. */
+  reviews?: ReviewVote[];
+  /** The final review decision. */
+  review?: { approved: boolean; by: "head" | "vote"; reason?: string };
 }
 
 export interface ProposalState {
@@ -475,6 +599,8 @@ export interface StateIndex {
   openAttempts: AttemptId[];
   /** Submissions with status "queued" or "checking", oldest first. */
   pendingSubmissions: SubmissionId[];
+  /** Submissions with status "review", oldest first. */
+  reviewSubmissions?: SubmissionId[];
   /** Rejected (non-stale) submissions per agent per task: agent -> task -> count. Used by the scheduler. */
   failures: Record<AgentId, Record<TaskId, number>>;
   /** Unanswered question notes per task, oldest first. */
