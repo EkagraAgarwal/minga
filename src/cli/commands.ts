@@ -818,7 +818,7 @@ export function renderReviewDetail(detail: ReviewDetail): string {
     `files: ${detail.files.length > 0 ? detail.files.join(", ") : "(none)"}`,
     ...renderReviewVotes(detail.votes),
     ...detail.warnings.map((warning) => `warning: ${warning}`),
-    `holdout: ${detail.holdout ?? "not run"}`,
+    ...(detail.holdout ? [`holdout: ${detail.holdout}`] : []),
   ];
   for (const diff of detail.diffs) {
     lines.push("", `--- ${diff.path} (+${diff.added} -${diff.removed}${diff.created ? ", created" : ""})`);
