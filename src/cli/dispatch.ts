@@ -8,10 +8,10 @@ import { createClient } from "./client.ts";
 import type { Client } from "./client.ts";
 import {
   attemptText, beatCommand, boardCommand, fitSubmitMessage, headBanCommand, headCloseCommand, headDecideCommand,
-  headKeygenCommand, headLeadCommand, headNoteCommand, headPostCommand, headRuleCommand, joinCommand, leadDecideCommand,
-  leadPostCommand, nextCommand, noteCommand, noticeLines, parseClaim, parseNoteKind, parsePaths, parseReleaseReason,
-  parseRuleArgs, proposeCommand, releaseCommand, renderBeatNews, resultCommand, statusCommand, submitCommand, submissionExitCode,
-  tasksCommand, voteCommand,
+  headKeygenCommand, headLeadCommand, headNoteCommand, headPostCommand, headReviewCommand, headRuleCommand, joinCommand,
+  leadDecideCommand, leadPostCommand, nextCommand, noteCommand, noticeLines, parseClaim, parseNoteKind, parsePaths,
+  parseReleaseReason, parseReviewPolicy, parseRuleArgs, proposeCommand, releaseCommand, renderBeatNews, resultCommand,
+  reviewCommand, reviewsCommand, statusCommand, submitCommand, submissionExitCode, tasksCommand, voteCommand,
 } from "./commands.ts";
 import type { CommandResult, ParsedCli, ParsedValue, SubmitView } from "./commands.ts";
 import { doctorCommand } from "./doctor.ts";
@@ -239,6 +239,28 @@ async function dispatchCore(cli: ParsedCli, deps: DispatchDeps): Promise<Dispatc
       return { result, code: submissionExitCode(result.data) };
     }
 
+    case "reviews": {
+      const c = readClient(deps);
+      return { result: await reviewsCommand(c), code: 0 };
+    }
+
+    case "review": {
+      const submission = requirePositional(cli, 0, "review needs a submission id (S-n)");
+      const answer = cli.positionals[1];
+      if (answer !== undefined && answer !== "approve" && answer !== "reject") {
+        throw new Error(`review must be approve or reject, got "${answer}"`);
+      }
+      const { client: c } = requireAgent(deps);
+      return {
+        result: await reviewCommand(c, {
+          submission,
+          ...(answer !== undefined ? { vote: answer } : {}),
+          reason: str(cli.options.reason),
+        }),
+        code: 0,
+      };
+    }
+
     case "release": {
       const attempt = requirePositional(cli, 0, "release needs an attempt id");
       const reasonText = str(cli.options.reason);
@@ -364,6 +386,10 @@ async function dispatchCore(cli: ParsedCli, deps: DispatchDeps): Promise<Dispatc
           scope: required("scope"),
           check: required("check"),
           paths,
+          protect: str(cli.options.protect) !== undefined
+            ? parsePaths(str(cli.options.protect)!) : undefined,
+          review: str(cli.options.review) !== undefined
+            ? parseReviewPolicy(str(cli.options.review)!) : undefined,
           branch: str(cli.options.branch) ?? "minga",
           force: cli.options.force === true,
           url: str(cli.options.url),
@@ -435,6 +461,22 @@ async function dispatchCore(cli: ParsedCli, deps: DispatchDeps): Promise<Dispatc
           result: await headDecideCommand(c, {
             proposal,
             accept: verdict === "accept",
+            reason: str(cli.options.reason),
+          }),
+          code: 0,
+        };
+      }
+
+      if (action === "review") {
+        const submission = requirePositional(cli, 0, "head review needs a submission id (S-n)");
+        const answer = requirePositional(cli, 1, "head review needs approve or reject");
+        if (answer !== "approve" && answer !== "reject") {
+          throw new Error(`head review must be approve or reject, got "${answer}"`);
+        }
+        return {
+          result: await headReviewCommand(c, {
+            submission,
+            vote: answer,
             reason: str(cli.options.reason),
           }),
           code: 0,

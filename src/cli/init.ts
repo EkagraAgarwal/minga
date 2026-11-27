@@ -4,8 +4,9 @@
  */
 import { existsSync, readFileSync, writeFileSync } from "node:fs";
 import { join, resolve } from "node:path";
+import type { ReviewPolicy } from "../core/types.ts";
 import type { CommandResult } from "./commands.ts";
-import { headKeygenCommand } from "./commands.ts";
+import { formatReviewPolicy, headKeygenCommand } from "./commands.ts";
 import { readHead, writeHead } from "./store.ts";
 
 export interface InitInput {
@@ -15,6 +16,10 @@ export interface InitInput {
   scope: string;
   check: string;
   paths: string[];
+  /** Globs the server refuses to accept from a submission. */
+  protect?: string[];
+  /** Who admits work that passed the check (and the holdout). */
+  review?: ReviewPolicy;
   branch?: string;
   force?: boolean;
   url?: string;
@@ -47,6 +52,8 @@ export interface TomlInput {
   scope: string;
   check: string;
   paths: string[];
+  protect?: string[];
+  review?: ReviewPolicy;
   branch?: string;
   url?: string;
   head: string;
@@ -54,6 +61,18 @@ export interface TomlInput {
 
 export function renderProjectToml(input: TomlInput): string {
   const paths = input.paths.map(tomlBasicString).join(", ");
+  const protect = input.protect ?? [];
+  const review = input.review ?? { mode: "none" };
+  const forbid = [
+    { pattern: "\\.(only|skip)\\(", paths: ["**/*.test.*", "**/*.spec.*", "test/**"], reason: "focused or skipped tests" },
+    { pattern: "@ts-ignore", reason: "suppressed type error" },
+    { pattern: "eslint-disable", reason: "suppressed lint warning" },
+  ].map((rule) => {
+    const parts = [`pattern = ${tomlBasicString(rule.pattern)}`];
+    if (rule.paths) parts.push(`paths = [${rule.paths.map(tomlBasicString).join(", ")}]`);
+    if (rule.reason) parts.push(`reason = ${tomlBasicString(rule.reason)}`);
+    return `#   { ${parts.join(", ")} },`;
+  });
   return [
     "# Minga project configuration. Edit freely; the server re-reads it on restart.",
     `name = ${tomlBasicString(input.name)}`,
@@ -64,6 +83,13 @@ export function renderProjectToml(input: TomlInput): string {
     `head = ${tomlBasicString(input.head)}`,
     "# Accepted work is committed here. Keep it a branch nobody has checked out; serve creates it.",
     `branch = ${tomlBasicString(input.branch ?? "minga")}`,
+    "# Safety: protected paths are never accepted; review gates work that passed the check.",
+    protect.length > 0
+      ? `protect = [${protect.map(tomlBasicString).join(", ")}]`
+      : '# protect = ["project.toml", "test/**"]',
+    review.mode !== "none"
+      ? `review = ${tomlBasicString(formatReviewPolicy(review))}`
+      : '# review = "head"',
     "",
     "[rules]",
     "# width = 3",
@@ -78,6 +104,22 @@ export function renderProjectToml(input: TomlInput): string {
     "# attack = 2",
     "# distill = 1",
     "# plan = 0",
+    "",
+    "# SAFETY — optional guards for the gate. Uncomment what you need.",
+    "# [gates]",
+    "# max_files = 40",
+    "# max_changed_lines = 2000",
+    "# forbid = [",
+    ...forbid,
+    "# ]",
+    "# warn = []",
+    "# [holdout]",
+    '# command = "bun test .holdout/"      # dir is laid over the checkout: keep tests in <dir>/.holdout/',
+    '# dir = ".minga/holdout"          # server-only, never tracked by git',
+    "# [sandbox]",
+    '# mode = "docker"                 # fails closed when Docker is missing',
+    '# image = "oven/bun:1"',
+    '# network = "none"',
     "",
     "# [[task]]",
     '# title = "Describe the first task"',

@@ -3,7 +3,21 @@
  * driving the kit. Keeps renderJoinDoc's signature for the server.
  */
 import type { ProjectInfo } from "../core/protocol.ts";
-import type { AcceptPolicy } from "../core/types.ts";
+import type { AcceptPolicy, ReviewPolicy } from "../core/types.ts";
+
+/** One sentence on who admits work that passed the check. Shared with the kit. */
+export function reviewPolicyText(policy: ReviewPolicy): string {
+  switch (policy.mode) {
+    case "none":
+      return "passing work lands at once (no review)";
+    case "head":
+      return "the head reviews every passing submission before it lands";
+    case "votes":
+      return `${policy.votes} approving vote${policy.votes === 1 ? "" : "s"} from other agents land it`;
+    case "head-or-votes":
+      return `the head or ${policy.votes} approving vote${policy.votes === 1 ? "" : "s"} from other agents land it`;
+  }
+}
 
 function acceptText(policy: AcceptPolicy): string {
   switch (policy.mode) {
@@ -14,6 +28,48 @@ function acceptText(policy: AcceptPolicy): string {
     case "head-or-votes":
       return `head agent or ${policy.votes} votes decides`;
   }
+}
+
+/** At most about a dozen lines, so the briefing stays readable. */
+function safetyLines(project: ProjectInfo): string[] {
+  const safety = project.safety;
+  if (!safety) return [];
+  const lines = [
+    "SAFETY",
+    `  Never submit protected paths (the server refuses them): ${safety.protect.join(", ") || "(none)"}`,
+  ];
+  const gates = safety.gates;
+  const limits: string[] = [];
+  if (gates.maxFiles > 0) limits.push(`at most ${gates.maxFiles} files`);
+  if (gates.maxChangedLines > 0) limits.push(`at most ${gates.maxChangedLines} changed lines`);
+  lines.push(`  Gates: ${limits.length > 0 ? limits.join(", ") : "no size limits"}`);
+  const forbid = gates.forbid.slice(0, 5);
+  for (const rule of forbid) {
+    const where = rule.paths && rule.paths.length > 0 ? rule.paths.join(", ") : "any file";
+    lines.push(`    forbidden ${rule.pattern} in ${where}${rule.reason ? ` — ${rule.reason}` : ""}`);
+  }
+  if (gates.forbid.length > forbid.length) lines.push(`    and ${gates.forbid.length - forbid.length} more`);
+  if (safety.holdout) {
+    lines.push("  Holdout: hidden tests also run on the server after the check passes; you only learn pass or fail.");
+  }
+  lines.push(`  Review: ${reviewPolicyText(safety.review)}`);
+  lines.push(`  Sandbox: ${safety.sandbox === "docker"
+    ? "checks run in a throwaway docker container with only the checkout mounted"
+    : "none (the check runs on the server host)"}.`);
+  return ["", ...lines];
+}
+
+function reviewingLines(project: ProjectInfo): string[] {
+  if (!project.safety || project.safety.review.mode === "none") return [];
+  return [
+    "",
+    "REVIEWING",
+    "  minga reviews; minga review <S-n> to read the diff; vote with",
+    "    minga review <S-n> approve|reject -m '<evidence>'. Reject work that weakens or skips tests,",
+    "    special-cases test inputs, mocks away the behaviour under test, adds dependencies or",
+    "    suppressions, or passes for the wrong reason.",
+    "  You may not review your own work, or a task you hold an attempt on or have work in review for.",
+  ];
 }
 
 export function renderJoinDoc(project: ProjectInfo, baseUrl: string): string {
@@ -52,12 +108,14 @@ export function renderJoinDoc(project: ProjectInfo, baseUrl: string): string {
     '     Each empty poll prints "no free task yet; waiting (Ns left)" to stderr.',
     "     Exit 4 means the project is finished: stop here, do not ask again.",
     "  3. Work in the assigned role, inside the scope.",
-    "     minga check <file...> runs the check locally ({files}, MINGA_FILES). Exit 0: submit now.",
+    "     minga check <file...> runs only the visible check locally ({files}, MINGA_FILES);",
+    "     a server-only holdout may also run. Exit 0: submit now.",
     "  4. minga beat <attempt>     (every 3-5 min; a lapsed lease is reassigned)",
     "     News arrives on beat: task status, new notes, others' approaches, path conflicts.",
     '     beat --approach "..." --paths a,b/ pivots your approach and declared files.',
     '  5. minga submit <attempt> --claim solves|refutes|progress -m "<line>" <file...>',
-    "     Waits for the verdict; if rejected, read the tail, fix and submit again on the same attempt, or:",
+    "     Waits for the verdict; with review on, a passing submit means \"waiting for review\", not landed.",
+    "     If rejected, read the tail, fix and submit again on the same attempt, or:",
     '  6. minga release <attempt> --handoff "<what you tried, what is left>" [--reason <reason>]',
     "",
     "COORDINATE",
@@ -74,6 +132,8 @@ export function renderJoinDoc(project: ProjectInfo, baseUrl: string): string {
     "    and re-run join to accept it. The check gets only an allowlisted environment",
     "    (plus names in MINGA_CHECK_ENV). check also beats your attempt: the lease renews,",
     "    news prints, and a task closed under you is reported right away.",
+    ...safetyLines(project),
+    ...reviewingLines(project),
     "",
     "ROLES AND CLAIMS",
     "  Each assignment has a role; any role may still submit --claim solves.",
@@ -93,7 +153,7 @@ export function renderJoinDoc(project: ProjectInfo, baseUrl: string): string {
     "  npx -y minga-swarm@latest mcp  (stdio MCP: one JSON-RPC message per line)",
     "  Point your harness at it, call minga_join first with this URL, model and harness,",
     "  then minga_sync, minga_next, minga_beat, minga_check, minga_submit, minga_result,",
-    "  minga_release, minga_tasks, minga_lead_post and minga_lead_decide.",
+    "  minga_release, minga_tasks, minga_reviews, minga_review, minga_lead_post and minga_lead_decide.",
     "  Tool results contain the CLI text plus the JSON available through --json.",
     "  If done is true, stop: the project has no open tasks left.",
     "",
@@ -113,7 +173,7 @@ export function renderJoinDoc(project: ProjectInfo, baseUrl: string): string {
     "  your files in .minga/stash/, then minga next.",
     '  With --json, failures print {"error":"..."} on stdout.',
     "",
-    `Also: minga status (attempt liveness), minga board, minga tasks [--open], minga result <S-n>, minga help. Server: ${base}`,
+    `Also: minga status (attempt liveness), minga board, minga tasks [--open], minga result <S-n>, minga reviews, minga review <S-n>, minga help. Server: ${base}`,
     "",
   ].join("\n");
 }

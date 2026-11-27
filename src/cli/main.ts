@@ -26,6 +26,9 @@ agent commands
   note <task> <idea|result|question|handoff|dead_end|digest> <text...> [--reply N-x] [--to <agent>]
   submit <attempt> --claim solves|refutes|progress -m "<message>" <file...> [--no-wait]
   result <S-n> [--wait]
+  reviews
+  review <S-n> [--json]
+  review <S-n> approve|reject [-m "<reason>"]
   release <attempt> [--handoff "..."] [--reason dead_end|too_hard|out_of_time|blocked|duplicate|other]
   propose task --under <task|root> --title "..." [--body "..."]
   propose impossible <task> --evidence "..."
@@ -37,7 +40,7 @@ agent commands
   check <file...>
 
 maintainer commands
-  init [dir] --name <n> --goal <g> --scope <s> --check <cmd> --paths <glob[,glob...>] [--branch minga] [--force]
+  init [dir] --name <n> --goal <g> --scope <s> --check <cmd> --paths <glob[,glob...>] [--protect <glob,glob>] [--review none|head|votes:N|head-or-votes:N] [--branch minga] [--force]
   serve [--repo <dir>] [--port 7777] [--host 127.0.0.1] [server flags...]
   doctor [--repo <dir>]
   mcp [--dir <dir>]
@@ -46,6 +49,7 @@ head commands
   head keygen
   head post --title "..." --body "..." [--under <T-n>] [--points <n>] [--paths a,b/]
   head decide <P-n> accept|reject [--reason "..."]
+  head review <S-n> approve|reject [-m "<reason>"]
   head rule <key>=<value>...
   head ban <agent> --reason "..."
   head note <task> <text...> [--kind result|idea|question|handoff]
@@ -90,11 +94,21 @@ a pinned area summary (only leads, the head or agents with accepted work there).
   submit: `usage: minga submit <attempt> --claim solves|refutes|progress -m "<message>" <file...> [--no-wait]
 
 Reads the files (relative to --root, default cwd), queues the check and waits
-for the verdict. Exit 0 accepted, 2 rejected. --no-wait exits after queueing.`,
+for the verdict. Exit 0 accepted or waiting for review, 2 rejected. --no-wait
+exits after queueing.`,
   result: `usage: minga result <S-n> [--wait]
 
-Shows a submission. Exit 0 while pending (without --wait) or accepted,
-2 when rejected.`,
+Shows a submission, including its review votes. Exit 0 while pending (without
+--wait), in review or accepted; 2 when rejected.`,
+  reviews: `usage: minga reviews
+
+Lists submissions waiting for review and the project's review policy.`,
+  review: `usage: minga review <S-n> [--json]
+       minga review <S-n> approve|reject [-m "<reason>"]
+
+Reads a submission's diff, warnings, holdout result, votes and check output, or
+casts a signed vote. A rejection needs -m with the reason.`,
+
   release: `usage: minga release <attempt> [--handoff "..."] [--reason <reason>]
 
 Gives the attempt back. Always pass --handoff so the next agent knows where
@@ -129,11 +143,12 @@ Runs the project's check command in the current directory exactly as the server
 will: {files} becomes the quoted paths and MINGA_FILES the space-separated list.
 Uses bun exec when Bun is installed, else the system shell. Exit 0 when the
 check passes, 2 when it fails. Needs your identity or --url.`,
-  init: `usage: minga init [dir] --name <n> --goal <g> --scope <s> --check <cmd> --paths <glob[,glob...>] [--branch minga] [--force]
+  init: `usage: minga init [dir] --name <n> --goal <g> --scope <s> --check <cmd> --paths <glob[,glob...>] [--protect <glob,glob>] [--review none|head|votes:N|head-or-votes:N] [--branch minga] [--force]
 
 Non-interactive scaffold: creates .minga/head.json, project.toml and adds
 .minga/ to .gitignore. dir must already be a git repository. --force overwrites
-an existing project.toml.`,
+an existing project.toml. --protect and --review set those keys; the generated
+TOML also has commented [gates], [holdout] and [sandbox] blocks to enable.`,
   serve: `usage: minga serve [--repo <dir>] [--port 7777] [--host 127.0.0.1] [server flags...]
 
 Runs the coordinator on Bun (>= 1.3). Unknown flags are passed to the server.`,
@@ -156,6 +171,9 @@ attempts' declared file intents.`,
   "head decide": `usage: minga head decide <P-n> accept|reject [--reason "..."]
 
 Accepts or rejects a proposal as the head agent.`,
+  "head review": `usage: minga head review <S-n> approve|reject [-m "<reason>"]
+
+The head's vote settles a review at once. A rejection needs -m with evidence.`,
   "head rule": `usage: minga head rule <key>=<value>...
 
 Changes project rules. Keys: width, leaseMinutes, maxAttemptsPerAgent,
@@ -176,7 +194,7 @@ Grants (or revokes) an agent a lead of an area task. Leads can post tasks and
 decide proposals under that area and pin digests.`,
   head: `usage: minga head <action>
 
-Actions: keygen, post, decide, rule, ban, note, close, lead. Try "minga head --help".`,
+Actions: keygen, post, decide, review, rule, ban, note, close, lead. Try "minga head --help".`,
   "lead post": `usage: minga lead post --title "..." --body "..." --under <T-n> [--points <n>] [--paths a,b/]
 
 Posts a task under an area you lead. The parent must be inside one of your areas.`,

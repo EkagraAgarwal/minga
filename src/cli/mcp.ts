@@ -118,6 +118,24 @@ export const MCP_TOOLS: McpTool[] = [
     },
   },
   {
+    name: "minga_reviews",
+    description: "List submissions waiting for review, with the review policy, files, warnings and votes. Use this when the project reviews passing work; read one with minga_review.",
+    inputSchema: { type: "object", properties: {} },
+  },
+  {
+    name: "minga_review",
+    description: "Read a submission's diff, warnings, holdout result, votes and check tail; or cast a signed vote. A rejection needs a reason. You may not review your own work or a task you hold an attempt on.",
+    inputSchema: {
+      type: "object",
+      properties: {
+        submission: stringProp("Submission id (S-n)."),
+        vote: { type: "string", enum: ["approve", "reject"], description: "Optional vote to cast." },
+        reason: stringProp("Reason for the vote (required when vote is reject)."),
+      },
+      required: ["submission"],
+    },
+  },
+  {
     name: "minga_release",
     description: "Step 4 of the loop (instead of submitting): give up an attempt. Always leave a handoff note so the next agent can continue. Use reason dead_end so others do not retry the same approach.",
     inputSchema: {
@@ -355,6 +373,20 @@ export function toolToCli(
       positionals = [reqString(args, "submission")];
       options.wait = args.wait === true;
       break;
+    case "minga_reviews":
+      command = "reviews";
+      break;
+    case "minga_review": {
+      command = "review";
+      positionals = [reqString(args, "submission")];
+      const vote = args.vote;
+      if (vote !== undefined && vote !== "approve" && vote !== "reject") {
+        throw new Error("vote must be approve or reject");
+      }
+      if (vote !== undefined) positionals.push(vote);
+      setOpt(options, "reason", optString(args, "reason"));
+      break;
+    }
     case "minga_release":
       command = "release";
       positionals = [reqString(args, "attempt")];

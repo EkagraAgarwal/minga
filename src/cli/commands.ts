@@ -11,11 +11,12 @@ import { parseArgs } from "node:util";
 import type {
   Assignment, AttemptView, BeatNews, BeatResponse, HeadLeadRequest, HeadLeadResponse, JoinResponse,
   LeaderboardResponse, NextResponse, NoteResponse, Notice, ProposeResponse, ProjectInfo, ReleaseResponse,
-  SubmitResponse, SubmissionView, VoteResponse, HeadDecideResponse, HeadNoteResponse, HeadRuleResponse,
-  HeadPostResponse, TasksResponse,
+  ReviewDetail, ReviewResponse, ReviewsResponse, SubmitResponse, SubmissionView, VoteResponse,
+  HeadDecideResponse, HeadNoteResponse, HeadRuleResponse, HeadPostResponse, TasksResponse,
 } from "../core/protocol.ts";
 import type {
-  AcceptPolicy, AgentId, Claim, NoteKind, ProposalId, ProposalKind, ReleaseReason, Rules, TaskId,
+  AcceptPolicy, AgentId, Claim, NoteKind, ProposalId, ProposalKind, ReleaseReason, ReviewPolicy,
+  ReviewVote, Rules, TaskId,
 } from "../core/types.ts";
 import { NOTE_KINDS, RELEASE_REASONS } from "../core/types.ts";
 import type { Role } from "../core/types.ts";
@@ -30,6 +31,7 @@ export const ROLE_HINTS: Record<Role, string> = {
 };
 import type { KeyPair } from "../identity/keys.ts";
 import { agentIdFromPublicKey, formatHeadKey, generateKeyPair } from "../identity/keys.ts";
+import { reviewPolicyText } from "./join-doc.ts";
 import type { Client } from "./client.ts";
 import type { HeadIdentity, SessionIdentity } from "./store.ts";
 
@@ -91,6 +93,10 @@ const COMMAND_OPTIONS: Record<string, OptionSet> = {
   result: {
     wait: { type: "boolean" },
   },
+  reviews: {},
+  review: {
+    reason: { type: "string", short: "m" },
+  },
   release: {
     handoff: { type: "string" },
     reason: { type: "string" },
@@ -113,6 +119,8 @@ const COMMAND_OPTIONS: Record<string, OptionSet> = {
     scope: { type: "string" },
     check: { type: "string" },
     paths: { type: "string" },
+    protect: { type: "string" },
+    review: { type: "string" },
     branch: { type: "string" },
     force: { type: "boolean" },
   },
@@ -128,6 +136,9 @@ const COMMAND_OPTIONS: Record<string, OptionSet> = {
 
 const HEAD_OPTIONS: Record<string, OptionSet> = {
   keygen: {},
+  review: {
+    reason: { type: "string", short: "m" },
+  },
   post: {
     title: { type: "string" },
     body: { type: "string" },
@@ -257,6 +268,33 @@ export function formatAcceptPolicy(policy: AcceptPolicy): string {
       return `head-or-votes:${policy.votes}`;
   }
 }
+
+/** `review` in project.toml: none | head | votes:N | head-or-votes:N. */
+export function formatReviewPolicy(policy: ReviewPolicy): string {
+  switch (policy.mode) {
+    case "none":
+      return "none";
+    case "head":
+      return "head";
+    case "votes":
+      return `votes:${policy.votes}`;
+    case "head-or-votes":
+      return `head-or-votes:${policy.votes}`;
+  }
+}
+
+export function parseReviewPolicy(text: string): ReviewPolicy {
+  if (text === "none") return { mode: "none" };
+  if (text === "head") return { mode: "head" };
+  const votes = /^votes:(\d+)$/.exec(text);
+  if (votes?.[1] !== undefined) return { mode: "votes", votes: positiveInt("votes", votes[1]) };
+  const hybrid = /^head-or-votes:(\d+)$/.exec(text);
+  if (hybrid?.[1] !== undefined) return { mode: "head-or-votes", votes: positiveInt("votes", hybrid[1]) };
+  throw new Error('review must be "none", "head", "votes:N" or "head-or-votes:N", got "' + text + '"');
+}
+
+/** The human form used in submit and the join doc, with the same wording. */
+export { reviewPolicyText };
 
 export function formatRules(rules: Rules): string {
   return [
@@ -594,11 +632,12 @@ export function readSubmissionFiles(root: string, files: string[]): Record<strin
   return out;
 }
 
-function isFinal(status: string): boolean {
-  return status === "accepted" || status === "rejected";
+/** "review" ends the agent's wait too: its attempt is done, the task stays open. */
+function isDoneWaiting(status: string): boolean {
+  return status === "accepted" || status === "rejected" || status === "review";
 }
 
-/** Poll GET /api/submission/<id>?wait=30 until a final status is returned. */
+/** Poll GET /api/submission/<id>?wait=30 until the verdict or review. */
 export async function waitForSubmission(
   client: Client,
   id: string,
@@ -617,7 +656,7 @@ export async function waitForSubmission(
       onProgress?.(`checking ${id} (run ${view.runs})`);
     }
     // The final block below is the only place that reports the verdict.
-    if (isFinal(view.status)) return view;
+    if (isDoneWaiting(view.status)) return view;
     // A server that answers at once without news must not turn this into a busy loop.
     if (!changed) await new Promise((resolve) => setTimeout(resolve, 250));
   }
@@ -633,8 +672,22 @@ function staleReason(view: SubmitView): string | undefined {
   return "unknown reason";
 }
 
+/** One-line causes of a rejection, printed before the output tail. */
+function rejectionLines(view: SubmissionView): string[] {
+  const lines: string[] = [];
+  const stale = staleReason(view);
+  if (stale !== undefined) lines.push(`stale: ${stale}`);
+  for (const gate of view.gate ?? []) lines.push(`gate: ${gate}`);
+  if (view.holdout === "failed") lines.push("reason: the server's hidden holdout tests failed");
+  if (view.review && !view.review.approved) {
+    lines.push(`reason: rejected in review by ${view.review.by}` +
+      (view.review.reason ? `: ${view.review.reason}` : ""));
+  }
+  return lines;
+}
+
 /** The exact text printed for a submission, shared by submit and result. */
-export function renderSubmission(view: SubmitView): string {
+export function renderSubmission(view: SubmitView, policy?: ReviewPolicy): string {
   // The ack uses `submission`; the view returned by GET uses `id`.
   const id = "submission" in view ? view.submission : view.id;
   if (view.status === "queued") {
@@ -646,14 +699,24 @@ export function renderSubmission(view: SubmitView): string {
     lines.push(`submission ${id}: checking`);
     return lines.join("\n");
   }
-  const attempt = "attempt" in view ? view.attempt : id;
+  if (view.status === "review") {
+    const holdout = view.holdout === "passed" ? " and the holdout" : "";
+    const waiting = policy !== undefined ? ` (${reviewPolicyText(policy)})` : "";
+    return [
+      "verdict: review",
+      `${id} passed the check${holdout}; it now waits for review${waiting}.`,
+      ...(view.warnings ?? []).map((warning) => `flag: ${warning}`),
+      ...renderReviewVotes(view.reviews ?? []),
+      "Your attempt is done: minga sync && minga next --wait 600.",
+      `Check later: minga result ${id}`,
+    ].join("\n");
+  }
+  const attempt = view.attempt;
   const exitCode = view.exitCode ?? 0;
   lines.push(`verdict: ${view.status}`, `submission ${id}`);
   lines.push(`exit code: ${exitCode}${view.timedOut ? " (timed out)" : ""}`);
-  if (view.status === "rejected") {
-    const reason = staleReason(view);
-    if (reason !== undefined) lines.push(`stale: ${reason}`);
-  }
+  if (view.status === "rejected") lines.push(...rejectionLines(view));
+  for (const warning of view.warnings ?? []) lines.push(`flag: ${warning}`);
   if (view.outputTail && view.outputTail.length > 0) {
     lines.push("output tail:", indent(view.outputTail));
   } else if (view.status === "rejected") {
@@ -668,6 +731,16 @@ export function renderSubmission(view: SubmitView): string {
       `"minga release ${attempt} --handoff \\"...\\""`);
   }
   return lines.join("\n");
+}
+
+/** The review policy is only needed for a submission in review; never block on it. */
+async function submissionPolicy(client: Client, view: SubmitView): Promise<ReviewPolicy | undefined> {
+  if (view.status !== "review") return undefined;
+  try {
+    return (await client.project()).safety?.review;
+  } catch {
+    return undefined;
+  }
 }
 
 /** 0 while pending or accepted, 2 when the project's check rejected the work. */
@@ -691,7 +764,7 @@ export async function submitCommand(client: Client, input: SubmitInput): Promise
   if (input.wait === false) return { text: renderSubmission(queued), data: queued };
 
   const final = await waitForSubmission(client, queued.submission, input.onProgress);
-  return { text: renderSubmission(final), data: final };
+  return { text: renderSubmission(final, await submissionPolicy(client, final)), data: final };
 }
 
 export interface ResultInput {
@@ -706,7 +779,99 @@ export async function resultCommand(client: Client, input: ResultInput): Promise
   const view = input.wait === true
     ? await waitForSubmission(client, id, input.onProgress)
     : await client.submission(id, 0);
-  return { text: renderSubmission(view), data: view };
+  return { text: renderSubmission(view, await submissionPolicy(client, view)), data: view };
+}
+
+// ---------------------------------------------------------------- review
+
+/** `+ agent: reason` / `- agent: reason`, with a count line; head votes marked. */
+export function renderReviewVotes(votes: ReviewVote[]): string[] {
+  const approvals = votes.filter((vote) => vote.approve).length;
+  const lines = [`votes: ${approvals} approval(s), ${votes.length - approvals} rejection(s)`];
+  for (const vote of votes) {
+    const mark = vote.head ? " (head)" : "";
+    lines.push(`${vote.approve ? "+" : "-"} ${vote.agent}${mark}: ${vote.reason ?? ""}`);
+  }
+  return lines;
+}
+
+/** GET /api/review/<S-n>: header, warnings, holdout, raw diffs, check tail. */
+export function renderReviewDetail(detail: ReviewDetail): string {
+  const lines = [
+    `${detail.submission} — ${detail.task} ${detail.taskTitle} (${detail.status})`,
+    `agent ${detail.agent} (${detail.model}) · ${detail.claim} · ${detail.message}`,
+    `files: ${detail.files.length > 0 ? detail.files.join(", ") : "(none)"}`,
+    ...renderReviewVotes(detail.votes),
+    ...detail.warnings.map((warning) => `warning: ${warning}`),
+    `holdout: ${detail.holdout ?? "not run"}`,
+  ];
+  for (const diff of detail.diffs) {
+    lines.push("", `--- ${diff.path} (+${diff.added} -${diff.removed}${diff.created ? ", created" : ""})`);
+    lines.push(diff.diff);
+  }
+  lines.push("", "check output tail:", indent(detail.outputTail.length > 0 ? detail.outputTail : "(empty)"));
+  return lines.join("\n");
+}
+
+export async function reviewsCommand(client: Client): Promise<CommandResult<ReviewsResponse>> {
+  const response = await client.reviews();
+  const lines = [`review policy: ${reviewPolicyText(response.policy)}`];
+  if (response.reviews.length === 0) {
+    lines.push("no submissions wait for review");
+  } else {
+    for (const item of response.reviews) {
+      const files = item.files.length > 0
+        ? `${item.files.length} (${item.files.join(", ")})`
+        : "0";
+      lines.push(`${item.submission}  ${item.task} ${item.taskTitle}  ${item.model} (${item.agent})  ` +
+        `files: ${files}  warnings: ${item.warnings.length}  ` +
+        `votes: +${item.approvals} -${item.rejections}`);
+    }
+  }
+  return { text: lines.join("\n"), data: response };
+}
+
+export interface ReviewInput {
+  submission: string;
+  vote?: "approve" | "reject";
+  reason?: string;
+}
+
+/** Show a review, or cast a signed vote (head variant uses the head key). */
+export async function reviewCommand(
+  client: Client,
+  input: ReviewInput,
+  head = false,
+): Promise<CommandResult<ReviewResponse | ReviewDetail>> {
+  if (!/^S-\d+$/.test(input.submission)) {
+    throw new Error(`review needs a submission id like S-1, got "${input.submission}"`);
+  }
+  if (input.vote === undefined) {
+    const detail = await client.review(input.submission);
+    return { text: renderReviewDetail(detail), data: detail };
+  }
+  if (input.vote === "reject" && (!input.reason || input.reason.trim().length === 0)) {
+    throw new Error('review reject needs -m "<reason>"');
+  }
+  const body = {
+    submission: input.submission,
+    approve: input.vote === "approve",
+    ...(input.reason !== undefined && input.reason.length > 0 ? { reason: input.reason } : {}),
+  };
+  const response = head ? await client.headReview(body) : await client.reviewVote(body);
+  const lines = [`voted ${input.vote} on ${input.submission}${head ? " (head)" : ""}`];
+  if (response.decided) {
+    lines.push(`decided: ${response.decided.approved ? "approved" : "rejected"} by ${response.decided.by}`);
+  }
+  return { text: lines.join("\n"), data: response };
+}
+
+/** The head's vote settles the review at once; uses the same body as an agent vote. */
+export function headReviewCommand(
+  client: Client,
+  input: ReviewInput,
+): Promise<CommandResult<ReviewResponse | ReviewDetail>> {
+  return reviewCommand(client, input, true);
 }
 
 // ---------------------------------------------------------------- other verbs

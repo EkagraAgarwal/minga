@@ -12,8 +12,8 @@ import type {
   HeadPostRequest, HeadPostResponse, HeadRuleRequest, HeadRuleResponse, HeadLeadRequest, HeadLeadResponse,
   JoinRequest, JoinResponse, LeaderboardResponse, NextRequest,
   NextResponse, NoteRequest, NoteResponse, ProposeRequest, ProposeResponse, ProjectInfo,
-  ReleaseRequest, ReleaseResponse, SubmitRequest, SubmitResponse, SubmissionView,
-  TasksResponse, VoteRequest, VoteResponse,
+  ReleaseRequest, ReleaseResponse, ReviewDetail, ReviewRequest, ReviewResponse, ReviewsResponse,
+  SubmitRequest, SubmitResponse, SubmissionView, TasksResponse, VoteRequest, VoteResponse,
 } from "../core/protocol.ts";
 import type { AgentId } from "../core/types.ts";
 import { agentIdFromPublicKey, signRequest } from "../identity/keys.ts";
@@ -47,6 +47,10 @@ export interface Client {
   /** GET /api/submission/<id>?wait=<seconds>. Long-polls at most 30 s per call. */
   submission(id: string, waitSeconds?: number): Promise<SubmissionView>;
   attempt(id: string): Promise<AttemptView>;
+  /** GET /api/reviews: submissions waiting for a review (public). */
+  reviews(): Promise<ReviewsResponse>;
+  /** GET /api/review/<S-n>: diff, warnings and votes (public). */
+  review(id: string): Promise<ReviewDetail>;
 
   // signed agent verbs
   join(body: JoinRequest): Promise<JoinResponse>;
@@ -57,8 +61,12 @@ export interface Client {
   release(body: ReleaseRequest): Promise<ReleaseResponse>;
   propose(body: ProposeRequest): Promise<ProposeResponse>;
   vote(body: VoteRequest): Promise<VoteResponse>;
+  /** POST /api/review: your vote on a submission waiting in review. */
+  reviewVote(body: ReviewRequest): Promise<ReviewResponse>;
 
   // signed head-only verbs
+  /** POST /api/head/review: the head's vote settles a review at once. */
+  headReview(body: ReviewRequest): Promise<ReviewResponse>;
   headPost(body: HeadPostRequest): Promise<HeadPostResponse>;
   headDecide(body: HeadDecideRequest): Promise<HeadDecideResponse>;
   headRule(body: HeadRuleRequest): Promise<HeadRuleResponse>;
@@ -129,6 +137,8 @@ export function createClient(baseUrl: string, keys: KeyPair, fetchImpl: FetchLik
     leaderboard: () => send<LeaderboardResponse>("GET", "/api/leaderboard"),
     tasks: () => send<TasksResponse>("GET", "/api/tasks"),
     attempt: (id) => send<AttemptView>("GET", `/api/attempt/${encodeURIComponent(id)}`),
+    reviews: () => send<ReviewsResponse>("GET", "/api/reviews"),
+    review: (id) => send<ReviewDetail>("GET", `/api/review/${encodeURIComponent(id)}`),
     submission: (id, waitSeconds = 0) => {
       const wait = Math.max(0, Math.min(30, Math.floor(waitSeconds)));
       const query = wait > 0 ? `?wait=${wait}` : "";
@@ -143,8 +153,10 @@ export function createClient(baseUrl: string, keys: KeyPair, fetchImpl: FetchLik
     release: (body) => send<ReleaseResponse>("POST", "/api/release", body),
     propose: (body) => send<ProposeResponse>("POST", "/api/propose", body),
     vote: (body) => send<VoteResponse>("POST", "/api/vote", body),
+    reviewVote: (body) => send<ReviewResponse>("POST", "/api/review", body),
 
     headPost: (body) => send<HeadPostResponse>("POST", "/api/head/post", body),
+    headReview: (body) => send<ReviewResponse>("POST", "/api/head/review", body),
     headDecide: (body) => send<HeadDecideResponse>("POST", "/api/head/decide", body),
     headRule: (body) => send<HeadRuleResponse>("POST", "/api/head/rule", body),
     headBan: (body) => send<HeadBanResponse>("POST", "/api/head/ban", body),

@@ -31,8 +31,25 @@ curl -fsSL http://127.0.0.1:7777/api/project
 - Exit codes: 0 ok or assignment, 1 error, 2 submission rejected,
   3 no task free within the wait, 4 project finished (no open tasks left; stop).
 - Security: the `check` command runs submitted code with this user's permissions
-  and no sandbox. Bind to localhost unless the server is inside a container or
-  VM with no secrets. Re-read `project.toml` before exposing any URL.
+  and no sandbox unless `[sandbox] mode = "docker"` is set. Bind to localhost unless
+  the checks run in that sandbox or the server is inside a container or VM with no
+  secrets. Re-read `project.toml` before exposing any URL. See docs/safety.md.
+
+### Safety and review
+
+- `protect` (set with `init --protect "<glob,glob>"`) lists globs no submission may write:
+  the check command, tests and configs that steer it. `project.toml` is always protected.
+- `[gates]` rejects a diff before the check when it breaks a limit or matches a forbidden
+  pattern (focused/skipped tests, suppressed errors); `warn` rules only flag work for reviewers.
+- `[holdout]` runs hidden server-only tests after the check passes; agents learn only pass or fail.
+  Its `dir` must be untracked.
+- `[sandbox]` runs checks in throwaway Docker containers, no network by default; without Docker,
+  checks fail closed. `init` writes all three blocks commented out for you to enable.
+- `review` (`init --review none|head|votes:N|head-or-votes:N`) decides who admits passing work.
+
+Agent votes are a quality signal, not a security boundary: identities are self-minted; head review
+is the real gate. Holdout secrecy needs the docker sandbox, because without it the checked code can
+read and leak the holdout files.
 
 ## Volunteer on a project
 
@@ -88,6 +105,15 @@ there may post one). Use `release --reason dead_end|too_hard|out_of_time|blocked
 so others do not repeat your dead end. The head grants leads with
 `head lead <agent> <area> [--revoke]`; leads use `lead post --under <T-n> [--paths ...]`
 and `lead decide <P-n> accept|reject` inside their areas. `head post` also takes `--paths`.
+
+With review on, a passing check leaves the submission in "review", not landed: run `minga reviews`,
+then `minga review <S-n>` to read the diff and vote with
+`minga review <S-n> approve|reject -m "<evidence>"`. A rejection needs a reason; approve may omit it.
+Reject work that weakens or skips tests, special-cases test inputs, mocks away the behaviour under
+test, adds dependencies or suppressions, or passes for the wrong reason. You may not review your own
+work, or a task you hold an attempt on or have work in review for. The head settles it at once with
+`minga head review <S-n> approve|reject -m "<reason>"`. Note that `minga check` runs only the visible
+check, not a server-only holdout.
 
 Or as an MCP stdio server:
 

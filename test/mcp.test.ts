@@ -85,14 +85,14 @@ describe("MCP protocol", () => {
     expect(await handler(JSON.stringify({ jsonrpc: "2.0", id: 3, method: "notifications/initialized" }))).toBeNull();
   });
 
-  test("tools/list exposes all seventeen tools with JSON Schema inputs", async () => {
+  test("tools/list exposes all nineteen tools with JSON Schema inputs", async () => {
     const handler = createMcpHandler({ dir: process.cwd(), execute: canned() });
     const reply = decode(await handler(rpc(4, "tools/list")));
     expect(reply.result.tools.map((t: { name: string }) => t.name)).toEqual([
       "minga_join", "minga_next", "minga_beat", "minga_note", "minga_submit", "minga_result",
-      "minga_release", "minga_propose_task", "minga_propose_impossible", "minga_vote",
-      "minga_status", "minga_board", "minga_tasks", "minga_check", "minga_sync",
-      "minga_lead_post", "minga_lead_decide",
+      "minga_reviews", "minga_review", "minga_release", "minga_propose_task",
+      "minga_propose_impossible", "minga_vote", "minga_status", "minga_board", "minga_tasks",
+      "minga_check", "minga_sync", "minga_lead_post", "minga_lead_decide",
     ]);
     for (const tool of reply.result.tools) {
       expect(typeof tool.description).toBe("string");
@@ -100,7 +100,14 @@ describe("MCP protocol", () => {
       expect(tool.inputSchema.type).toBe("object");
       expect(typeof tool.inputSchema.properties).toBe("object");
     }
-    expect(MCP_TOOLS.length).toBe(17);
+    expect(MCP_TOOLS.length).toBe(19);
+    const reviews = reply.result.tools.find((t: { name: string }) => t.name === "minga_reviews");
+    const review = reply.result.tools.find((t: { name: string }) => t.name === "minga_review");
+    expect(reviews.inputSchema.properties).toEqual({});
+    expect(reviews.description).toContain("waiting for review");
+    expect(review.inputSchema.required).toEqual(["submission"]);
+    expect(review.inputSchema.properties.vote.enum).toEqual(["approve", "reject"]);
+    expect(review.description).toContain("signed vote");
 
     const beat = reply.result.tools.find((t: { name: string }) => t.name === "minga_beat");
     expect(beat.inputSchema.properties.paths.type).toBe("array");
@@ -248,6 +255,14 @@ describe("tool calls", () => {
       attempt: "A-1", claim: "solves", message: "m", files: [], wait: false,
     }).options.wait).toBe(false);
     expect(toolToCli("minga_result", { submission: "S-1", wait: true }).command).toBe("result");
+    expect(toolToCli("minga_reviews", {})).toEqual({ command: "reviews", options: {}, positionals: [] });
+    expect(toolToCli("minga_review", { submission: "S-4" })).toEqual({
+      command: "review", options: {}, positionals: ["S-4"],
+    });
+    expect(toolToCli("minga_review", { submission: "S-4", vote: "approve", reason: "ok" })).toEqual({
+      command: "review", options: { reason: "ok" }, positionals: ["S-4", "approve"],
+    });
+    expect(() => toolToCli("minga_review", { submission: "S-4", vote: "maybe" })).toThrow(/vote must be/);
     expect(toolToCli("minga_propose_task", { title: "t", under: "T-1" })).toEqual({
       command: "propose", options: { under: "T-1", title: "t" }, positionals: ["task"],
     });
@@ -415,6 +430,34 @@ describe("MCP round trip through the real dispatcher", () => {
       expect(reply.result.content[0].text).toContain(`head ${head.slice(0, 7)} (minga sync if your checkout is older)`);
       expect(reply.result.structuredContent.assignment.head).toBe(head);
     });
+  });
+
+  test("minga_reviews and minga_review reach the shared dispatcher", async () => {
+    const paths: string[] = [];
+    const fetchImpl: FetchLike = async (url, init) => {
+      const path = new URL(url).pathname;
+      paths.push(path);
+      const body = init?.method === "POST"
+        ? { submission: "S-4", decided: { approved: true, by: "vote" } }
+        : { reviews: [], policy: { mode: "head" } };
+      return new Response(JSON.stringify(body), { status: 200, headers: { "content-type": "application/json" } });
+    };
+    await withTempDir(async (dir) => {
+      withIdentityForMcp(dir);
+      const handler = createMcpHandler({ dir, fetchImpl });
+      const listed = decode(await handler(rpc(41, "tools/call", { name: "minga_reviews", arguments: {} })));
+      expect(listed.result.isError).toBeUndefined();
+      expect(listed.result.content[0].text).toContain("no submissions wait for review");
+      expect(listed.result.structuredContent.policy).toEqual({ mode: "head" });
+      const voted = decode(await handler(rpc(42, "tools/call", {
+        name: "minga_review", arguments: { submission: "S-4", vote: "approve" },
+      })));
+      expect(voted.result.isError).toBeUndefined();
+      expect(voted.result.content[0].text).toContain("decided: approved by vote");
+      expect(voted.result.structuredContent).toEqual({ submission: "S-4", decided: { approved: true, by: "vote" } });
+    });
+    // Keep the captured routes in one assertion for readability.
+    expect(paths).toEqual(["/api/reviews", "/api/review"]);
   });
 
   test("protocol messages are the only stdout writes in mcp mode", async () => {
