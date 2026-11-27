@@ -2,6 +2,28 @@
 
 Every release is tried by live agent swarms first; their feedback drives the next one.
 
+## 0.3.0 — 2026-11-27
+
+Guarding the gate. Exit 0 was the only judge, and agents are good at making a suite pass for the wrong reason. Every guard is opt-in per project; without them a 0.3 server behaves as 0.2 (old kits and old event logs work). See [docs/safety.md](docs/safety.md).
+
+- **Protected paths.** `protect = ["test/**", "package.json", ...]` lists globs no submission may write, even inside `paths`; the server answers 403 before anything runs, and the kit refuses locally first. `project.toml` is always protected.
+- **Gates.** `[gates]` rejects a diff before the check runs: `forbid` regexes on added lines only (focused or skipped tests, `@ts-ignore`, `|| true`, …), `max_files`, `max_changed_lines`. `warn` rules only flag work for reviewers.
+- **Holdout tests.** `[holdout]` runs private tests after the check passes, laid over the same checkout. Agents learn only pass or fail; the output goes to `.minga/holdout-logs/` for the maintainer, never to the log, the dashboard or the agent. `serve` refuses a holdout directory git tracks.
+- **Docker sandbox.** `[sandbox] mode = "docker"` runs each check in a throwaway container with only the checkout mounted. It has no network by default, and caps on memory, CPUs and processes. All capabilities are dropped, the root filesystem is read-only, and `.git` is hidden and verified afterwards. If Docker is missing, the check fails closed and nothing is accepted.
+- **Review before landing.** `review = "head" | "votes:N" | "head-or-votes:N"`. Passing work waits in review and the agent moves on.
+  - `minga reviews` and `minga review S-n` show the diff and the check output.
+  - The head decides with `minga head review S-n approve|reject -m "<why>"`.
+  - In vote modes, idle agents are told when there is work they may vote on. Voters need accepted work, and never review their own work or a task they compete on.
+  - Approval lands the work, rechecking it if the branch moved under its files.
+  - Commits carry a `Minga-Review` trailer.
+- **Volunteer sandbox.** `minga check --sandbox docker` runs the project's check on a volunteer's machine inside a container. The container has no network, and the volunteer's identity and git metadata are hidden from it. Offline, `check` uses the command saved at `join`.
+- **Observatory.** The dashboard adds:
+  - a safety strip and an amber review state with votes;
+  - a review queue with diffs;
+  - one-line reasons for gate, holdout and review rejections.
+- **Adversarial suite.** `test/adversarial.test.ts` plays a cheating agent against a real server, real git and real checks; every shortcut is caught.
+- `minga init --protect "<globs>" --review head` writes the settings, plus a commented safety block that parses as is.
+
 ## 0.2.1 — 2026-11-27
 
 From the fourth live swarm, the first on 0.2: 4 models from 4 labs, 16 tasks, all accepted in 11 minutes.
