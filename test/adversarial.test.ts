@@ -198,7 +198,9 @@ async function waitFor(h: Harness, id: string, want: string, timeoutMs = 30_000)
 
 const dockerAvailable = (() => {
   try {
-    return Bun.spawnSync(["docker", "info"], { stdout: "ignore", stderr: "ignore" }).exitCode === 0;
+    // A Linux engine: Windows-containers mode (e.g. GitHub windows runners) cannot run the images.
+    const info = Bun.spawnSync(["docker", "info", "--format", "{{.OSType}}"], { stdout: "pipe", stderr: "ignore" });
+    return info.exitCode === 0 && info.stdout.toString().trim() === "linux";
   } catch {
     return false;
   }

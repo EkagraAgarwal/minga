@@ -2005,10 +2005,10 @@ describe("local protected-path pre-check", () => {
   });
 });
 
-const dockerInfo = spawnSync("docker", ["info"], { encoding: "utf8", timeout: 8_000 });
+const dockerInfo = spawnSync("docker", ["info", "--format", "{{.OSType}}"], { encoding: "utf8", timeout: 8_000 });
 const testImage = process.env.MINGA_DOCKER_TEST_IMAGE ?? DEFAULT_CHECK_IMAGE;
 const imageReady = spawnSync("docker", ["image", "inspect", testImage], { encoding: "utf8", timeout: 8_000 });
-const dockerReady = dockerInfo.status === 0 && dockerInfo.error === undefined
+const dockerReady = dockerInfo.status === 0 && dockerInfo.error === undefined && dockerInfo.stdout.trim() === "linux"
   && imageReady.status === 0 && imageReady.error === undefined;
 
 describe.skipIf(!dockerReady)("real docker sandbox", () => {

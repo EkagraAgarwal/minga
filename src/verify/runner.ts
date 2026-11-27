@@ -420,6 +420,10 @@ export const createCheckPool: CreateCheckPool = async (opts: CheckPoolOptions): 
     if (version.code !== 0) {
       return { ok: false, reason: oneLine(version.stderr || version.stdout || `exit ${version.code}`) };
     }
+    const os = await runCommand([dockerBin, "info", "--format", "{{.OSType}}"], DOCKER_PROBE_MS);
+    if (os.code === 0 && os.stdout.trim() !== "" && os.stdout.trim() !== "linux") {
+      return { ok: false, reason: `the docker engine runs ${os.stdout.trim()} containers; switch it to Linux containers` };
+    }
     const inspect = await runCommand([dockerBin, "image", "inspect", docker!.image], DOCKER_PROBE_MS);
     if (inspect.code !== 0) {
       const pull = await runCommand([dockerBin, "pull", docker!.image], DOCKER_PULL_MS);
